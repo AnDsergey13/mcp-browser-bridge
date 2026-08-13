@@ -13,6 +13,8 @@ const REQ_TIMEOUT_MS = 30000; // таймаут res на req (§1)
 const NAV_TIMEOUT_MS = 10000; // ожидание загрузки вкладки
 const POST_NAV_TIMEOUT_MS = 15000; // ожидание «тихого окна» в content script (+ запас)
 const FETCHFILE_TIMEOUT_MS = 10 * 60 * 1000; // релей большого файла
+const CLICK_CMD_TIMEOUT_MS = 20000; // 2 c nav-watch + тихое окно + after в контенте
+const CLICK_RECOVERY_TIMEOUT_MS = 12000; // сторожевой таймаут восстановления после смерти контекста
 const ACK_BG_TIMEOUT_MS = 20000; // страховка поверх контентных 15 с на file.ack
 const JOURNAL_LIMIT = 20;
 const NOTIF_SESSION = "bridge-session-approval";
@@ -26,6 +28,8 @@ let transferCounter = 0;
 let reconnectDelayMs = 1000; // backoff 1→30 c (§3)
 let reconnectTimer = null;
 let connecting = false;
+/** match_patterns текущей политики — сверка актуального URL вкладки перед page-командой. */
+let policyPatterns = [];
 
 /** @type {Map<string, {resolve:Function, reject:Function, timer:number}>} наши исходящие req */
 const pendingReqs = new Map();
@@ -210,11 +214,18 @@ async function doHello() {
     throw e;
   }
   const data = res || {};
-  await saveState({
+  // Гранты выдаются scope:"session" — новая серверная сессия = чистый список.
+  const { serverSessionId: prevSid } = await browser.storage.local.get({
+    serverSessionId: "",
+  });
+  const newSid = data.server_session_id || "";
+  const patch = {
     lastError: "",
     presets: Array.isArray(data.presets) ? data.presets : [],
-    serverSessionId: data.server_session_id || "",
-  });
+    serverSessionId: newSid,
+  };
+  if (newSid && newSid !== prevSid) patch.sessionGrants = [];
+  await saveState(patch);
   const status = data.status || "pending_approval";
   if (status === "active") {
     await setSessionStatus("active");
@@ -277,6 +288,50 @@ async function getTab(tabId) {
     return await browser.tabs.get(tabId);
   } catch (e) {
     throw perr("NO_TAB", "вкладка " + tabId + " не найдена");
+  }
+}
+
+// ---------- харденинг: сверка текущего URL вкладки с политикой ----------
+// Сервер проверяет политику по последнему известному URL; если пользователь
+// вручную увёл вкладку на чужой домен — команду НЕ исполняем (DOMAIN_MISMATCH).
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Простой конвертер match pattern → RegExp (`*://*.host/*`, `*://host/*`). */
+function matchPatternToRegExp(pattern) {
+  const m = /^(\*|https?):\/\/([^/]*)(\/.*)$/.exec(pattern || "");
+  if (!m) return null;
+  const scheme = m[1] === "*" ? "https?" : m[1];
+  const host = m[2];
+  let hostRe;
+  if (host.startsWith("*.")) {
+    // `*.host` — сам host и его поддомены
+    hostRe = "(?:[^/]*\\.)?" + escapeRe(host.slice(2));
+  } else {
+    hostRe = host.split("*").map(escapeRe).join("[^/]*");
+  }
+  const pathRe = m[3].split("*").map(escapeRe).join(".*");
+  return new RegExp("^" + scheme + "://" + hostRe + pathRe + "$");
+}
+
+function urlMatchesPolicy(url) {
+  if (!policyPatterns.length || !url) return false;
+  return policyPatterns.some((p) => {
+    const re = matchPatternToRegExp(p);
+    return re && re.test(url);
+  });
+}
+
+/** Перед page-командой: актуальный tabs.get(url) должен попадать в match_patterns. */
+async function assertTabDomain(tabId) {
+  const tab = await getTab(tabId);
+  const url = tab.url || "";
+  if (!urlMatchesPolicy(url)) {
+    throw perr(
+      "DOMAIN_MISMATCH",
+      "текущий URL вкладки " + tabId + " вне match_patterns политики: " + url
+    );
   }
 }
 
@@ -413,30 +468,106 @@ async function navCommand(method, params) {
   };
 }
 
-// click: может убить контекст полной навигацией — тогда дожидаемся новой страницы.
+/** Вотчер начала полной навигации вкладки (статус loading) — детектор смерти контекста. */
+function watchTabNavigating(tabId) {
+  let onUpdated;
+  let onRemoved;
+  function cleanup() {
+    browser.tabs.onUpdated.removeListener(onUpdated);
+    browser.tabs.onRemoved.removeListener(onRemoved);
+  }
+  const promise = new Promise((resolve, reject) => {
+    onUpdated = (id, changeInfo) => {
+      if (id === tabId && changeInfo.status === "loading") {
+        cleanup();
+        resolve("NAV_STARTED");
+      }
+    };
+    onRemoved = (id) => {
+      if (id === tabId) {
+        cleanup();
+        reject(perr("NO_TAB", "вкладка закрыта"));
+      }
+    };
+    browser.tabs.onUpdated.addListener(onUpdated);
+    browser.tabs.onRemoved.addListener(onRemoved);
+  });
+  promise.catch(() => {}); // проигравшая ветвь race не даёт unhandled rejection
+  return { promise, cancel: cleanup };
+}
+
+/**
+ * Восстановление после смерти контекста клика (JS-навигация без якоря):
+ * ждём загрузку и опрашиваем новый content script. Общий сторожевой
+ * таймаут — сервер никогда не получает 30-секундный TIMEOUT из-за гонки.
+ */
+async function recoverAfterClickNavigation(tabId, extra) {
+  let navTimedOut = false;
+  const st = await withTimeout(
+    (async () => {
+      try {
+        await waitTabComplete(tabId, NAV_TIMEOUT_MS);
+      } catch (e) {
+        if (e.code === "NO_TAB") throw e;
+        navTimedOut = true;
+      }
+      return postNavState(tabId);
+    })(),
+    CLICK_RECOVERY_TIMEOUT_MS,
+    "NAV_TIMEOUT"
+  );
+  return Object.assign({}, st, extra || {}, {
+    navigated: true,
+    truncated: !!(st.truncated || navTimedOut),
+  });
+}
+
+// click: три исхода — ответ контента; anchor-фолбэк (JS подавил клик);
+// смерть контекста на лету (JS-навигация) → recover с вотчером loading и сторожем.
 async function clickCommand(params) {
   const tabId = params.tabId;
-  await getTab(tabId);
+  await assertTabDomain(tabId);
+
+  const navWatcher = watchTabNavigating(tabId);
+  const cmdPromise = sendCmdToTab(tabId, "click", params, CLICK_CMD_TIMEOUT_MS);
+  cmdPromise.catch(() => {}); // проигравшая ветвь race
+  let st = null;
+  let contextDead = false;
   try {
-    return await sendCmdToTab(tabId, "click", params, REQ_TIMEOUT_MS + NAV_TIMEOUT_MS);
+    const winner = await Promise.race([cmdPromise, navWatcher.promise]);
+    if (winner === "NAV_STARTED") contextDead = true;
+    else st = winner;
   } catch (e) {
-    if (e.code !== "CONTEXT_DEAD") throw e;
-    let navTimedOut = false;
-    try {
-      await waitTabComplete(tabId, NAV_TIMEOUT_MS);
-    } catch (navErr) {
-      if (navErr.code === "NO_TAB") throw navErr;
-      navTimedOut = true;
+    if (e.code === "CONTEXT_DEAD") contextDead = true;
+    else {
+      navWatcher.cancel();
+      throw e;
     }
-    const st = await postNavState(tabId);
-    return {
-      url: st.url,
-      title: st.title,
-      flags: st.flags,
-      navigated: true,
-      truncated: !!(st.truncated || navTimedOut),
-    };
+  } finally {
+    navWatcher.cancel();
   }
+
+  if (contextDead) return recoverAfterClickNavigation(tabId);
+  if (st && st.anchor_href && !st.navigated) {
+    return anchorFallbackNavigation(tabId, st);
+  }
+  return st;
+}
+
+/**
+ * Фолбэк навигации по якорю: content script сообщил, что клик не навигировал,
+ * но у цели есть абсолютный http(s) href → доводим навигацию сами.
+ */
+async function anchorFallbackNavigation(tabId, clickResult) {
+  try {
+    await browser.tabs.update(tabId, { url: clickResult.anchor_href });
+  } catch (e) {
+    throw perr("INTERNAL", "anchor fallback: " + e.message);
+  }
+  return recoverAfterClickNavigation(tabId, {
+    navigation_fallback: "anchor_href",
+    clicked: clickResult.clicked,
+  });
 }
 
 async function screenshotCommand(params) {
@@ -451,7 +582,7 @@ async function screenshotCommand(params) {
 }
 
 async function fetchFileCommand(params) {
-  await getTab(params.tabId);
+  await assertTabDomain(params.tabId);
   const transferId = "t_" + ++transferCounter;
   const st = await sendCmdToTab(
     params.tabId,
@@ -463,9 +594,14 @@ async function fetchFileCommand(params) {
 }
 
 // consent.ask: баннер рисует content script; нет скрипта (challenge-страница) → deny.
+// Вкладка ушла с домена политики → консервативный deny с пояснением.
 async function consentCommand(params) {
   const timeoutMs = (Number(params.timeout_ms) || 120000) + 10000;
   try {
+    const tab = await getTab(params.tabId);
+    if (!urlMatchesPolicy(tab.url || "")) {
+      return { decision: "deny", note: "domain_mismatch: " + (tab.url || "") };
+    }
     const st = await sendCmdToTab(params.tabId, "__consent", params, timeoutMs);
     return { decision: st.decision || "deny" };
   } catch (e) {
@@ -533,7 +669,7 @@ async function handleServerReq(msg) {
       return consentCommand(params);
     default:
       if (CONTENT_METHODS.has(method)) {
-        await getTab(params.tabId);
+        await assertTabDomain(params.tabId);
         return sendCmdToTab(params.tabId, method, params);
       }
       throw perr("INTERNAL", "неизвестный метод: " + method);
@@ -602,6 +738,9 @@ async function onWireMessage(raw) {
 }
 
 async function onPolicyUpdate(data) {
+  policyPatterns = Array.isArray(data.match_patterns)
+    ? data.match_patterns.filter((p) => typeof p === "string" && p.length)
+    : [];
   await saveState({
     policyPreset: data.preset || "",
     policyVersion: data.version || 0,
@@ -668,6 +807,11 @@ async function handlePopupAction(msg) {
         capabilities: ["read", "interact"],
         scope: "session",
       });
+      // Трекинг выданных грантов — popup показывает подтверждение и дизейблит кнопку.
+      const { sessionGrants } = await browser.storage.local.get({ sessionGrants: [] });
+      if (!sessionGrants.includes(msg.domain)) {
+        await saveState({ sessionGrants: sessionGrants.concat(msg.domain).slice(-50) });
+      }
       return { ok: true, result: res };
     }
     case "pause.global": {

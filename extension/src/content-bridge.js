@@ -141,11 +141,102 @@
     return { url: location.href, title: document.title, flags };
   }
 
+  /**
+   * Блок after для act.*: если была навигация или DOM менялся (dirty) —
+   * компактный список интерактивных текущего скоупа (ref-метки живые).
+   * pivot — элемент команды: прижимает after к месту действия (без навигации).
+   * Ничего не изменилось → поле не добавляется.
+   */
+  function withAfter(state, navigated, pivot) {
+    if (!navigated && !(B.refs && B.refs.dirty)) return state;
+    if (!B.snapshot || !B.snapshot.afterBlock) return state;
+    return Object.assign(state, B.snapshot.afterBlock(navigated ? null : pivot || null));
+  }
+
+  /**
+   * Ожидание асинхронных подсказок (автокомплит приходит по сети ПОСЛЕ
+   * ввода) — СОБЫТИЙНОЕ, без тайминговой подгонки: MutationObserver следит
+   * за childList-вставками. Выходим, когда ОДНА вставка приносит пачку
+   * (>=3) новых интерактивных элементов — сигнатура выпадающего списка.
+   * Атрибутные мутации (флап классов, спиннеры) игнорируются. Дедлайн —
+   * только страховка от зависания: под нагрузкой ждём дольше, на быстрой
+   * системе выходим раньше. Диагностика — в window.__BRIDGE__.debugSettle.
+   */
+  const SUGGEST_TIMEOUT_MS = 8000; // страховочный потолок ожидания
+  const SUGGEST_MIN_DELTA = 3; // минимум новых интерактивных за вставку = «появился список»
+  async function settleForSuggestions() {
+    if (!B.snapshot || !B.snapshot.countInteractive) return;
+    await waitQuiet(3000); // основное тихое окно (укороченный таймаут для ввода)
+    const isInter = B.snapshot.isInteractiveEl;
+    const dbg = { v: 4, baseline: B.snapshot.countInteractive(), exit: "deadline", added: 0 };
+    B.debugSettle = dbg;
+    await new Promise((resolve) => {
+      const deadline = Date.now() + SUGGEST_TIMEOUT_MS;
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        obs.disconnect();
+        clearInterval(timer);
+        resolve();
+      };
+      const obs = new MutationObserver((mutations) => {
+        let added = 0;
+        let first = "";
+        for (const m of mutations) {
+          if (m.type !== "childList") continue; // флап атрибутов — не подсказки
+          for (const n of m.addedNodes) {
+            if (n.nodeType !== 1) continue;
+            const countIn = (el) => {
+              let c = 0;
+              try {
+                if (isInter(el)) {
+                  c++;
+                  if (!first) first = el.tagName.toLowerCase() + ":" + String(el.innerText || "").slice(0, 40);
+                }
+                for (const d of el.querySelectorAll("*")) if (isInter(d)) c++;
+              } catch (e) {}
+              return c;
+            };
+            added += countIn(n);
+          }
+        }
+        if (added > dbg.added) {
+          dbg.added = added;
+          dbg.first = first;
+        }
+        if (added >= SUGGEST_MIN_DELTA) {
+          dbg.exit = "list";
+          finish();
+        }
+      });
+      obs.observe(document.documentElement, { subtree: true, childList: true });
+      const timer = setInterval(() => {
+        if (Date.now() >= deadline) finish();
+      }, 300);
+    });
+  }
+
   // ---------- ref ----------
   function mustResolve(ref) {
     const el = B.refs && B.refs.resolve(ref);
     if (!el) throw cerr("STALE_REF", "ref " + ref + " инвалидирован — сделайте свежий snapshot");
     return el;
+  }
+
+  /** Цель клика: по ref (как раньше) или атомарно по тексту (click-by-text). */
+  function resolveClickTarget(params) {
+    if (params.text == null) return mustResolve(params.ref);
+    const r = B.snapshot.findByText(String(params.text));
+    if (r.status === "one") return r.el;
+    if (r.status === "many") {
+      throw cerr("AMBIGUOUS", "несколько кандидатов: " + r.texts.join(" | "));
+    }
+    throw cerr(
+      "NOT_FOUND",
+      "кликабельный элемент «" + params.text + "» не найден. Ближайшие: " +
+        (r.texts.length ? r.texts.join(" | ") : "—")
+    );
   }
 
   // ---------- N3: реалистичные события ----------
@@ -201,6 +292,19 @@
     dispatchPointer(el, "pointerup");
     dispatchMouse(el, "mouseup");
     el.click();
+  }
+
+  // N3: клавиатурное событие — автокомплиты часто слушают keydown/keyup,
+  // а не input; isTrusted=false подделать нельзя, но ключевые поля честные.
+  function dispatchKey(el, type, key) {
+    el.dispatchEvent(
+      new KeyboardEvent(type, {
+        key: key,
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      })
+    );
   }
 
   // Нативный сеттер value с прототипа — React-совместимая установка значения.
@@ -373,9 +477,11 @@
   // ---------- обработчики команд ----------
   const handlers = {
     // Опрос после навигации, инициированной background'ом или полной перезагрузкой.
+    // Страница новая → after прилагается всегда (экономит отдельный snapshot).
     async __postNav() {
       const q = await waitQuiet();
-      return Object.assign(pageState(), { truncated: q.truncated });
+      const st = Object.assign(pageState(), { truncated: q.truncated });
+      return withAfter(st, true);
     },
 
     async __consent(params) {
@@ -384,16 +490,54 @@
     },
 
     async click(params) {
-      const el = mustResolve(params.ref);
+      const el = resolveClickTarget(params); // ref-путь и атомарный click-by-text
       const urlBefore = location.href;
+      const docBefore = document;
+
+      // Якорь цели (сам элемент или предок) с абсолютным http(s) href —
+      // кандидат на фолбэк навигации, если JS проигнорировал/подавил клик.
+      let anchorHref = null;
+      const anchor = el.closest ? el.closest("a[href]") : null;
+      if (anchor) {
+        try {
+          const u = new URL(anchor.getAttribute("href"), location.href);
+          if (u.protocol === "http:" || u.protocol === "https:") anchorHref = u.href;
+        } catch (e) {}
+      }
+      // Диагностика цели — возвращается в ответе click.
+      const clicked = {
+        tag: el.tagName.toLowerCase(),
+        text: String(el.innerText || el.value || el.getAttribute("aria-label") || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 80),
+        href: anchorHref,
+      };
+
       el.scrollIntoView({ block: "center" });
       realisticClick(el);
       // Полная навигация убьёт этот контекст — background обработает fallback.
+      // Ждём смену location/документа до ~2 c (SPA/hash-навигация), затем тихое окно.
+      const navDeadline = Date.now() + 2000;
+      while (Date.now() < navDeadline) {
+        if (location.href !== urlBefore || document !== docBefore) break;
+        await sleep(100);
+      }
       const q = await waitQuiet();
-      return Object.assign(pageState(), {
-        navigated: location.href !== urlBefore,
+      // Честный флаг: смена URL (SPA/hash) ИЛИ замена документа (document.open/write).
+      const navigated = location.href !== urlBefore || document !== docBefore;
+      const out = Object.assign(pageState(), {
+        navigated,
+        clicked,
         truncated: q.truncated,
       });
+      // Навигации не случилось, но якорь есть → отдаём background'у на фолбэк
+      // (after со старой страницы в этом случае бесполезен).
+      if (!navigated && anchorHref) {
+        out.anchor_href = anchorHref;
+        return out;
+      }
+      return withAfter(out, navigated, el);
     },
 
     async type(params) {
@@ -402,16 +546,35 @@
       el.scrollIntoView({ block: "center" });
       el.focus();
       if (el.isContentEditable) {
+        const key = text.slice(-1) || "Unidentified";
+        dispatchKey(el, "keydown", key);
         el.textContent = params.clear ? text : el.textContent + text;
         el.dispatchEvent(new Event("input", { bubbles: true }));
+        dispatchKey(el, "keyup", key);
       } else {
-        setNativeValue(el, params.clear ? text : el.value + text);
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        // Посимвольно: keydown → value+input → keyup на каждый символ —
+        // так срабатывают автокомплиты, слушающие клавиатуру, а не input.
+        let cur = params.clear ? "" : el.value;
+        for (const ch of text) {
+          dispatchKey(el, "keydown", ch);
+          cur += ch;
+          setNativeValue(el, cur);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          dispatchKey(el, "keyup", ch);
+        }
       }
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      return pageState();
+      const tSettle = Date.now();
+      await settleForSuggestions(); // автокомплит приходит по сети после ввода
+      const st = withAfter(pageState(), false, el);
+      // Диагностика ожидания подсказок: длительность, число интерактивных, причина выхода.
+      st.debug_settle = Object.assign(
+        { settle_ms: Date.now() - tSettle },
+        B.debugSettle || {},
+        { interactive: B.snapshot && B.snapshot.countInteractive ? B.snapshot.countInteractive() : -1 }
+      );
+      return st;
     },
-
     async select(params) {
       const el = mustResolve(params.ref);
       if (el.tagName !== "SELECT") throw cerr("INTERNAL", "ref " + params.ref + " не <select>");
@@ -421,25 +584,26 @@
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       if (el.value !== value) throw cerr("INTERNAL", "option не найден: " + value);
-      return pageState();
+      return withAfter(pageState(), false, el);
     },
 
     async scroll(params) {
       window.scrollBy(0, Number(params.dy) || 0);
       await sleep(150);
-      return pageState();
+      return withAfter(pageState(), false);
     },
 
     async scrollIntoView(params) {
       const el = mustResolve(params.ref);
       el.scrollIntoView({ block: "center" });
       await sleep(150);
-      return pageState();
+      return withAfter(pageState(), false, el);
     },
 
     async pressKey(params) {
       pressKey(String(params.key || ""));
-      return pageState();
+      await settleForSuggestions(); // Enter/стрелки в поле поиска тоже ждут автокомплит
+      return withAfter(pageState(), false, document.activeElement);
     },
 
     async hover(params) {
@@ -448,7 +612,7 @@
       dispatchPointer(el, "pointerover");
       dispatchMouse(el, "mouseover");
       dispatchMouse(el, "mousemove");
-      return pageState();
+      return withAfter(pageState(), false);
     },
 
     async snapshot(params) {

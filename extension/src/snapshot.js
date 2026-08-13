@@ -96,7 +96,13 @@
       );
     },
 
-    /** Перепоиск по css-пути + сигнатуре; принимаем только ровно одного кандидата. */
+    /**
+     * Перепоиск по css-пути + сигнатуре. Несколько кандидатов — НЕ ошибка
+     * (AMBIGUOUS существует только для click-by-text); tie-breaking:
+     *  (а) точное совпадение пересчитанного css-пути;
+     *  (б) самый глубокий узел (чаще всего цель — <li> внутри <ul> с тем же текстом);
+     *  (в) по-прежнему >1 — null (→ STALE_REF).
+     */
     refind(entry) {
       let nodes;
       try {
@@ -104,13 +110,33 @@
       } catch (e) {
         return null;
       }
-      let found = null;
+      const candidates = [];
       for (const n of nodes) {
-        if (!this.matchesSignature(n, entry)) continue;
-        if (found) return null; // кандидатов несколько — неоднозначно
-        found = n;
+        if (this.matchesSignature(n, entry)) candidates.push(n);
       }
-      return found;
+      if (candidates.length === 0) return null;
+      if (candidates.length === 1) return candidates[0];
+      // (а) точное совпадение пути
+      const exactPath = candidates.filter((n) => cssPath(n) === entry.path);
+      if (exactPath.length === 1) return exactPath[0];
+      const pool = exactPath.length > 1 ? exactPath : candidates;
+      // (б) самый глубокий узел
+      let best = null;
+      let bestDepth = -1;
+      let tie = false;
+      for (const n of pool) {
+        let d = 0;
+        for (let c = n; c && c.parentElement; c = c.parentElement) d++;
+        if (d > bestDepth) {
+          best = n;
+          bestDepth = d;
+          tie = false;
+        } else if (d === bestDepth) {
+          tie = true;
+        }
+      }
+      // (в) неоднозначно — честный STALE_REF
+      return tie ? null : best;
     },
 
     resolve(ref) {
@@ -285,6 +311,30 @@
     return document.querySelector("main, article") || document.body;
   }
 
+  // ---------- расширенная эвристика интерактивности ----------
+  // Базовый INTERACTIVE_SEL (см. выше: роли option/menuitem/tab/switch/combobox
+  // и др.) + [onclick] + li/span/div с вычисленным cursor:pointer.
+  // getComputedStyle вызывается ЛЕНИВО: только для li/span/div без других
+  // признаков, и только после проверки видимости.
+  function isInteractiveEl(el) {
+    if (el.matches(INTERACTIVE_SEL)) return true;
+    if (el.hasAttribute("onclick")) return true;
+    const tag = el.tagName;
+    if (tag === "LI" || tag === "SPAN" || tag === "DIV") {
+      return isVisible(el) && getComputedStyle(el).cursor === "pointer";
+    }
+    return false;
+  }
+
+  /** Обход интерактивных элементов root в порядке документа (без скоуп/видимость-фильтров). */
+  function forEachInteractive(root, cb) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    let el;
+    while ((el = walker.nextNode())) {
+      if (isInteractiveEl(el)) cb(el);
+    }
+  }
+
   function compressedText(root) {
     const clone = root.cloneNode(true);
     clone
@@ -305,19 +355,24 @@
     let truncated = false;
     let count = 0;
 
-    const nodes = root.querySelectorAll(INTERACTIVE_SEL + "," + HEADING_SEL);
-    for (const el of nodes) {
-      if (!isVisible(el) || isSkippable(el)) continue;
+    // Один проход в порядке документа: заголовки + интерактивные (база + расширенная эвристика).
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    let el;
+    while ((el = walker.nextNode())) {
+      if (el.matches(HEADING_SEL)) {
+        if (!isVisible(el)) continue;
+        if (!noViewportFilter && !inViewport(el)) continue;
+        const t = clean(el.innerText || el.textContent);
+        if (t) lines.push("#".repeat(Number(el.tagName[1])) + " " + t);
+        continue;
+      }
+      if (!isInteractiveEl(el)) continue;
+      if (isSkippable(el) || !isVisible(el)) continue;
       if (!noViewportFilter && !inViewport(el)) continue;
       if (el.closest('[aria-hidden="true"]')) continue;
       if (count >= MAX_ELEMENTS) {
         truncated = true;
         break;
-      }
-      if (el.matches(HEADING_SEL)) {
-        const t = clean(el.innerText || el.textContent);
-        if (t) lines.push("#".repeat(Number(el.tagName[1])) + " " + t);
-        continue;
       }
       count++;
       lines.push(describe(el));
@@ -344,17 +399,105 @@
     const roleFilter = String(params.role || "").toLowerCase();
     const matches = [];
     if (!query) return matches;
-    for (const el of document.querySelectorAll(INTERACTIVE_SEL)) {
-      if (matches.length >= 20) break;
-      if (!isVisible(el) || isSkippable(el)) continue;
+    forEachInteractive(document.body, (el) => {
+      if (matches.length >= 20) return;
+      if (!isVisible(el) || isSkippable(el)) return;
       const role = (el.getAttribute("role") || implicitRole(el)).toLowerCase();
-      if (roleFilter && role !== roleFilter) continue;
+      if (roleFilter && role !== roleFilter) return;
       const text = labelOf(el);
       if (text.toLowerCase().includes(query)) {
         matches.push({ ref: refs.assign(el), text: clean(text, 120) });
       }
-    }
+    });
     return matches;
+  }
+
+  // ---------- поиск кликабельного по тексту (act.click {text}) ----------
+  // Точное совпадение → prefix → substring. Ровно один лучший — ok;
+  // 0 → {status:"none", texts: ближайшие}; >1 равнозначных → {status:"many"}.
+  function findByText(query) {
+    const q = clean(query).toLowerCase();
+    if (!q) return { status: "none", texts: [] };
+    const firstToken = q.split(/\s+/)[0];
+    const exact = [];
+    const prefix = [];
+    const partial = [];
+    const near = [];
+    forEachInteractive(document.body, (el) => {
+      if (!isVisible(el) || isSkippable(el)) return;
+      const t = clean(labelOf(el));
+      if (!t) return;
+      const lt = t.toLowerCase();
+      if (near.length < 5 && lt.indexOf(firstToken) !== -1) near.push(t.slice(0, 60));
+      if (lt === q) exact.push({ el, t });
+      else if (lt.startsWith(q)) prefix.push({ el, t });
+      else if (lt.indexOf(q) !== -1) partial.push({ el, t });
+    });
+    const best = exact.length ? exact : prefix.length ? prefix : partial;
+    if (best.length === 1) return { status: "one", el: best[0].el };
+    if (best.length > 1) {
+      return { status: "many", texts: best.slice(0, 5).map((c) => c.t.slice(0, 60)) };
+    }
+    return { status: "none", texts: near };
+  }
+
+  /** Число видимых интерактивных текущего скоупа — детектор появления автокомплита. */
+  function countInteractive() {
+    const root = scopeRoot({}) || document.body;
+    let n = 0;
+    forEachInteractive(root, (el) => {
+      if (isSkippable(el) || !isVisible(el) || !inViewport(el)) return;
+      n++;
+    });
+    return n;
+  }
+
+  // ---------- компактный after-блок для act.* ----------
+  // Строки в формате снапшота для текущего скоупа (main|article ∩ viewport),
+  // мягкий лимит ~2KB. ref-метки реальные: assign() — ими можно сразу пользоваться.
+  // pivot — элемент, с которым работала команда: интерактивные сортируются по
+  // ВИЗУАЛЬНОЙ близости к нему (центры rect'ов), чтобы реакция на действие
+  // (автокомплит, раскрывшийся блок) попадала в лимит первой. Визуальная, а
+  // не DOM-близость: выпадающие списки часто монтируются в конец <body> и по
+  // порядку документа далеки от поля ввода, хотя рисуются рядом с ним.
+  const AFTER_LIMIT = 2048;
+
+  function afterBlock(pivot) {
+    const root = scopeRoot({}) || document.body;
+    const entries = [];
+    forEachInteractive(root, (el) => {
+      if (isSkippable(el) || !isVisible(el) || !inViewport(el)) return;
+      if (el.closest('[aria-hidden="true"]')) return;
+      entries.push({ el, line: describe(el) });
+    });
+    if (pivot && pivot.getBoundingClientRect && entries.length > 1) {
+      const pr = pivot.getBoundingClientRect();
+      const px = pr.left + pr.width / 2;
+      const py = pr.top + pr.height / 2;
+      const dist2 = (el) => {
+        const r = el.getBoundingClientRect();
+        const dx = r.left + r.width / 2 - px;
+        const dy = r.top + r.height / 2 - py;
+        return dx * dx + dy * dy;
+      };
+      entries.sort((a, b) => dist2(a.el) - dist2(b.el));
+    }
+    const lines = [];
+    let size = 0;
+    let truncated = false;
+    for (const { line } of entries) {
+      if (size + line.length + 1 > AFTER_LIMIT) {
+        truncated = true;
+        break;
+      }
+      lines.push(line);
+      size += line.length + 1;
+    }
+    if (!lines.length) return {};
+    refs.dirty = false; // after — мини-снапшот: записи актуальны
+    const out = { after: lines.join("\n") };
+    if (truncated) out.after_truncated = true;
+    return out;
   }
 
   // ---------- extractMarkdown ----------
@@ -433,5 +576,5 @@
     }
   }
 
-  B.snapshot = { build, findText, extractMarkdown };
+  B.snapshot = { build, findText, findByText, afterBlock, countInteractive, extractMarkdown, isInteractiveEl };
 })();
