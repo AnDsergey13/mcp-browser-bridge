@@ -1,0 +1,8 @@
+node_modules/
+.bridge/
+downloads/*
+!downloads/.gitkeep
+memory/*
+!memory/.gitkeep
+!memory/global-notes.md
+ENVIRONMENT.local.md

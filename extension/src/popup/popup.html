@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="status">
+    <span id="connDot" class="dot off"></span>
+    <span id="connText">—</span>
+  </header>
+  <div id="injectorStatus" class="hint">Инжектор: —</div>
+  <div id="lastError" class="error hidden"></div>
+
+  <section id="approvalBox" class="panel warn hidden">
+    <p>Новая сессия агента запрашивает доступ к браузеру.</p>
+    <div class="row">
+      <button id="btnApprove" class="btn ok">Разрешить</button>
+      <button id="btnDeny" class="btn danger">Запретить</button>
+    </div>
+  </section>
+
+  <section id="hostPermBox" class="panel hidden">
+    <p>Для инжекции content scripts нужен доступ к сайтам.</p>
+    <button id="btnHostPerm" class="btn">Выдать доступ к сайтам</button>
+  </section>
+
+  <section id="autoPauseBox" class="panel warn hidden">
+    <p>Авто-пауза (капча/челлендж/2FA):</p>
+    <ul id="autoPauseList" class="autopause"></ul>
+  </section>
+
+  <section class="panel">
+    <label class="field">
+      <span>Пресет политики</span>
+      <select id="presetSelect"></select>
+    </label>
+  </section>
+
+  <section class="panel">
+    <button id="btnGrant" class="btn">Разовый грант (read+interact, сессия)</button>
+    <div class="hint">домен текущей вкладки: <span id="grantDomain">—</span></div>
+  </section>
+
+  <button id="btnPause" class="pause">ПАУЗА</button>
+
+  <div class="panel">
+    <div class="hint">Последнее действие</div>
+    <div id="lastAction">—</div>
+  </div>
+
+  <details class="panel">
+    <summary>Журнал (20)</summary>
+    <ul id="journal" class="journal"></ul>
+  </details>
+
+  <details class="panel">
+    <summary>Настройки</summary>
+    <label class="field">
+      <span>URL сервера</span>
+      <input id="inUrl" type="text" spellcheck="false" placeholder="ws://127.0.0.1:18777">
+    </label>
+    <label class="field">
+      <span>Секрет</span>
+      <input id="inSecret" type="password" spellcheck="false">
+    </label>
+    <button id="btnSave" class="btn">Сохранить</button>
+    <span id="saveMsg" class="hint"></span>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

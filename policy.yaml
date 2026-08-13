@@ -1,0 +1,51 @@
+# policy.yaml — ТОЛЬКО безопасность: домены, возможности, gating, предохранители.
+# Рекомендации по сайтам («какой хлеб брать», рабочие селекторы, заметки) —
+# НЕ здесь, а в memory/domains/<domain>.md и memory/global-notes.md.
+# Файл монтируется в контейнер и hot-reload'ится по изменению.
+
+version: 2
+active_preset: local-services   # переключается из popup расширения
+default: deny                    # всё, что не перечислено — запрещено
+
+# Дефолтные решения по gated-категориям: auto | confirm | deny
+gated_defaults:
+  pay: confirm
+  login: confirm
+  submit: confirm
+  delete: confirm
+
+# N16: предохранители. Значение здесь нельзя ослабить per-domain переопределением,
+# если в пресете нет явного `allow_unsafe: true`.
+hard_floor:
+  pay: confirm
+
+# N6: human-pacing
+pacing:
+  min_delay_ms: 400
+  max_delay_ms: 2500
+  max_actions_per_minute: 30
+
+presets:
+  local-services:
+    description: "Локальные сервисы, без церемоний"
+    domains:
+      "localhost:8080":
+        capabilities: [read, interact]
+        gated: { login: auto, submit: auto, delete: confirm }
+      "127.0.0.1:3000":
+        capabilities: [read, interact]
+        gated: { login: auto }
+
+  course:
+    description: "Сайт курса + ничего лишнего"
+    domains:
+      example.com:                # заменить на домен курса
+        capabilities: [read, interact, download]
+        gated: { submit: confirm }
+
+  shop:
+    description: "Закупка: наполнить корзину, checkout не открывать"
+    domains:
+      store.example.by:
+        capabilities: [read, interact]
+        # download отсутствует -> CAPABILITY_DENIED при попытке скачать
