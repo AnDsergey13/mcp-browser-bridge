@@ -226,6 +226,10 @@ export class BridgeCore {
   private classify(name: string, args: Record<string, unknown>, tabId: number | null, targetUrl: string): GatedCategory | null {
     if (name === 'tab.open') return classifyUrl(targetUrl);
     if ((name === 'act.click' || name === 'act.type' || name === 'act.select') && tabId !== null) {
+      // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
+      if (name === 'act.click' && !args['ref'] && args['text']) {
+        return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
+      }
       const ref = String(args['ref'] ?? '');
       const snap = this.snapshots.get(tabId);
       return classifyElement(snap?.refs.get(ref));
@@ -305,6 +309,12 @@ export class BridgeCore {
         return { tabs: visible, hidden_tabs: hidden };
       }
       case 'tab.open': {
+        // С tabId — навигация существующей вкладки (без новой); без — tabs.create.
+        if (tabId !== null) {
+          const res = await this.transport.request('navigate', { tabId, url: args['url'] }) as { url?: string; title?: string };
+          if (res.url) this.tabs.set(tabId, { url: res.url, title: res.title ?? '' });
+          return { tabId, ...res };
+        }
         const res = await this.transport.request('tab.open', { url: args['url'], active: args['active'] }) as { tabId: number; url: string; title: string };
         this.tabs.set(res.tabId, { url: res.url, title: res.title });
         return res;
@@ -328,8 +338,10 @@ export class BridgeCore {
         return this.pageCommand('findText', tabId, { query: args['query'], role: args['role'] });
       case 'page.screenshot':
         return this.pageCommand('screenshot', tabId, {});
-      case 'act.click':
-        return this.pageCommand('click', tabId, { ref: args['ref'] });
+      case 'act.click': {
+        if (!args['ref'] && !args['text']) throw new Error('act.click: нужен ref или text');
+        return this.pageCommand('click', tabId, { ref: args['ref'], text: args['text'] });
+      }
       case 'act.type':
         return this.pageCommand('type', tabId, { ref: args['ref'], text: args['text'], clear: args['clear'] });
       case 'act.select':
@@ -372,13 +384,13 @@ export function buildMcpServer(core: BridgeCore): McpServer {
 
   const defs: [string, string, Record<string, z.ZodTypeAny>][] = [
     ['tab.list', 'Список вкладок браузера', {}],
-    ['tab.open', 'Открыть URL в новой вкладке', { url: z.string(), active: z.boolean().optional() }],
+    ['tab.open', 'Открыть URL (без tabId — новая вкладка; с tabId — навигация существующей)', { url: z.string(), tabId: tabId.optional(), active: z.boolean().optional() }],
     ['tab.close', 'Закрыть вкладку', { tabId }],
     ['page.snapshot', 'Семантический снапшот страницы (интерактивные элементы с ref-метками)', { tabId, scope: z.enum(['viewport', 'main', 'full']).optional(), selector: z.string().optional() }],
     ['page.extract', 'Чистый markdown содержимого страницы', { tabId, selector: z.string().optional() }],
     ['page.find', 'Поиск по тексту/роли без полного снапшота (≤20 совпадений)', { tabId, query: z.string(), role: z.string().optional() }],
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId }],
-    ['act.click', 'Клик по элементу', { tabId, ref }],
+    ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional() }],
     ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional() }],
     ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string() }],
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional() }],

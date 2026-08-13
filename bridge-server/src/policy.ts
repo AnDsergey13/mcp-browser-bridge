@@ -311,7 +311,11 @@ export class PolicyEngine {
   // ---- pacing (N6), читается из текущей политики (hot-reload aware) ----
 
   pacing(): { min_delay_ms: number; max_delay_ms: number; max_actions_per_minute: number } {
-    const p = this.file.pacing ?? {};
+    const g = this.file.pacing ?? {};
+    // per-preset переопределение: presets.<name>.pacing поверх глобального
+    const preset = this.file.presets?.[this.activePreset()] as Record<string, unknown> | undefined;
+    const local = (preset?.['pacing'] ?? {}) as Partial<NonNullable<PolicyFile['pacing']>>;
+    const p = { ...g, ...local };
     return {
       min_delay_ms: p.min_delay_ms ?? 400,
       max_delay_ms: p.max_delay_ms ?? 2500,
