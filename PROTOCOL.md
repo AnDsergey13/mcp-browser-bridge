@@ -64,7 +64,8 @@
 
 ### Вкладки
 - `tab.list` `{}` → `{tabs:[{tabId,url,title,active}]}`
-- `tab.open` `{url, active?:bool}` → `{tabId,url,title}` (после load)
+- `tab.open` `{url, active?:bool}` → `{tabId,url,title}` (после load).
+  MCP-вариант: с `tabId` — навигация существующей вкладки (`navigate`), без — новая.
 - `tab.close` `{tabId}` → `{}`
 
 ### Страница
@@ -93,7 +94,14 @@
 
 Ошибки расширения: `NO_TAB`, `STALE_REF` (ref инвалидирован — агент должен
 сделать свежий snapshot), `NAV_TIMEOUT`, `FETCH_FAILED`, `CONTENT_SCRIPT_ABSENT`
-(домен вне match_patterns — значит и политика бы не пустила).
+(домен вне match_patterns — значит и политика бы не пустила), `DOMAIN_MISMATCH`
+(текущий URL вкладки не совпадает с match_patterns политики — команда не
+исполнена), `NOT_FOUND`/`AMBIGUOUS` (click-by-text: кандидатов ноль или >1).
+
+`click` принимает `ref` ИЛИ `text` (атомарный поиск+клик в момент исполнения,
+устойчив к перерисовкам). Ответы act.* содержат `after` — свежие
+интерактивные элементы скоупа (если DOM/URL изменились; ≤2KB) — отдельный
+snapshot после действия обычно не нужен.
 
 ## 5. Запросы расширение → сервер (req)
 
