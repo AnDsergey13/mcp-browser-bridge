@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "browser-bridge": {
+      "command": "node",
+      "args": ["bridge-server/src/index.ts"],
+      "cwd": "/workspace"
+    }
+  }
+}
