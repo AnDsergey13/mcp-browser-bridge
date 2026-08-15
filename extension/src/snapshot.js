@@ -501,7 +501,7 @@
   }
 
   // ---------- extractMarkdown ----------
-  const STRIP_SEL = "script,style,noscript,nav,footer,aside,form,iframe,svg";
+  const STRIP_SEL = "script,style,noscript,nav,footer,aside,form,svg";
 
   function extractMarkdown(params) {
     params = params || {};
@@ -510,13 +510,21 @@
       document.querySelector("main, article") ||
       document.body;
 
-    // Манифест картинок — без URL (скачивание по номеру манифеста).
+    // Манифест картинок: src нужен для скачивания (file.download) по номеру n.
+    // Инлайн data: URI не тащим — только пометка.
     const images = [];
+    // Видимость проверяем ДО клонирования: клон отсоединён от DOM,
+    // getClientRects() на нём пуст, isVisible внутри walkMd бесполезен.
+    const visibleImgs = new Set();
     let n = 0;
     src.querySelectorAll("img").forEach((img) => {
       if (!isVisible(img)) return;
+      visibleImgs.add(img);
+      let srcUrl = img.currentSrc || img.src || "";
+      if (srcUrl.startsWith("data:")) srcUrl = "data:(inline)";
       images.push({
         n: ++n,
+        src: clean(srcUrl, 1000),
         alt: clean(img.getAttribute("alt") || "", 80),
         w: img.naturalWidth || img.width || 0,
         h: img.naturalHeight || img.height || 0,
@@ -525,6 +533,12 @@
 
     const clone = src.cloneNode(true);
     clone.querySelectorAll(STRIP_SEL).forEach((x) => x.remove());
+    // walkMd ходит по клону: видимым img ставим метку-класс, переживающую клон.
+    src.querySelectorAll("img").forEach((img, i) => {
+      if (!visibleImgs.has(img)) return;
+      const c = clone.querySelectorAll("img")[i];
+      if (c) c.setAttribute("data-bridge-visible", "1");
+    });
     const out = [];
     walkMd(clone, out);
     const markdown = out
@@ -535,15 +549,31 @@
     return { markdown, images };
   }
 
+  function pushFrag(out, s) {
+    if (!s) return;
+    // Склейка соседних инлайн-фрагментов: <strong>/<a> внутри фразы рвут
+    // текст на узлы — граница узлов почти всегда граница слов, поэтому
+    // по умолчанию вставляем пробел. Не вставляем после открывающей скобки
+    // и перед закрывающей пунктуацией/скобкой.
+    const last = out.length ? out[out.length - 1] : "";
+    const lastC = last.replace(/\s+$/, "").slice(-1);
+    const headC = s.replace(/^[*_`\[\]]+/, "").charAt(0);
+    if (lastC && !/\s$/.test(last) && !"([/".includes(lastC) &&
+        !/^[,.!?;:%\]\)}]/.test(headC)) {
+      out.push(" ");
+    }
+    out.push(s);
+  }
+
   function walkMd(node, out) {
     for (const child of node.childNodes) {
       if (child.nodeType === 3) {
-        const t = clean(child.textContent);
-        if (t) out.push(t);
+        pushFrag(out, clean(child.textContent));
         continue;
       }
       if (child.nodeType !== 1) continue;
       const tag = child.tagName.toLowerCase();
+      if (tag === "button") continue; // UI-кнопки ("Enable fullscreen") — не контент
       if (/^h[1-6]$/.test(tag)) {
         const t = clean(child.textContent);
         if (t) out.push("\n\n" + "#".repeat(Number(tag[1])) + " " + t + "\n\n");
@@ -560,16 +590,42 @@
       } else if (tag === "br") {
         out.push("\n");
       } else if (tag === "a") {
+        // img внутри ссылки: ссылка-обёртка не нужна, важна сама картинка.
+        const imgOnly = child.querySelector("img") && !clean(child.textContent);
+        if (imgOnly) {
+          walkMd(child, out);
+          continue;
+        }
         const t = clean(child.textContent);
         const href = child.getAttribute("href");
-        if (t && href) out.push("[" + t + "](" + href + ")");
-        else if (t) out.push(t);
+        if (t && href) pushFrag(out, "[" + t + "](" + href + ")");
+        else if (t) pushFrag(out, t);
+      } else if (tag === "img") {
+        // Картинка инлайн — на своём месте в тексте (скачивается по src,
+        // локализация путей — на стороне агента/скриптов). Видимость помечена
+        // на оригинале до клонирования (data-bridge-visible).
+        const srcUrl = child.currentSrc || child.src || "";
+        if (srcUrl && !srcUrl.startsWith("data:") &&
+            child.hasAttribute("data-bridge-visible")) {
+          const alt = clean(child.getAttribute("alt") || "", 80);
+          out.push("\n\n![" + alt + "](" + srcUrl + ")\n\n");
+        }
+      } else if (tag === "iframe") {
+        // Встраиваемый плеер/виджет: оставляем маркер с URL — видео-скрипты
+        // находят поток по net.list и подменяют маркер локальным файлом.
+        const srcUrl = child.getAttribute("src") || "";
+        if (srcUrl) out.push("\n\n[embedded: " + srcUrl + "]\n\n");
+      } else if (tag === "video" || tag === "audio") {
+        const srcUrl = child.currentSrc || child.src || "";
+        if (srcUrl && !srcUrl.startsWith("blob:")) {
+          out.push("\n\n[" + tag + ": " + srcUrl + "]\n\n");
+        }
       } else if (tag === "strong" || tag === "b") {
         const t = clean(child.textContent);
-        if (t) out.push("**" + t + "**");
+        if (t) pushFrag(out, "**" + t + "**");
       } else if (tag === "em" || tag === "i") {
         const t = clean(child.textContent);
-        if (t) out.push("*" + t + "*");
+        if (t) pushFrag(out, "*" + t + "*");
       } else {
         walkMd(child, out);
       }

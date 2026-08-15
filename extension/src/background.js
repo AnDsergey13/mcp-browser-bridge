@@ -58,6 +58,35 @@ function syncAutoPaused() {
   saveState({ autoPaused: list });
 }
 
+// ---------- netWatch: пассивный лог media-запросов (m3u8/mpd/media) ----------
+// Только наблюдение (без блокировок): ищем прямые URL потоков для скачивания.
+// Буфер кольцевой, по 50 записей на вкладку; чистится при навигации и закрытии.
+const NETLOG_CAP = 50;
+const NETLOG_STREAM_RE = /\.(m3u8|mpd)(\?|#|$)/i;
+/** @type {Map<number, Array<{ts:number,url:string,type:string,frameId:number}>>} */
+const netLog = new Map();
+
+browser.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (d.tabId < 0) return; // фоновые запросы без вкладки не интересны
+    if (d.type !== "media" && !NETLOG_STREAM_RE.test(d.url)) return;
+    let arr = netLog.get(d.tabId);
+    if (!arr) netLog.set(d.tabId, (arr = []));
+    arr.push({ ts: Date.now(), url: d.url, type: d.type, frameId: d.frameId });
+    if (arr.length > NETLOG_CAP) arr.splice(0, arr.length - NETLOG_CAP);
+  },
+  { urls: ["<all_urls>"], types: ["media", "xmlhttprequest"] }
+);
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") netLog.delete(tabId);
+});
+browser.tabs.onRemoved.addListener((tabId) => netLog.delete(tabId));
+
+function netListCommand(params) {
+  return { requests: netLog.get(params.tabId) || [] };
+}
+
 // ---------- утилиты ----------
 function perr(code, message) {
   const e = new Error(message);
@@ -665,6 +694,9 @@ async function handleServerReq(msg) {
       return screenshotCommand(params);
     case "fetchFile":
       return fetchFileCommand(params);
+    case "netList":
+      await assertTabDomain(params.tabId);
+      return netListCommand(params);
     case "consent.ask":
       return consentCommand(params);
     default:

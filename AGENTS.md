@@ -20,7 +20,15 @@
   `policy_reminder` ответов.
 - Навигация и чтение — через `page.snapshot`/`page.extract`, действия — через
   `act.*` по ref-меткам снапшота. После SPA-перерисовки ref устаревает
-  (`STALE_REF`) — сделай свежий snapshot.
+  (`STALE_REF`) — сделай свежий snapshot. Прямые URL медиа-потоков
+  (m3u8/mpd/mp4) — через `net.list` после запуска воспроизведения.
+- Скачивание медиа — готовыми скриптами из `bridge-server/scripts/` (не руками
+  через отдельные file.download): `hls-download.py` (HLS: master→variant→
+  сегменты→склейка .ts, ffmpeg-ремукс если есть; `--net` берёт потоки из
+  net.list) и `localize-page.py` (страница → самодостаточный content.md:
+  картинки скачаны в images/ и вписаны по месту, embed'ы видео подменены
+  локальными файлами). Оба идут через живой live-repl и file.download;
+  нужны download-гранты на домены ФАЙЛОВ (CDN), не только страницы.
 - Gating не обходить никогда: `ACTION_DENIED`, `AUTO_PAUSED_HUMAN_NEEDED`,
   `PAUSED`, `STATE_DIVERGED`, `DOMAIN_NOT_ALLOWED`, `CAPABILITY_DENIED` —
   это СТОП и доклад пользователю, а не повторные попытки и не поиск обхода.
