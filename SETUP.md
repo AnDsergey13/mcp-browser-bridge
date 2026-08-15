@@ -11,8 +11,10 @@
    `node --import tsx src/index.ts` с cwd `/workspace/bridge-server`
    (исправлено 2026-08-15; голый `node index.ts` .ts не загружает).
 4. Браузер: `about:debugging` → Load Temporary Add-on →
-   `extension/manifest.json` (если браузер перезапускался). После загрузки
-   перезагрузи вкладку курса (F5) — иначе старые content scripts.
+   `extension/manifest.json` (если браузер перезапускался). Открытые вкладки
+   грантованных доменов переинжектируются автоматически при первом
+   policy.update (П2-6) — F5 больше не обязателен; если вкладка «не
+   отвечает» (CONTENT_SCRIPT_ABSENT) — перезагрузи её вручную.
 5. Popup: подтверди «Новая сессия агента» → выдай session-гранты доменам
    (для курса: `course.cpsdrone.com`, `fast.wistia.com`,
    `embed-cloudfront.wistia.com`, `files.cdn.thinkific.com` —
