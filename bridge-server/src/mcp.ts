@@ -24,7 +24,7 @@ interface TabInfo { url: string; title: string }
 interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string }
 interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash: string | null } }
 
-const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot']);
+const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list']);
 const ACT_TOOLS = new Set(['act.click', 'act.type', 'act.select', 'act.scroll', 'act.key']);
 
 function shortHash(text: string): string {
@@ -166,7 +166,9 @@ export class BridgeCore {
           return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`, reminder()));
         }
         // tab.close тоже идёт через policy (interact): нельзя закрыть чужую вкладку.
-        targetUrl = known.url;
+        // file.download: проверяем домен ФАЙЛА, а не вкладки — capability download
+        // должна быть выдана домену, с которого реально скачиваем.
+        targetUrl = name === 'file.download' ? String(args['url'] ?? '') : known.url;
       }
 
       // 6. Policy-проверка: домен + capability + gated-категория.
@@ -338,6 +340,8 @@ export class BridgeCore {
         return this.pageCommand('findText', tabId, { query: args['query'], role: args['role'] });
       case 'page.screenshot':
         return this.pageCommand('screenshot', tabId, {});
+      case 'net.list':
+        return this.transport.request('netList', { tabId });
       case 'act.click': {
         if (!args['ref'] && !args['text']) throw new Error('act.click: нужен ref или text');
         return this.pageCommand('click', tabId, { ref: args['ref'], text: args['text'] });
@@ -390,6 +394,7 @@ export function buildMcpServer(core: BridgeCore): McpServer {
     ['page.extract', 'Чистый markdown содержимого страницы', { tabId, selector: z.string().optional() }],
     ['page.find', 'Поиск по тексту/роли без полного снапшота (≤20 совпадений)', { tabId, query: z.string(), role: z.string().optional() }],
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId }],
+    ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional() }],
     ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional() }],
     ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string() }],

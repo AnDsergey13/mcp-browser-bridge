@@ -85,31 +85,39 @@
 
   // ---------- флаги DOM-маркеров ----------
   function computeFlags() {
-    const q = (sel) => {
+    // Только ВИДИМЫЕ элементы: script-теги и невидимые интеграции (invisible
+    // reCAPTCHA/Turnstile, пустые 0px div.g-recaptcha) флагов не дают — иначе
+    // ложные авто-паузы на сайтах с фоновой антибот-защитой (Teachable и пр.).
+    const vis = (sel) => {
       try {
-        return !!document.querySelector(sel);
+        for (const el of document.querySelectorAll(sel)) {
+          if (el.getClientRects().length && el.offsetWidth > 0 && el.offsetHeight > 0) {
+            return true;
+          }
+        }
+        return false;
       } catch (e) {
         return false;
       }
     };
     const flags = [];
     if (
-      q(
+      vis(
         '[id*="cf-chl"],[class*="cf-chl"],[id*="challenge-platform"],[class*="challenge-platform"],' +
           '[id*="turnstile"],[class*="turnstile"],' +
-          'iframe[src*="challenges.cloudflare.com"],script[src*="challenges.cloudflare.com"]'
+          'iframe[src*="challenges.cloudflare.com"]'
       )
     )
       flags.push("cloudflare_challenge");
     if (
-      q(
-        '.g-recaptcha,[class*="g-recaptcha"],iframe[src*="recaptcha"],script[src*="recaptcha"],' +
+      vis(
+        '.g-recaptcha,[class*="g-recaptcha"],iframe[src*="recaptcha"],' +
           '.h-captcha,[class*="h-captcha"],iframe[src*="hcaptcha"]'
       )
     )
       flags.push("captcha");
-    if (q('input[autocomplete="one-time-code"]')) flags.push("otp");
-    if (q('input[type="password"]')) flags.push("login_form");
+    if (vis('input[autocomplete="one-time-code"]')) flags.push("otp");
+    if (vis('input[type="password"]')) flags.push("login_form");
     return flags;
   }
 

@@ -6,3 +6,5 @@ memory/*
 !memory/.gitkeep
 !memory/global-notes.md
 ENVIRONMENT.local.md
+tools/
+__pycache__/

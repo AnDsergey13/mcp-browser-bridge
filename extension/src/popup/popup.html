@@ -39,8 +39,13 @@
   </section>
 
   <section class="panel">
-    <button id="btnGrant" class="btn">Разовый грант (read+interact, сессия)</button>
     <div class="hint">домен текущей вкладки: <span id="grantDomain">—</span></div>
+    <div class="hint">capabilities:
+      <label><input type="checkbox" id="capRead" checked> read</label>
+      <label><input type="checkbox" id="capInteract" checked> interact</label>
+      <label><input type="checkbox" id="capDownload"> download</label>
+    </div>
+    <button id="btnGrant" class="btn">Выдать / обновить грант (сессия)</button>
     <div id="grantMsg" class="hint"></div>
   </section>
 

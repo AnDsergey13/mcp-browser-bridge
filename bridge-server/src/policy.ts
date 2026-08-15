@@ -159,16 +159,22 @@ export class PolicyEngine {
 
   // ---- разовые гранты ----
 
-  addSessionGrant(domain: string, capabilities: Capability[]): void {
+  /**
+   * Разовый грант с REPLACE-семантикой: popup шлёт полный набор capabilities
+   * (чекбоксы), поэтому повторная выдача = редактирование — capability можно
+   * и снять. Пресетные домены не перезаписываются: session-грант лишь
+   * дополняет/переопределяет поверх пресета (grantFor мержит).
+   */
+  setSessionGrant(domain: string, capabilities: Capability[]): void {
     const existing = this.sessionGrants.get(domain);
-    const caps = new Set<Capability>([...(existing?.capabilities ?? []), ...capabilities]);
+    const caps = [...new Set(capabilities)];
     this.sessionGrants.set(domain, {
-      capabilities: [...caps],
+      capabilities: caps,
       gated: existing?.gated ?? {},
       source: 'session',
     });
     this.updateVersion++;
-    this.audit({ kind: 'grant', domain, decision: 'session_grant', capabilities: [...caps] });
+    this.audit({ kind: 'grant', domain, decision: existing ? 'session_grant_update' : 'session_grant', capabilities: caps });
     this.emitChange();
   }
 

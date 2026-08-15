@@ -74,9 +74,18 @@
 - `reload` `{tabId}` → `{url,title,flags}`
 - `snapshot` `{tabId, scope?:"viewport"|"main"|"full", selector?}` →
   `{url,title,snapshot,dom_hash,flags,truncated}` — семантический снапшот (§6)
-- `extractMarkdown` `{tabId, selector?}` → `{url,title,markdown,images:[{n,alt,w,h}],flags}`
+- `extractMarkdown` `{tabId, selector?}` → `{url,title,markdown,images:[{n,src,alt,w,h}],flags}`
+  Картинки и embed'ы стоят ИНЛАЙН в markdown на своих местах: `![alt](src)`,
+  `[embedded: iframe-src]`, `[video|audio: src]`. Манифест `images` — для
+  скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
+  Локализация (скачать картинки, подменить URL на локальные пути) —
+  `bridge-server/scripts/localize-page.py`.
 - `findText` `{tabId,query,role?}` → `{matches:[{ref,text}],flags}` (≤20)
 - `screenshot` `{tabId}` → `{data_jpeg_base64}` (≤1280px, q70)
+- `netList` `{tabId}` → `{requests:[{ts,url,type,frameId}]}` — пассивный лог
+  media-запросов вкладки (webRequest, тип `media` + URL `*.m3u8|*.mpd`;
+  кольцевой буфер 50 записей, чистится при навигации/закрытии вкладки).
+  MCP-инструмент: `net.list`, capability `read` по домену вкладки.
 - `click` `{tabId,ref}` → `{url,title,flags,navigated}`
 - `type` `{tabId,ref,text,clear?:bool}` → `{url,title,flags}`
 - `select` `{tabId,ref,value}` → `{url,title,flags}`
@@ -86,11 +95,15 @@
 - `getStateHash` `{tabId}` → `{url,dom_hash}` — для reconcile при resume
 - `fetchFile` `{tabId,url,name?}` → поток событий (§8); финальный res:
   `{transferId,size,sha256}` — res приходит ПОСЛЕ evt `file.end`.
+  Policy проверяет домен ФАЙЛА (`url`), а не вкладки: capability `download`
+  должна быть выдана домену, с которого скачиваем.
 
 `flags` — массив строк из `["captcha","cloudflare_challenge","otp","login_form"]`,
-вычисляется content script'ом по DOM-маркерам после каждой команды
+вычисляется content script'ом по ВИДИМЫМ DOM-маркерам после каждой команды
 (`cf-chl`, `challenge-platform`, `turnstile`, `g-recaptcha`, `h-captcha`,
-`input[autocomplete=one-time-code]`, `input[type=password]`).
+`input[autocomplete=one-time-code]`, `input[type=password]`). Невидимые
+интеграции (invisible reCAPTCHA/Turnstile, script-теги, 0px-контейнеры)
+флагов не дают — защита от ложных авто-пауз.
 
 Ошибки расширения: `NO_TAB`, `STALE_REF` (ref инвалидирован — агент должен
 сделать свежий snapshot), `NAV_TIMEOUT`, `FETCH_FAILED`, `CONTENT_SCRIPT_ABSENT`
@@ -107,7 +120,9 @@ snapshot после действия обычно не нужен.
 
 - `consent.response` НЕ нужен — согласие это res на серверный req (ниже).
 - `grant.add` `{domain, capabilities:["read","interact",...], scope:"session"}` →
-  `{granted:true}` — разовый грант из popup. Сервер пишет аудит и шлёт
+  `{granted:true}` — разовый грант из popup. REPLACE-семантика: popup шлёт полный
+  набор capabilities (чекбоксы), повторная выдача = редактирование (можно снять
+  capability). Невалидные capability отбрасываются. Сервер пишет аудит и шлёт
   свежий `policy.update` всем.
 - `grant.remove` `{domain}` → `{removed:bool}` — отзыв разового гранта из popup
   (только session-гранты; пресетные домены — правкой policy.yaml). Сервер пишет
