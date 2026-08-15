@@ -72,6 +72,7 @@
   const refs = {
     counter: 0,
     map: new Map(),
+    byEl: new WeakMap(), // Element → ref: O(1) дедуп в assign (П1-4)
     dirty: false,
     mapUrl: location.href,
 
@@ -83,6 +84,7 @@
     checkNavigation() {
       if (location.href !== this.mapUrl) {
         this.map.clear();
+        this.byEl = new WeakMap();
         this.mapUrl = location.href;
         this.dirty = false;
       }
@@ -163,9 +165,11 @@
 
     assign(el) {
       this.checkNavigation();
-      // Дедупликация: живой ref для того же элемента переиспользуется.
-      for (const [r, entry] of this.map) {
-        if (entry.el === el && el.isConnected) return r;
+      // Дедупликация: живой ref для того же элемента переиспользуется (O(1)).
+      const known = this.byEl.get(el);
+      if (known && el.isConnected) {
+        const entry = this.map.get(known);
+        if (entry && entry.el === el) return known;
       }
       const r = "e" + ++this.counter;
       this.map.set(r, {
@@ -175,6 +179,7 @@
         text: sigText(el),
         path: cssPath(el),
       });
+      this.byEl.set(el, r);
       return r;
     },
   };
@@ -347,13 +352,55 @@
   }
 
   // ---------- семантический снапшот (§9) ----------
+  // П1-5: ≥5 подряд идущих строк с одинаковой сигнатурой (роль + текст,
+  // напр. 50 кнопок «Купить») сворачиваются в `[e12..e61] button "Купить" ×50`.
+  // Свёртка только визуальная: refs выданы всем элементам, act.* по любому
+  // ref из диапазона работает (сервер раскрывает диапазон в parseSnapshotRefs).
+  // Сворачиваем только численно ПОСЛЕДОВАТЕЛЬНЫЕ refs — переиспользованный
+  // старый ref ломал бы нотацию диапазона.
+  function collapseRepeats(lines) {
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const m = /^\[(e(\d+))\]\s(.*)$/.exec(lines[i]);
+      if (!m) {
+        out.push(lines[i]);
+        i++;
+        continue;
+      }
+      let j = i + 1;
+      let prevNum = Number(m[2]);
+      let consecutive = true;
+      while (j < lines.length) {
+        const m2 = /^\[(e(\d+))\]\s(.*)$/.exec(lines[j]);
+        if (!m2 || m2[3] !== m[3]) break;
+        if (Number(m2[2]) !== prevNum + 1) consecutive = false;
+        prevNum = Number(m2[2]);
+        j++;
+      }
+      if (j - i >= 5 && consecutive) {
+        out.push("[" + m[1] + "..e" + prevNum + "] " + m[3] + " ×" + (j - i));
+      } else {
+        for (let k = i; k < j; k++) out.push(lines[k]);
+      }
+      i = j;
+    }
+    return out;
+  }
+
   function build(params) {
     params = params || {};
     const root = scopeRoot(params) || document.body;
     const noViewportFilter = params.scope === "full" || !!params.selector;
     const lines = [];
+    // П1-4б: хром страницы (меню/шапка/подвал) при дефолтном скоупе опускаем
+    // В КОНЕЦ снапшота — контент идёт первым, но элементы остаются адресуемыми.
+    // scope:"full" и явный selector — старое поведение (порядок документа).
+    const deferred = [];
     let truncated = false;
     let count = 0;
+    // П1-4а: эмитнутые cursor-pointer элементы → {idx, text} для дедупа цепочек.
+    const pointerSeen = new Map();
 
     // Один проход в порядке документа: заголовки + интерактивные (база + расширенная эвристика).
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
@@ -375,9 +422,35 @@
         break;
       }
       count++;
-      lines.push(describe(el));
+
+      // П1-4а: pointer-цепочка (div в div с cursor:pointer и тем же текстом) —
+      // оставляем только НИЖНИЙ элемент: он ближе к тексту, клик надёжнее.
+      const tag = el.tagName;
+      const cursorOnly =
+        (tag === "LI" || tag === "SPAN" || tag === "DIV") &&
+        !el.matches(INTERACTIVE_SEL) &&
+        !el.hasAttribute("onclick");
+      if (cursorOnly) {
+        const text = clean(el.innerText || "");
+        for (let p = el.parentElement; p; p = p.parentElement) {
+          const rec = pointerSeen.get(p);
+          if (rec && rec.text === text) {
+            lines[rec.idx] = null; // предок-дубль с тем же текстом
+            pointerSeen.delete(p);
+          }
+        }
+        const idx = lines.length;
+        lines.push(describe(el));
+        pointerSeen.set(el, { idx, text });
+        continue;
+      }
+
+      const line = describe(el);
+      if (!noViewportFilter && el.closest("header,nav,footer,aside")) deferred.push(line);
+      else lines.push(line);
     }
 
+    const body = collapseRepeats(lines.filter(Boolean).concat(deferred));
     const text = compressedText(root);
     const snapshot =
       "url: " +
@@ -385,7 +458,7 @@
       "\ntitle: " +
       document.title +
       "\n" +
-      lines.join("\n") +
+      body.join("\n") +
       (text ? "\n" + text : "");
     // Свежий снапшот = свежий взгляд на DOM: снимаем dirty, записи актуальны.
     refs.dirty = false;
@@ -502,9 +575,64 @@
 
   // ---------- extractMarkdown ----------
   const STRIP_SEL = "script,style,noscript,nav,footer,aside,form,svg";
+  const MD_MAX_CHARS = 15000; // П2-1: лимит ДО серверного capResponse (резка по абзацу)
+
+  // Детектор div-супа (П2-1): семантических блоков мало при большом тексте.
+  function isDivSoup(root) {
+    const textLen = (root.textContent || "").replace(/\s+/g, "").length;
+    if (textLen <= 2000) return false;
+    return root.querySelectorAll("p,h1,h2,h3,h4,h5,h6,li").length < 10;
+  }
+
+  // Доля текста внутри <a>: у меню/футеров/related-ссылок высокая, у контента низкая.
+  function linkDensityOf(el) {
+    const textLen = (el.textContent || "").replace(/\s+/g, " ").trim().length;
+    if (!textLen) return 0;
+    let linkLen = 0;
+    el.querySelectorAll("a").forEach((a) => {
+      linkLen += (a.textContent || "").length;
+    });
+    return linkLen / textLen;
+  }
+
+  /**
+   * Density-режим (П2-1, свои эвристики, без внешних библиотек): выбираем
+   * самый «текстовый» контейнер (score = длина текста × (1 − link-density)),
+   * поднимаемся к верхнему хорошему предку, чтобы захватить соседние абзацы.
+   */
+  function pickDensityContainer(root) {
+    let best = null;
+    let bestScore = 0;
+    root.querySelectorAll("div,section,article,main").forEach((b) => {
+      const textLen = (b.textContent || "").replace(/\s+/g, " ").trim().length;
+      if (textLen < 200) return;
+      const ld = linkDensityOf(b);
+      if (ld > 0.5) return; // меню/список ссылок — не контент
+      const score = textLen * (1 - ld);
+      if (score > bestScore) {
+        bestScore = score;
+        best = b;
+      }
+    });
+    if (!best) return null;
+    let cur = best;
+    while (cur.parentElement && cur.parentElement !== root) {
+      const p = cur.parentElement;
+      const textLen = (p.textContent || "").replace(/\s+/g, " ").trim().length;
+      const ld = linkDensityOf(p);
+      if (textLen < 200 || ld > 0.5) break;
+      if (textLen * (1 - ld) < bestScore * 0.75) break;
+      cur = p;
+    }
+    return cur;
+  }
 
   function extractMarkdown(params) {
     params = params || {};
+    // П2-2: images — "inline" (по умолчанию, контракт localize-page.py),
+    // "manifest" (только манифест, без инлайна в тексте), "off" (чистое чтение).
+    const imagesMode = params.images || "inline";
+    const maxChars = Number(params.max_chars) > 0 ? Number(params.max_chars) : MD_MAX_CHARS;
     const src =
       (params.selector && document.querySelector(params.selector)) ||
       document.querySelector("main, article") ||
@@ -516,36 +644,58 @@
     // Видимость проверяем ДО клонирования: клон отсоединён от DOM,
     // getClientRects() на нём пуст, isVisible внутри walkMd бесполезен.
     const visibleImgs = new Set();
-    let n = 0;
-    src.querySelectorAll("img").forEach((img) => {
-      if (!isVisible(img)) return;
-      visibleImgs.add(img);
-      let srcUrl = img.currentSrc || img.src || "";
-      if (srcUrl.startsWith("data:")) srcUrl = "data:(inline)";
-      images.push({
-        n: ++n,
-        src: clean(srcUrl, 1000),
-        alt: clean(img.getAttribute("alt") || "", 80),
-        w: img.naturalWidth || img.width || 0,
-        h: img.naturalHeight || img.height || 0,
+    if (imagesMode !== "off") {
+      let n = 0;
+      src.querySelectorAll("img").forEach((img) => {
+        if (!isVisible(img)) return;
+        visibleImgs.add(img);
+        let srcUrl = img.currentSrc || img.src || "";
+        if (srcUrl.startsWith("data:")) srcUrl = "data:(inline)";
+        images.push({
+          n: ++n,
+          src: clean(srcUrl, 1000),
+          alt: clean(img.getAttribute("alt") || "", 80),
+          w: img.naturalWidth || img.width || 0,
+          h: img.naturalHeight || img.height || 0,
+        });
       });
-    });
+    }
 
+    // Маркировка видимых img — НА ОРИГИНАЛЕ до клонирования (П2-1): клон
+    // унаследует атрибут, хрупкая индексная синхронизация img[i] не нужна.
+    // Атрибут временный: сразу после клонирования снимаем его с оригинала.
+    if (imagesMode === "inline") {
+      visibleImgs.forEach((img) => img.setAttribute("data-bridge-visible", "1"));
+    }
     const clone = src.cloneNode(true);
+    if (imagesMode === "inline") {
+      visibleImgs.forEach((img) => img.removeAttribute("data-bridge-visible"));
+    }
     clone.querySelectorAll(STRIP_SEL).forEach((x) => x.remove());
-    // walkMd ходит по клону: видимым img ставим метку-класс, переживающую клон.
-    src.querySelectorAll("img").forEach((img, i) => {
-      if (!visibleImgs.has(img)) return;
-      const c = clone.querySelectorAll("img")[i];
-      if (c) c.setAttribute("data-bridge-visible", "1");
-    });
+
+    const opts = { density: false, inlineImages: imagesMode === "inline" };
+    let target = clone;
+    if (isDivSoup(clone)) {
+      const container = pickDensityContainer(clone);
+      if (container) {
+        opts.density = true;
+        target = container;
+      }
+    }
     const out = [];
-    walkMd(clone, out);
-    const markdown = out
+    walkMd(target, out, opts);
+    let markdown = out
       .join("")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]+\n/g, "\n")
       .trim();
+    // Лимит по границе абзаца (лучше, чем обрубок строки серверным резаком).
+    if (markdown.length > maxChars) {
+      const boundary = markdown.lastIndexOf("\n\n", maxChars);
+      markdown =
+        markdown.slice(0, boundary > maxChars / 2 ? boundary : maxChars) +
+        "\n\n… [обрезано по max_chars]";
+    }
     return { markdown, images };
   }
 
@@ -565,7 +715,8 @@
     out.push(s);
   }
 
-  function walkMd(node, out) {
+  function walkMd(node, out, opts) {
+    opts = opts || {};
     for (const child of node.childNodes) {
       if (child.nodeType === 3) {
         pushFrag(out, clean(child.textContent));
@@ -579,12 +730,20 @@
         if (t) out.push("\n\n" + "#".repeat(Number(tag[1])) + " " + t + "\n\n");
       } else if (tag === "p") {
         const buf = [];
-        walkMd(child, buf);
+        walkMd(child, buf, opts);
+        const t = buf.join("").trim();
+        if (t) out.push("\n\n" + t + "\n\n");
+      } else if (opts.density && (tag === "div" || tag === "section" || tag === "article")) {
+        // П2-1 density-режим: текстовые div склеиваем в абзацы; блоки-«хвосты»
+        // (футеры, related-ссылки, link-density > 0.5) отсекаем.
+        if (linkDensityOf(child) > 0.5) continue;
+        const buf = [];
+        walkMd(child, buf, opts);
         const t = buf.join("").trim();
         if (t) out.push("\n\n" + t + "\n\n");
       } else if (tag === "li") {
         const buf = [];
-        walkMd(child, buf);
+        walkMd(child, buf, opts);
         const t = buf.join("").trim();
         if (t) out.push("\n- " + t);
       } else if (tag === "br") {
@@ -593,7 +752,7 @@
         // img внутри ссылки: ссылка-обёртка не нужна, важна сама картинка.
         const imgOnly = child.querySelector("img") && !clean(child.textContent);
         if (imgOnly) {
-          walkMd(child, out);
+          walkMd(child, out, opts);
           continue;
         }
         const t = clean(child.textContent);
@@ -603,7 +762,9 @@
       } else if (tag === "img") {
         // Картинка инлайн — на своём месте в тексте (скачивается по src,
         // локализация путей — на стороне агента/скриптов). Видимость помечена
-        // на оригинале до клонирования (data-bridge-visible).
+        // на оригинале до клонирования (data-bridge-visible унаследован клоном).
+        // images:"manifest"/"off" — без инлайна в тексте (П2-2).
+        if (!opts.inlineImages) continue;
         const srcUrl = child.currentSrc || child.src || "";
         if (srcUrl && !srcUrl.startsWith("data:") &&
             child.hasAttribute("data-bridge-visible")) {
@@ -627,10 +788,65 @@
         const t = clean(child.textContent);
         if (t) pushFrag(out, "*" + t + "*");
       } else {
-        walkMd(child, out);
+        walkMd(child, out, opts);
       }
     }
   }
 
-  B.snapshot = { build, findText, findByText, afterBlock, countInteractive, extractMarkdown, isInteractiveEl };
+  // ---------- scan: автоскролл ленты с агрегацией (П2-3) ----------
+  // Каждый экран: сбор интерактивных viewport'а → дедуп по сигнатуре (строка
+  // без ref-префикса) → скролл. Стоп: 3 экрана без новых уникальных ИЛИ упор
+  // в низ ленты, лимиты: max_screens (≤20) и 45 с (страховка от «бесконечных»
+  // лент). refs живые (та же страница) — адресуемы сразу.
+  const SCAN_LINE_REF = /^\[(e\d+)\]\s(.*)$/;
+  const SCAN_LIMIT = 12000; // символов агрегата (до серверного capResponse)
+
+  async function scan(params) {
+    params = params || {};
+    const maxScreens = Math.min(Math.max(Number(params.max_screens) || 10, 1), 20);
+    const deadline = Date.now() + 45000;
+    const step = Math.max(300, Math.round((window.innerHeight || 800) * 0.9));
+    const seen = new Set();
+    const lines = [];
+    let size = 0;
+    let truncated = false;
+    let stableRounds = 0;
+    let screens = 0;
+    let lastScrollY = -1;
+
+    while (screens < maxScreens && stableRounds < 3 && Date.now() < deadline) {
+      screens++;
+      let added = 0;
+      const root = scopeRoot({}) || document.body;
+      forEachInteractive(root, (el) => {
+        if (isSkippable(el) || !isVisible(el) || !inViewport(el)) return;
+        if (el.closest('[aria-hidden="true"]')) return;
+        const line = describe(el); // assign живого ref
+        const m = SCAN_LINE_REF.exec(line);
+        const sig = m ? m[2] : line;
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        if (size + line.length + 1 > SCAN_LIMIT) {
+          truncated = true;
+          return;
+        }
+        lines.push(line);
+        size += line.length + 1;
+        added++;
+      });
+      if (truncated) break;
+      const y = window.scrollY;
+      if (added === 0 || y === lastScrollY) stableRounds++;
+      else stableRounds = 0;
+      lastScrollY = y;
+      window.scrollBy(0, step);
+      await new Promise((r) => setTimeout(r, 400)); // человеческий темп + догрузка ленты
+    }
+    refs.dirty = false; // scan — по сути серия мини-снапшотов, записи актуальны
+    const out = { scan: lines.join("\n"), screens, unique: lines.length };
+    if (truncated) out.scan_truncated = true;
+    return out;
+  }
+
+  B.snapshot = { build, findText, findByText, afterBlock, countInteractive, extractMarkdown, isInteractiveEl, scan };
 })();

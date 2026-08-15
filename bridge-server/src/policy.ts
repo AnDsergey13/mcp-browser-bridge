@@ -38,6 +38,8 @@ interface PolicyFile {
   default?: string;
   gated_defaults?: Partial<Record<GatedCategory, GatedDecision>>;
   hard_floor?: Partial<Record<GatedCategory, GatedDecision>>;
+  /** П2-4: журналировать полные args tool calls (default off; пароли маскируются). */
+  journal_full_args?: boolean;
   pacing?: { min_delay_ms?: number; max_delay_ms?: number; max_actions_per_minute?: number };
   presets?: Record<string, {
     description?: string;
@@ -328,6 +330,11 @@ export class PolicyEngine {
   }
 
   // ---- pacing (N6), читается из текущей политики (hot-reload aware) ----
+
+  /** П2-4: флаг журналирования полных args (default off, hot-reload aware). */
+  journalFullArgs(): boolean {
+    return this.file.journal_full_args === true;
+  }
 
   pacing(): { min_delay_ms: number; max_delay_ms: number; max_actions_per_minute: number } {
     const g = this.file.pacing ?? {};

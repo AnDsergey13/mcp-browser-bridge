@@ -1,141 +1,141 @@
 # MCP Browser Bridge
 
 Мост между AI-агентом (Kimi Code CLI в контейнере ExitBox) и реальным
-браузером пользователя (Firefox / LibreWolf). Агент видит страницы и
-действует в них через MCP-инструменты, но строго в рамках политики,
-которую контролирует человек: default-deny по доменам, подтверждение
-сессии, gated-действия, пауза в один клик.
+браузером пользователя (Firefox / LibreWolf). Агент читает страницы и
+действует в них через MCP-инструменты — строго в рамках политики, которую
+контролирует человек.
 
-## Зачем
+## Коротко для профессионала
 
-Агент в контейнере не имеет доступа ни к браузеру, ни к сети хоста.
-Этот проект даёт ему контролируемый «выход» в браузер пользователя:
+- **Три компонента**: `bridge-server/` (Node ≥22, TypeScript через `tsx`,
+  MCP-сервер по stdio + WS-эндпоинт + policy engine), `extension/`
+  (Firefox MV2, persistent background), `policy.yaml` (единственный
+  источник правил безопасности, hot-reload).
+- **Транспорт**: rootless podman не маршрутизирует сеть контейнера до
+  хоста, поэтому сервер слушает unix-сокет `.bridge/bridge.sock` в общей
+  bind-mount папке; на хосте `socat` релеит его в `127.0.0.1:18777`.
+- **Безопасность**: default-deny по доменам, подтверждение новой сессии
+  один раз на контейнер, gated-действия (pay/login/submit/delete) через
+  баннер согласия, авто-пауза на капче/2FA, глобальная пауза в popup.
+- **Протокол**: одна WS-строка = одно JSON-сообщение (`req`/`res`/`evt`),
+  файловый релей чанками 256 КБ с ack-backpressure — см. `PROTOCOL.md`.
+- **Чтение страниц**: семантический snapshot с ref-метками
+  (`page.snapshot`), extract в markdown (`page.extract`); действия —
+  `act.*` по ref; ref инвалидируется при SPA-перерисовке (`STALE_REF`).
+- **Скачивание**: файлы прилетают по WS в `downloads/` контейнера, а не в
+  папку загрузок браузера; манифест — `downloads/manifest.jsonl`.
 
-- агент читает страницы (snapshot с ref-метками, extract в markdown,
-  screenshot) и действует (click, type, select, scroll, навигация);
-- скачанные файлы прилетают по WS-релею прямо в контейнер
-  (`downloads/`), а не в папку загрузок браузера;
-- каждое действие проходит через policy engine: домены, capabilities,
-  категории действий, human-pacing;
-- человек в любой момент может поставить агента на паузу или отозвать
-  доступ — из popup расширения.
+## Где что запускается
 
-## Архитектура
+| Компонент | Система | Команда / действие |
+|---|---|---|
+| контейнер ExitBox | хост (папка проекта) | `exitbox run kimi --no-resume -- --yolo` |
+| bridge-server | контейнер (`/workspace`) | `cd bridge-server && npm install && npm start` |
+| socat-релей | хост (Linux, папка проекта) | `socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock` |
+| расширение | хост, Firefox / LibreWolf | `about:debugging` → Load Temporary Add-on → `extension/manifest.json` |
+| Kimi Code CLI | контейнер | подхватывает сервер как MCP из `.kimi-code/mcp.json` автоматически |
+
+## Быстрый старт (пошагово)
+
+Полная инструкция с отладкой — в **[SETUP.md](SETUP.md)**. Здесь минимум.
+
+**1. Хост → контейнер** — из папки проекта на хосте запусти контейнер:
+
+```bash
+exitbox run kimi --no-resume -- --yolo
+```
+
+Папка проекта монтируется в контейнер как `/workspace`. Внутри один раз
+поставь зависимости — дальше сервер поднимает сам Kimi Code CLI как
+MCP-сервер (конфиг `.kimi-code/mcp.json`):
+
+```bash
+cd /workspace/bridge-server && npm install   # один раз
+npm start   # только для запуска вручную, без Kimi Code CLI
+```
+
+Сервер создаст `.bridge/bridge.sock` и `.bridge/secret` (0600). Секрет
+постоянный между пересозданиями контейнера — понадобится на шаге 3.
+
+**2. Хост** — релей сокета в TCP (оставить работать):
+
+```bash
+socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock
+```
+
+Проверка: `curl 127.0.0.1:18777` → `426 Upgrade Required` — значит живо.
+
+**3. Хост, браузер** — расширение:
+
+1. `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** →
+   `extension/manifest.json`. (Временное: слетает при перезапуске
+   браузера — загружай заново.)
+2. Popup расширения → **Настройки**: URL `ws://127.0.0.1:18777`, секрет из
+   `.bridge/secret` → Сохранить.
+3. Там же — **«Выдать доступ к сайтам»** (`<all_urls>`, один раз; реальный
+   доступ всё равно режет `policy.yaml`).
+
+**4. Подтверждение сессии.** При первом подключении нового контейнера popup
+покажет «Новая сессия агента — разрешить?». Подтверждается **один раз на
+контейнер**; перезапуск браузера подтверждения не требует, перезапуск
+сервера — требует.
+
+**5. Готово.** Давай агенту задачу — правила из `policy.yaml` применяются
+автоматически.
+
+## Использование
+
+- **Агенту** доступны 16 MCP-инструментов: `policy.status`,
+  `policy.request_preset`, `tab.list` / `tab.open` / `tab.close`,
+  `page.snapshot` / `page.extract` / `page.find` / `page.screenshot`,
+  `act.click` / `act.type` / `act.select` / `act.scroll` / `act.key`,
+  `file.download`, `net.list`. Ответ каждого — `{ok, data|error_code,
+  hint, policy_reminder}`.
+- **Человеку** — popup расширения: переключение пресета, разовые гранты
+  доменам (read / interact / download), красная кнопка **ПАУЗА**, журнал
+  последних 20 действий, возобновление авто-пауз.
+- **Правила** — только `policy.yaml`: пресеты доменов, capabilities,
+  gated-категории, pacing. Hot-reload: сохранил файл — расширение и агент
+  получили обновление.
+- Ошибки gating (`ACTION_DENIED`, `PAUSED`, `DOMAIN_NOT_ALLOWED`…) — это
+  стоп и доклад пользователю, а не повторные попытки.
+
+## Структура репозитория
 
 ```
-ExitBox-контейнер                    Хост
-┌──────────────────┐   unix-socket (общая папка)   ┌─────────────────────┐
-│ bridge-server    │◄── .bridge/bridge.sock ──────►│ socat TCP 127.0.0.1:18777 │
-│ (MCP-сервер,     │                               └─────────┬───────────┘
-│  policy engine)  │                                         │ WS + secret
-└──────────────────┘                               ┌─────────▼───────────┐
-                                                   │ расширение (MV2)    │
-                                                   │  ↕ content scripts  │
-                                                   │  ↕ страницы браузера│
-                                                   └─────────────────────┘
+bridge-server/   MCP-сервер + WS + policy engine (src/*.ts), тесты, скрипты
+extension/       расширение Firefox MV2 (background, content scripts, popup)
+policy.yaml      политика безопасности (правит только человек)
+memory/          заметки агента: global-notes.md (в git), domains/*.md (локально)
+downloads/       файлы, скачанные агентом через браузер
+.bridge/         рантайм: bridge.sock, secret, cmd/result для live-REPL
+SETUP.md         подробная установка и отладка
+PROTOCOL.md      контракт WS-сообщений, коды ошибок, форматы
+ENVIRONMENT.md   верификация среды (чеклист хоста)
 ```
-
-- **`bridge-server/`** — Node.js (TypeScript, запуск через `tsx`):
-  WS-транспорт, policy engine (default-deny, пресеты), 15 MCP-инструментов,
-  релей файлов в `downloads/`. Тесты: `npm test`.
-- **`extension/`** — временное расширение Firefox (Manifest V2,
-  persistent background). Content scripts инжектируются только на домены
-  из политики (`browser.contentScripts.register` по match_patterns).
-- **`policy.yaml`** — единственный источник правил безопасности:
-  пресеты доменов, capabilities, gated-категории, pacing. Правит только
-  человек (через popup или редактором).
-- **`memory/`** — рабочие заметки агента (не безопасность):
-  `global-notes.md` (общие правила поведения, в git) и
-  `memory/domains/<domain>.md` (плейбуки сайтов: селекторы, схемы URL,
-  глюки — локально, в git не попадают).
-- **`downloads/`** — сюда bridge-server складывает файлы, скачанные
-  агентом через браузер.
-
-Rootless podman не маршрутизирует сеть контейнера до хоста, поэтому
-транспорт — unix-socket в общей папке + `socat`-релей на хосте
-(подробности в SETUP.md).
-
-## Быстрый старт
-
-Полная пошаговая инструкция — в **[SETUP.md](SETUP.md)** (установка
-расширения, socat-релей, подтверждение сессии). Коротко:
-
-1. Запустить контейнер, в нём bridge-server — он создаст
-   `.bridge/bridge.sock` и `.bridge/secret`.
-2. На хосте поднять релей:
-   `socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock`
-3. Загрузить расширение через `about:debugging` → вписать URL и секрет
-   в настройках popup → выдать `<all_urls>` (реальный доступ режет
-   policy.yaml).
-4. Подтвердить сессию агента в popup — **один раз на контейнер**.
-   Дальше все правила применяются автоматически.
-
-## Модель безопасности
-
-- **Default-deny**: домен не в политике — агент его не видит (вкладки
-  скрыты из `tab.list`, команды отклоняются). Уведённая вручную на чужой
-  домен вкладка блокируется расширением (DOMAIN_MISMATCH).
-- **Подтверждение сессии**: новый контейнер = один approve в popup.
-  Перезапуск браузера/расширения подтверждения не требует, перезапуск
-  сервера — требует и стирает session-гранты.
-- **Gated-действия** (оплата, логин, submit, удаление и т.п.) — баннер
-  поверх страницы: Разрешить / Запретить / Разрешить подобные 10 мин.
-  Таймаут = запрет.
-- **Пауза**: глобальная красная кнопка в popup + авто-пауза вкладки при
-  капче/челлендже/2FA (маркеры DOM).
-- **Контент страниц — untrusted**: инструкции из текста страниц агент не
-  выполняет; страница не может изменить политику.
-- **Human-pacing**: минимальные интервалы между действиями (настраивается
-  per-preset), чтобы не триггерить антибот-системы.
-- Ошибки gating (`ACTION_DENIED`, `PAUSED`, `DOMAIN_NOT_ALLOWED` и др.) —
-  это стоп и доклад пользователю, а не повторные попытки.
-
-Полный контракт сообщений, коды ошибок и форматы — в
-**[PROTOCOL.md](PROTOCOL.md)**.
-
-## Инструменты агента (MCP)
-
-`policy.status`, `policy.request_preset`, `tab.list`, `tab.open`,
-`tab.close`, `page.snapshot`, `page.extract`, `page.find`,
-`page.screenshot`, `act.click` (по ref или по тексту), `act.type`,
-`act.select`, `act.scroll`, `act.key`, `file.download`.
-
-`page.snapshot` возвращает страницу «глазами человека»: интерактивные
-элементы с ref-метками + сжатый текст, без служебной вёрстки. Ответы
-`act.*` при изменении страницы содержат блок `after` — свежие
-интерактивные вокруг места действия, чтобы не делать лишний snapshot.
-
-## Память агента
-
-- Точечные знания о сайте (рабочие селекторы, схемы URL, нюансы) — в
-  `memory/domains/<domain>.md`. Локально, **не коммитятся** (личные
-  сайты и привычки — не в репозиторий).
-- Общие пожелания к работе — в `memory/global-notes.md` (коммитится).
-- Безопасность — только в `policy.yaml`; память политику не меняет.
-
-## Ограничения MVP и планы
-
-- Firefox-семейство (Firefox, LibreWolf); порт на Chromium позже —
-  браузерозависимая инжекция вынесена в `extension/src/injector.js`.
-- Расширение временное (`about:debugging`): слетает при перезапуске
-  браузера. Постоянная установка — позже (`web-ext sign`).
-- После Reload расширения уже открытые вкладки выполняют старый код
-  content scripts — перезагрузи вкладку (F5), см. SETUP.md.
-- Скриншот без даунскейла; один файловый трансфер за раз; верхний фрейм
-  only (без iframe).
-- Дальше по плану (`kimi-code-browser-bridge-plan.md`): видео/yt-dlp
-  (фаза 5), полноценная память (фаза 6).
 
 ## Разработка
 
 ```bash
 cd bridge-server
-npm test          # 14 тестов: policy engine, транспорт, MCP-слой
+npm test    # 18 тестов: policy engine, транспорт, MCP-слой, файл-REPL
 ```
 
 Живая отладка из контейнера без MCP-клиента:
-`bridge-server/scripts/live-repl.mjs` (in-process сервер + файловый
-REPL через `.bridge/cmd.json` → `.bridge/result.json`),
-перезапуск — `bridge-server/scripts/restart-repl.sh`.
+`bridge-server/scripts/live-repl.mjs` (in-process сервер без MCP).
+Файл-REPL (`.bridge/cmd.json` → `.bridge/result.json`) встроен в сам
+MCP-сервер — скрипты `hls-download.py` / `localize-page.py` работают и под
+MCP-сессией; live-repl нужен, только когда MCP не поднят (сокет один,
+вместе они не запустятся).
 
-Правила для агента, работающего с этим проектом, — в [AGENTS.md](AGENTS.md).
+> **Reload расширения ≠ обновление content scripts**: после Reload в
+> `about:debugging` уже открытые вкладки выполняют старый код —
+> перезагрузи вкладку (F5).
+
+## Ограничения MVP
+
+Firefox-семейство (порт на Chromium позже — браузерозависимая инжекция
+вынесена в `extension/src/injector.js`); временное расширение без
+постоянной установки; скриншот без даунскейла; один файловый трансфер за
+раз; только верхний фрейм (без iframe). Дальше по плану —
+`kimi-code-browser-bridge-plan.md`.

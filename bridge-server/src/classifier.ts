@@ -19,23 +19,40 @@ const TEXT_DELETE = /удалить|отпис|delete|remove|unsubscribe/i;
 export function parseSnapshotRefs(snapshotText: string): Map<string, ElementMeta> {
   const refs = new Map<string, ElementMeta>();
   for (const line of snapshotText.split('\n')) {
+    // П1-5: свёрнутая группа `[e12..e61] button "Купить" ×50` — раскрываем
+    // диапазон: refs выданы всем элементам, classify/stale-retry обязаны их
+    // видеть (иначе клик по середине диапазона обходил бы gated-категорию).
+    const range = /^\s*\[e(\d+)\.\.e(\d+)\]\s+([a-zA-Z-]+)\s*(.*)$/.exec(line);
+    if (range) {
+      const from = Number(range[1]);
+      const to = Number(range[2]);
+      if (to >= from && to - from <= 1000) {
+        for (let n = from; n <= to; n++) {
+          refs.set(`e${n}`, parseRefMeta(`e${n}`, range[3], range[4]));
+        }
+      }
+      continue;
+    }
     const m = /^\s*\[(e\d+)\]\s+([a-zA-Z-]+)\s*(.*)$/.exec(line);
     if (!m) continue;
-    const [, ref, role, rest] = m;
-    const meta: ElementMeta = { ref, role, text: '', href: null, attrs: {} };
-    const hrefM = /→\s*(\S+)/.exec(rest);
-    if (hrefM) meta.href = hrefM[1];
-    const textM = /"([^"]*)"/.exec(rest);
-    if (textM) meta.text = textM[1];
-    // атрибуты key=value (value — слово или "quoted")
-    const attrRe = /([a-zA-Z-]+)=("([^"]*)"|\S+)/g;
-    let am: RegExpExecArray | null;
-    while ((am = attrRe.exec(rest)) !== null) {
-      meta.attrs[am[1]] = am[3] !== undefined ? am[3] : am[2];
-    }
-    refs.set(ref, meta);
+    refs.set(m[1], parseRefMeta(m[1], m[2], m[3]));
   }
   return refs;
+}
+
+function parseRefMeta(ref: string, role: string, rest: string): ElementMeta {
+  const meta: ElementMeta = { ref, role, text: '', href: null, attrs: {} };
+  const hrefM = /→\s*(\S+)/.exec(rest);
+  if (hrefM) meta.href = hrefM[1];
+  const textM = /"([^"]*)"/.exec(rest);
+  if (textM) meta.text = textM[1];
+  // атрибуты key=value (value — слово или "quoted")
+  const attrRe = /([a-zA-Z-]+)=("([^"]*)"|\S+)/g;
+  let am: RegExpExecArray | null;
+  while ((am = attrRe.exec(rest)) !== null) {
+    meta.attrs[am[1]] = am[3] !== undefined ? am[3] : am[2];
+  }
+  return meta;
 }
 
 /** Классификация по целевому URL (tab.open / navigate). */

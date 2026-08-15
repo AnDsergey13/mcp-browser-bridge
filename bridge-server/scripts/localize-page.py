@@ -65,7 +65,7 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(os.path.join(a.out, 'images'), exist_ok=True)
-    d = bridge('page.extract', {'tabId': a.tab})
+    d = bridge('page.extract', {'tabId': a.tab, 'max_chars': 60000})
     md = d['markdown']
     source_url = d['url']
 
@@ -75,7 +75,7 @@ def main():
         if not src or src == 'data:(inline)':
             continue
         local = 'images/' + img_name(im['n'], src)
-        target = os.path.join(DL, img_name(im['n'], src))
+        target = os.path.join(a.out, 'images', img_name(im['n'], src))
         if not os.path.exists(target):
             got = bridge('file.download', {'tabId': a.tab, 'url': src,
                                            'name': img_name(im['n'], src)})

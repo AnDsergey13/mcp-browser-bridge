@@ -482,6 +482,71 @@
     }
   }
 
+  // ---------- waitFor: событийное ожидание условия (page.wait_for, П1-1) ----------
+  // Один активный wait на вкладку (очередей в протоколе нет — осознанно).
+  // Проверка — по DOM-мутациям (childList/characterData) + редкий тик для
+  // url_contains (history-навигация мутаций не даёт). Таймаут — НЕ ошибка:
+  // condition_met:false, чтобы модель планировала дальше.
+  let activeWait = null;
+
+  function evalWaitCondition(cond, state) {
+    const negate = state === "disappear" || state === "stale";
+    let has = false;
+    if (cond.url_contains != null) {
+      has = location.href.includes(String(cond.url_contains));
+    } else if (cond.ref != null) {
+      has = !!(B.refs && B.refs.resolve(String(cond.ref)));
+    } else if (cond.text != null) {
+      has = ((document.body && document.body.innerText) || "").includes(String(cond.text));
+    }
+    return negate ? !has : has;
+  }
+
+  async function waitForHandler(params) {
+    if (activeWait) {
+      throw cerr("WAIT_BUSY", "на вкладке уже есть активный page.wait_for — дождись его завершения");
+    }
+    const cond = params.condition || {};
+    const state = params.state || "appear";
+    if (cond.text == null && cond.ref == null && cond.url_contains == null) {
+      throw cerr("INTERNAL", "wait_for: нужно condition.text, condition.ref или condition.url_contains");
+    }
+    const timeoutMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 30000);
+    const wait = new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+      const cleanup = () => {
+        obs.disconnect();
+        clearInterval(timer);
+        activeWait = null;
+      };
+      const check = () => {
+        let met = false;
+        try {
+          met = evalWaitCondition(cond, state);
+        } catch (e) {
+          met = false;
+        }
+        if (met || Date.now() >= deadline) {
+          cleanup();
+          resolve(met);
+        }
+      };
+      const obs = new MutationObserver((mutations) => {
+        // Флап атрибутов (классы, спиннеры) не трогает текст/структуру —
+        // реагируем на реальные вставки и изменения текста.
+        for (const m of mutations) {
+          if (m.type === "childList" || m.type === "characterData") return check();
+        }
+      });
+      obs.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+      const timer = setInterval(check, 300); // страховка + url_contains
+      check(); // условие может быть уже выполнено
+    });
+    activeWait = wait;
+    const met = await wait;
+    return Object.assign(pageState(), { condition_met: met, waited_state: state });
+  }
+
   // ---------- обработчики команд ----------
   const handlers = {
     // Опрос после навигации, инициированной background'ом или полной перезагрузкой.
@@ -572,16 +637,10 @@
         }
       }
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      const tSettle = Date.now();
       await settleForSuggestions(); // автокомплит приходит по сети после ввода
-      const st = withAfter(pageState(), false, el);
-      // Диагностика ожидания подсказок: длительность, число интерактивных, причина выхода.
-      st.debug_settle = Object.assign(
-        { settle_ms: Date.now() - tSettle },
-        B.debugSettle || {},
-        { interactive: B.snapshot && B.snapshot.countInteractive ? B.snapshot.countInteractive() : -1 }
-      );
-      return st;
+      // Диагностика ожидания подсказок — в window.__BRIDGE__.debugSettle
+      // (в ответ не включаем: П0-4, экономия токенов).
+      return withAfter(pageState(), false, el);
     },
     async select(params) {
       const el = mustResolve(params.ref);
@@ -647,6 +706,15 @@
       const r = B.snapshot.build({});
       const dom_hash = await sha256Short(r.snapshot);
       return { url: location.href, dom_hash };
+    },
+
+    async waitFor(params) {
+      return waitForHandler(params || {});
+    },
+
+    async scan(params) {
+      const r = await B.snapshot.scan(params || {});
+      return Object.assign(pageState(), r);
     },
 
     async fetchFile(params) {

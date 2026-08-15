@@ -20,14 +20,19 @@ export class MemoryStore {
   }
 
   /** Append-only журнал: каждый tool call (фаза 6 п.1). */
-  journal(entry: { tool: string; args: unknown; result: unknown; tabId?: number | null; url?: string | null }): void {
+  journal(entry: { tool: string; args: unknown; result: unknown; tabId?: number | null; url?: string | null; argsFull?: unknown }): void {
     try {
       fs.mkdirSync(this.memoryDir, { recursive: true });
+      const result = entry.result as { ok?: unknown } | null;
       const line = JSON.stringify({
         ts: new Date().toISOString(),
         tool: entry.tool,
+        ok: result && typeof result === 'object' ? result.ok === true : null,
         args_digest: digest(entry.args),
         result_digest: digest(entry.result),
+        // П2-4: полные args — только при journal_full_args: true в policy.yaml
+        // (санитизированы в BridgeCore: пароли маскируются).
+        ...(entry.argsFull !== undefined ? { args: entry.argsFull } : {}),
         tabId: entry.tabId ?? null,
         url: entry.url ?? null,
       });

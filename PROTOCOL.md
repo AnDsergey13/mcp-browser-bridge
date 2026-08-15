@@ -74,18 +74,37 @@
 - `reload` `{tabId}` → `{url,title,flags}`
 - `snapshot` `{tabId, scope?:"viewport"|"main"|"full", selector?}` →
   `{url,title,snapshot,dom_hash,flags,truncated}` — семантический снапшот (§6)
-- `extractMarkdown` `{tabId, selector?}` → `{url,title,markdown,images:[{n,src,alt,w,h}],flags}`
+- `extractMarkdown` `{tabId, selector?, images?:"inline"|"manifest"|"off", max_chars?:число}` →
+  `{url,title,markdown,images:[{n,src,alt,w,h}],flags}`
   Картинки и embed'ы стоят ИНЛАЙН в markdown на своих местах: `![alt](src)`,
   `[embedded: iframe-src]`, `[video|audio: src]`. Манифест `images` — для
   скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
+  `images:"manifest"` — только манифест, без инлайна в тексте; `"off"` — без
+  картинок вовсе (чистое чтение). Дефолт `"inline"` — контракт
+  `localize-page.py`, не менять. `max_chars` (дефолт 15000) — лимит markdown
+  по границе абзаца ДО серверной резки. Div-суп (мало p/h/li при большом
+  тексте) — density-режим: выбор самого текстового контейнера по
+  text-density/link-density, склейка текстовых div в абзацы, отсечение
+  «хвостов» с link-density > 0.5 (П2-1, свои эвристики, без библиотек).
   Локализация (скачать картинки, подменить URL на локальные пути) —
   `bridge-server/scripts/localize-page.py`.
 - `findText` `{tabId,query,role?}` → `{matches:[{ref,text}],flags}` (≤20)
+- `waitFor` `{tabId, condition:{text?|ref?|url_contains?}, state?:"appear"|"disappear"|"stale", timeout_ms?:≤30000}` →
+  `{url,title,flags,condition_met:bool}` — событийное ожидание условия на
+  MutationObserver (П1-1), без polling снапшотами. Таймаут — НЕ ошибка:
+  `condition_met:false`. Один активный wait на вкладку: повторный вызов во
+  время ожидания → ошибка `WAIT_BUSY`. MCP-инструмент: `page.wait_for`,
+  capability `read`.
 - `screenshot` `{tabId}` → `{data_jpeg_base64}` (≤1280px, q70)
 - `netList` `{tabId}` → `{requests:[{ts,url,type,frameId}]}` — пассивный лог
   media-запросов вкладки (webRequest, тип `media` + URL `*.m3u8|*.mpd`;
   кольцевой буфер 50 записей, чистится при навигации/закрытии вкладки).
   MCP-инструмент: `net.list`, capability `read` по домену вкладки.
+- `scan` `{tabId, max_screens?:≤20}` → `{url,title,flags,scan,screens,unique[,scan_truncated]}` —
+  автоскролл ленты с агрегацией уникальных интерактивных (П2-3): дедуп по
+  сигнатуре строки, стоп после 3 экранов без роста или у дна ленты, жёсткие
+  лимиты 20 экранов / 45 с. Строки в формате снапшота, refs живые.
+  MCP-инструмент: `page.scan`, capability `interact` (скролл) + pacing.
 - `click` `{tabId,ref}` → `{url,title,flags,navigated}`
 - `type` `{tabId,ref,text,clear?:bool}` → `{url,title,flags}`
 - `select` `{tabId,ref,value}` → `{url,title,flags}`
@@ -109,12 +128,24 @@
 сделать свежий snapshot), `NAV_TIMEOUT`, `FETCH_FAILED`, `CONTENT_SCRIPT_ABSENT`
 (домен вне match_patterns — значит и политика бы не пустила), `DOMAIN_MISMATCH`
 (текущий URL вкладки не совпадает с match_patterns политики — команда не
-исполнена), `NOT_FOUND`/`AMBIGUOUS` (click-by-text: кандидатов ноль или >1).
+исполнена), `NOT_FOUND`/`AMBIGUOUS` (click-by-text: кандидатов ноль или >1),
+`WAIT_BUSY` (на вкладке уже активен waitFor — дождаться его завершения).
 
 `click` принимает `ref` ИЛИ `text` (атомарный поиск+клик в момент исполнения,
 устойчив к перерисовкам). Ответы act.* содержат `after` — свежие
 интерактивные элементы скоупа (если DOM/URL изменились; ≤2KB) — отдельный
 snapshot после действия обычно не нужен.
+
+MCP-инструмент `act.batch` (П1-2, отдельной wire-команды нет — сервер сам
+вызывает click/type/select/pressKey по шагам): `{tabId, steps:[{do:"click"|
+"type"|"select"|"key", ref?|text?, value?, clear?, key?}]}`, ≤10 шагов.
+Policy-check всех шагов — атомарно ДО исполнения (gated-шаг без гранта
+отклоняет весь пакет); pacing — уменьшенный jitter 0.3–0.8 c между шагами,
+каждый шаг идёт в окно 30 act/мин; ёмкость окна проверяется на весь пакет
+заранее. Шаг получает авто-retry после STALE_REF (один, поиск по тексту из
+кэша refs; >1 кандидата — AMBIGUOUS). Ответ — состояние после последнего
+шага + `steps:[{do,ref,ok}]`. Падение шага → `BATCH_STEP_FAILED` с
+`data:{steps, batch_completed}` (partial execution не скрывается).
 
 ## 5. Запросы расширение → сервер (req)
 
@@ -189,17 +220,30 @@ title: …
 - ref-метки `eN` — только интерактивные: a, button, input, select, textarea,
   summary, [role=button|link|checkbox|…], [contenteditable], [tabindex].
 - Скоуп по умолчанию: пересечение viewport и `main|article` (fallback body);
-  `scope:"full"` — вся страница.
+  `scope:"full"` — вся страница. При дефолтном скоупе интерактивные элементы
+  из `header/nav/footer/aside` опускаются В КОНЕЦ снапшота (П1-4), при
+  `scope:"full"`/явном `selector` — в порядке документа.
+- Повторы: ≥5 подряд строк с одинаковой сигнатурой сворачиваются в
+  `[e12..e61] button "Купить" ×50` (П1-5). Свёртка визуальная: любой ref из
+  диапазона адресуем, сервер раскрывает диапазон для классификатора.
+- Pointer-цепочки (вложенные div/span/li с cursor:pointer и одним текстом)
+  дают одну строку — нижний элемент (П1-4).
 - Карта ref→элемент живёт в content script и ИНВАЛИДИРУЕТСЯ при навигации и
-  DOM-мутациях; команда по мёртвому ref → `STALE_REF`.
-- `dom_hash` — сервер хэширует строку snapshot (sha256, короткий).
+  DOM-мутациях; команда по мёртвому ref → `STALE_REF` (сервер один раз
+  переснимает снапшот и повторяет действие по тексту элемента — П1-3).
+- `dom_hash` — сервер хэширует строку snapshot (sha256, короткий). Повторный
+  snapshot с тем же dom_hash и тем же скоупом → `{unchanged:true}` (П0-3).
 
 ## 10. Коды ошибок сервера (MCP → агент)
 
 `BROWSER_OFFLINE`, `SESSION_NOT_APPROVED`, `SESSION_DENIED`,
 `DOMAIN_NOT_ALLOWED`, `CAPABILITY_DENIED`, `ACTION_DENIED` (consent deny/timeout),
 `PAUSED`, `AUTO_PAUSED_HUMAN_NEEDED`, `STATE_DIVERGED`, `PACING_LIMIT`,
-`STALE_REF`, `RESPONSE_TOO_LARGE` (после резки — hint), `TIMEOUT`, `INTERNAL`.
+`STALE_REF`, `AMBIGUOUS` (авто-retry нашёл >1 кандидата по тексту),
+`BATCH_STEP_FAILED` (act.batch: шаг упал, `data.batch_completed` — сколько успело),
+`WAIT_BUSY` (на вкладке уже активен page.wait_for),
+`SCREENSHOT_TOO_LARGE` (скриншот за потолком — base64 не отдан),
+`RESPONSE_TOO_LARGE` (после резки — hint), `TIMEOUT`, `INTERNAL`.
 
 Формат ответа MCP-инструмента: `{ok, data|error_code, hint, policy_reminder}`.
 `policy_reminder`: активный пресет + security-ограничения домена +

@@ -9,9 +9,12 @@ import path from 'node:path';
 
 export class BridgeError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  /** Доп. данные для конверта ошибки (напр. прогресс act.batch при BATCH_STEP_FAILED). */
+  data?: unknown;
+  constructor(code: string, message: string, data?: unknown) {
     super(message);
     this.code = code;
+    if (data !== undefined) this.data = data;
   }
 }
 

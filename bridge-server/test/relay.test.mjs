@@ -58,12 +58,23 @@ test('file.download: файл на диске, sha256 сходится, manifest
   assert.match(entry.url, /allowed\.example/);
 });
 
-test('file.download: повторное скачивание → uniquify имени', async () => {
+test('file.download: повтор идентичного файла → dedup (существующее имя)', async () => {
+  const res = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'http://allowed.example/files/lesson.pdf', name: 'lesson.pdf',
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  // П0-6: тот же url + тот же контент → существующий файл, без «lesson (1).pdf».
+  assert.equal(res.data.file, 'lesson.pdf');
+});
+
+test('file.download: то же имя, но другой контент → uniquify имени', async () => {
+  mock.fileToServe = { name: 'lesson.pdf', content: crypto.randomBytes(800), chunkSize: 400 };
   const res = await handle.core.callTool('file.download', {
     tabId: 1, url: 'http://allowed.example/files/lesson.pdf', name: 'lesson.pdf',
   });
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.match(res.data.file, /lesson \(1\)\.pdf/);
+  mock.fileToServe = { name: 'lesson.pdf', content: FILE_CONTENT, chunkSize: 400 };
 });
 
 test('file.download без capability download → CAPABILITY_DENIED', async () => {

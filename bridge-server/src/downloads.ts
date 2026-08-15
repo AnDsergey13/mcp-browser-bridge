@@ -130,11 +130,43 @@ export class DownloadRelay {
       this.finishFail(transferId, new RelayError('FETCH_FAILED', `sha256 не сошёлся: ext=${expected} server=${sha256}`));
       return;
     }
+    // П0-6: идемпотентность ретрая после клиентского -32001 — тот же url и
+    // тот же контент (size+sha256) уже лежит в downloads → отдаём существующий
+    // файл, а не плодим «name (1).ext».
+    const existing = this.findCompleted(t.url, t.bytes, sha256);
+    if (existing) {
+      fs.rmSync(t.tmpPath, { force: true });
+      this.manifest({ ts: new Date().toISOString(), url: t.url, name: existing, size: t.bytes, sha256, status: 'ok', dedup: true });
+      this.log(`relay: dedup ${transferId} → существующий ${existing} (${t.bytes} bytes)`);
+      this.finishOk({ transferId, name: existing, size: t.bytes, sha256 });
+      return;
+    }
     const finalName = this.uniquify(t.name);
     fs.renameSync(t.tmpPath, path.join(this.downloadsDir, finalName));
     this.manifest({ ts: new Date().toISOString(), url: t.url, name: finalName, size: t.bytes, sha256, status: 'ok' });
     this.log(`relay: done ${transferId} → ${finalName} (${t.bytes} bytes)`);
     this.finishOk({ transferId, name: finalName, size: t.bytes, sha256 });
+  }
+
+  /** Завершённая запись manifest с тем же url+size+sha256 и живым файлом на диске. */
+  private findCompleted(url: string | null, size: number, sha256: string): string | null {
+    if (!url) return null;
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(path.join(this.downloadsDir, 'manifest.jsonl'), 'utf8').split('\n');
+    } catch {
+      return null;
+    }
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let e: Record<string, unknown>;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e['status'] !== 'ok' || e['url'] !== url || e['sha256'] !== sha256 || e['size'] !== size) continue;
+      const name = String(e['name'] ?? '');
+      if (name && fs.existsSync(path.join(this.downloadsDir, name))) return name;
+    }
+    return null;
   }
 
   private onAbort(data: Record<string, unknown>): void {
