@@ -172,6 +172,19 @@ export class PolicyEngine {
     this.emitChange();
   }
 
+  /**
+   * Отзыв разового гранта (жест пользователя в popup). Только session-гранты:
+   * пресетные домены управляются правкой policy.yaml. Возвращает false, если
+   * session-гранта на этот домен не было.
+   */
+  removeSessionGrant(domain: string): boolean {
+    if (!this.sessionGrants.delete(domain)) return false;
+    this.updateVersion++;
+    this.audit({ kind: 'grant', domain, decision: 'session_revoke' });
+    this.emitChange();
+    return true;
+  }
+
   // ---- домены ----
 
   /** Ключи вида "host" или "host:port". "host" матчит host и его поддомены (любой порт). */

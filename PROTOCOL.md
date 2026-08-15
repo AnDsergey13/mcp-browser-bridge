@@ -109,6 +109,10 @@ snapshot после действия обычно не нужен.
 - `grant.add` `{domain, capabilities:["read","interact",...], scope:"session"}` →
   `{granted:true}` — разовый грант из popup. Сервер пишет аудит и шлёт
   свежий `policy.update` всем.
+- `grant.remove` `{domain}` → `{removed:bool}` — отзыв разового гранта из popup
+  (только session-гранты; пресетные домены — правкой policy.yaml). Сервер пишет
+  аудит (`session_revoke`) и шлёт свежий `policy.update` — инжектор
+  перерегистрирует content scripts без этого домена.
 - `preset.switch` `{name}` → `{preset}` — переключение пресета из popup
   (user gesture, разрешено всегда). Сервер шлёт `policy.update`.
 

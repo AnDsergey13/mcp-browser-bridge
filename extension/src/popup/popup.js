@@ -148,6 +148,26 @@ function render() {
     $("grantMsg").textContent = "";
   }
 
+  // Список грантов сессии с отзывом (управляет человек, не модель).
+  const grants = Array.isArray(state.sessionGrants) ? state.sessionGrants : [];
+  $("grantsBox").classList.toggle("hidden", grants.length === 0);
+  const gUl = $("grantsList");
+  gUl.innerHTML = "";
+  for (const domain of grants) {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = domain + " (read+interact)";
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = "Отозвать";
+    btn.disabled = st !== "active";
+    btn.addEventListener("click", () => send("grant.remove", { domain }));
+    li.appendChild(label);
+    li.appendChild(document.createTextNode(" "));
+    li.appendChild(btn);
+    gUl.appendChild(li);
+  }
+
   // Настройки (не затираем поле, пока пользователь его редактирует)
   if (document.activeElement !== $("inUrl")) $("inUrl").value = state.serverUrl || "";
   if (document.activeElement !== $("inSecret")) $("inSecret").value = state.secret || "";

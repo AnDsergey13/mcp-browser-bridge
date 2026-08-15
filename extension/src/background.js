@@ -814,6 +814,14 @@ async function handlePopupAction(msg) {
       }
       return { ok: true, result: res };
     }
+    case "grant.remove": {
+      // Отзыв разового гранта (жест в popup). Сервер обновит match_patterns
+      // через policy.update → инжектор перерегистрируется без этого домена.
+      const res = await sendReq("grant.remove", { domain: msg.domain });
+      const { sessionGrants } = await browser.storage.local.get({ sessionGrants: [] });
+      await saveState({ sessionGrants: sessionGrants.filter((d) => d !== msg.domain) });
+      return { ok: true, result: res };
+    }
     case "pause.global": {
       paused = !!msg.paused;
       sendEvt("pause.global", { paused });
