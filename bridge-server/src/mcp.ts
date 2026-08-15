@@ -21,11 +21,14 @@ export interface ToolPayload {
 }
 
 interface TabInfo { url: string; title: string }
-interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string }
+// П0-3: scopeKey = scope|selector — без него снапшот scope:"full" после
+// scope:"viewport" при совпадающем dom_hash дал бы ложный unchanged.
+interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string }
 interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash: string | null } }
 
-const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list']);
-const ACT_TOOLS = new Set(['act.click', 'act.type', 'act.select', 'act.scroll', 'act.key']);
+const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for']);
+// page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
+const ACT_TOOLS = new Set(['act.click', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
 
 function shortHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -46,6 +49,9 @@ export class BridgeCore {
   private autoPaused = new Map<number, AutoPause>();
   private diverged = new Map<number, { url: string; dom_hash: string }>();
   private consentSeq = 0;
+  // П0-1: состояние версионирования policy_reminder.
+  private reminderCounter = 0;
+  private lastReminderHash: string | null = null;
 
   constructor(deps: {
     transport: Transport;
@@ -118,6 +124,28 @@ export class BridgeCore {
     return p;
   }
 
+  /**
+   * П0-1: полный policy_reminder отдаём (а) при первом вызове сессии,
+   * (б) при смене хэша содержимого (hot-reload policy.yaml, правка плейбука),
+   * (в) раз в 10 вызовов, (г) на ЛЮБОЙ ошибке (forceFull — там reminder несёт
+   * смысл для модели: гейтинг, паузы, расхождение состояния). Иначе — короткая
+   * форма {preset, domain, reminder_version}; поле policy_reminder сохраняется
+   * всегда (конверт ответа не меняется).
+   */
+  private versionedReminder(full: Record<string, unknown>, forceFull: boolean): Record<string, unknown> {
+    const hash = shortHash(JSON.stringify(full));
+    this.reminderCounter++;
+    const due = forceFull || this.lastReminderHash === null ||
+      this.lastReminderHash !== hash || this.reminderCounter >= 10;
+    if (due) {
+      this.lastReminderHash = hash;
+      this.reminderCounter = 0;
+      return { ...full, reminder_version: hash };
+    }
+    const domain = full['domain'] as Record<string, unknown> | undefined;
+    return { preset: full['preset'], domain: domain?.['key'] ?? null, reminder_version: hash };
+  }
+
   /** Главный конвейер исполнения инструмента. */
   async callTool(name: string, args: Record<string, unknown>): Promise<ToolPayload> {
     const tabId = typeof args['tabId'] === 'number' ? (args['tabId'] as number) : null;
@@ -125,10 +153,16 @@ export class BridgeCore {
     let resolved: ResolvedDomain | null = urlForReminder ? this.policy.resolveDomain(urlForReminder) : null;
 
     const finish = (payload: ToolPayload): ToolPayload => {
-      this.memory.journal({ tool: name, args, result: payload, tabId, url: urlForReminder });
+      this.memory.journal({
+        tool: name, args, result: payload, tabId, url: urlForReminder,
+        // П2-4: полные args — только при journal_full_args: true (default off).
+        ...(this.policy.journalFullArgs() ? { argsFull: this.sanitizedArgs(name, args, tabId) } : {}),
+      });
       return payload;
     };
-    const reminder = (): Record<string, unknown> => this.memory.buildPolicyReminder(this.policy, resolved);
+    // forceFull=true — на ошибках gating/пауз; =false — короткая форма по хэшу (П0-1).
+    const reminder = (forceFull = true): Record<string, unknown> =>
+      this.versionedReminder(this.memory.buildPolicyReminder(this.policy, resolved), forceFull);
 
     try {
       // 1. Состояние сессии (policy.status работает всегда — он и докладывает состояние).
@@ -172,40 +206,56 @@ export class BridgeCore {
       }
 
       // 6. Policy-проверка: домен + capability + gated-категория.
+      // act.batch: каждый шаг проходит check ПОШТУЧНО и АТОМАРНО в начале
+      // (П1-2) — gated-шаг без гранта отклоняет весь пакет, partial execution
+      // для gated недопустим. Одинаковые категории проверяются один раз.
       if (targetUrl) {
-        const category = this.classify(name, args, tabId, targetUrl);
-        const check = this.policy.check(targetUrl, capability as 'read' | 'interact' | 'download' | null, category);
-        resolved = check.resolved;
-        if (check.decision === 'deny') return finish(this.fail(check.error_code, check.hint, reminder()));
-        if (check.decision === 'consent') {
-          const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0);
-          if (decision === 'deny') {
-            this.policy.audit({ kind: 'deny', domain: check.resolved.key, category: check.category, decision: 'consent_deny' });
-            return finish(this.fail('ACTION_DENIED', `Пользователь не подтвердил действие категории "${check.category}" (deny/timeout). Не повторяй без изменения замысла.`, reminder()));
+        for (const category of this.classifyAll(name, args, tabId, targetUrl)) {
+          const check = this.policy.check(targetUrl, capability as 'read' | 'interact' | 'download' | null, category);
+          if (check.decision === 'deny') return finish(this.fail(check.error_code, check.hint, reminder()));
+          resolved = check.resolved;
+          if (check.decision === 'consent') {
+            const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0);
+            if (decision === 'deny') {
+              this.policy.audit({ kind: 'deny', domain: check.resolved.key, category: check.category, decision: 'consent_deny' });
+              return finish(this.fail('ACTION_DENIED', `Пользователь не подтвердил действие категории "${check.category}" (deny/timeout). Не повторяй без изменения замысла.`, reminder()));
+            }
+            if (decision === 'allow_10min') this.policy.cacheAllow10min(check.resolved.key, check.category);
+            else this.policy.audit({ kind: 'grant', domain: check.resolved.key, category: check.category, decision: 'consent_allow' });
           }
-          if (decision === 'allow_10min') this.policy.cacheAllow10min(check.resolved.key, check.category);
-          else this.policy.audit({ kind: 'grant', domain: check.resolved.key, category: check.category, decision: 'consent_allow' });
         }
       }
 
-      // 7. Pacing (N6) для act.*.
-      if (ACT_TOOLS.has(name)) await this.pacing.beforeAction();
+      // 7. Pacing (N6) для act.*. act.batch: ёмкость окна проверяется на весь
+      // пакет заранее, сами шаги проходят beforeAction с малым jitter в execute.
+      if (ACT_TOOLS.has(name)) {
+        if (name === 'act.batch') {
+          this.pacing.checkCapacity(Array.isArray(args['steps']) ? (args['steps'] as unknown[]).length : 0);
+        } else {
+          await this.pacing.beforeAction();
+        }
+      }
 
-      // 8. Исполнение.
-      const data = await this.execute(name, args, tabId);
+      // 8. Исполнение (с одноразовым авто-retry после STALE_REF — П1-3).
+      let data: unknown;
+      try {
+        data = await this.execute(name, args, tabId);
+      } catch (err) {
+        data = await this.retryAfterStaleRef(name, args, tabId, err);
+      }
       urlForReminder = (data && typeof data === 'object' && typeof (data as Record<string, unknown>)['url'] === 'string')
         ? (data as Record<string, unknown>)['url'] as string
         : urlForReminder;
       resolved = urlForReminder ? this.policy.resolveDomain(urlForReminder) : resolved;
 
       // 9. N15: контент страниц — untrusted.
-      if (PAGE_TOOLS.has(name) && data && typeof data === 'object') {
+      if ((PAGE_TOOLS.has(name) || name === 'page.scan') && data && typeof data === 'object') {
         (data as Record<string, unknown>)['untrusted_page_content'] = true;
       }
 
       // 10. N7: страховочная резка.
       const capped = capResponse(data);
-      return finish({ ok: true, data: capped.data, hint: capped.hint, policy_reminder: reminder() });
+      return finish({ ok: true, data: capped.data, hint: capped.hint, policy_reminder: reminder(false) });
     } catch (err) {
       if (err instanceof PacingLimitError) {
         return finish(this.fail('PACING_LIMIT', `Human-pacing: ${err.message}. Подожди и замедли темп действий.`, reminder()));
@@ -221,17 +271,46 @@ export class BridgeCore {
         CONTENT_SCRIPT_ABSENT: 'Домен вне match_patterns политики — content script не загружен.',
         NAV_TIMEOUT: 'Навигация не завершилась вовремя.',
       };
-      return finish(this.fail(code, hints[code] ?? (be.message ?? 'Внутренняя ошибка сервера'), reminder()));
+      return finish(this.fail(code, hints[code] ?? (be.message ?? 'Внутренняя ошибка сервера'), reminder(), be.data));
     }
+  }
+
+  /**
+   * П2-4: args для журнала при journal_full_args: true. Значения act.type в
+   * login-формах (password-поле или gated-категория login) маскируются.
+   */
+  private sanitizedArgs(name: string, args: Record<string, unknown>, tabId: number | null): Record<string, unknown> {
+    const clone = JSON.parse(JSON.stringify(args)) as Record<string, unknown>;
+    const maskIfLogin = (tool: string, a: Record<string, unknown>): void => {
+      if (tool !== 'act.type' || typeof a['text'] !== 'string' || tabId === null) return;
+      const meta = this.snapshots.get(tabId)?.refs.get(String(a['ref'] ?? ''));
+      if (meta?.attrs['type'] === 'password' || this.classifyAct(tool, a, tabId) === 'login') {
+        a['text'] = '***';
+      }
+    };
+    if (name === 'act.batch' && Array.isArray(clone['steps'])) {
+      for (const s of clone['steps'] as Record<string, unknown>[]) {
+        if (s && typeof s === 'object') maskIfLogin(`act.${String(s['do'] ?? '')}`, s);
+      }
+    } else {
+      maskIfLogin(name, clone);
+    }
+    return clone;
   }
 
   private classify(name: string, args: Record<string, unknown>, tabId: number | null, targetUrl: string): GatedCategory | null {
     if (name === 'tab.open') return classifyUrl(targetUrl);
-    if ((name === 'act.click' || name === 'act.type' || name === 'act.select') && tabId !== null) {
-      // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
-      if (name === 'act.click' && !args['ref'] && args['text']) {
-        return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
-      }
+    if (tabId !== null) return this.classifyAct(name, args, tabId);
+    return null;
+  }
+
+  /** Категория одного act-действия (используется и для шагов act.batch). */
+  private classifyAct(name: string, args: Record<string, unknown>, tabId: number): GatedCategory | null {
+    // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
+    if (name === 'act.click' && !args['ref'] && args['text']) {
+      return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
+    }
+    if (name === 'act.click' || name === 'act.type' || name === 'act.select') {
       const ref = String(args['ref'] ?? '');
       const snap = this.snapshots.get(tabId);
       return classifyElement(snap?.refs.get(ref));
@@ -239,8 +318,27 @@ export class BridgeCore {
     return null;
   }
 
+  /**
+   * Категории для policy-check (П1-2): для act.batch — поштучно по всем
+   * шагам (уникальные), для остальных инструментов — одна категория.
+   */
+  private classifyAll(name: string, args: Record<string, unknown>, tabId: number | null, targetUrl: string): (GatedCategory | null)[] {
+    if (name !== 'act.batch') return [this.classify(name, args, tabId, targetUrl)];
+    const cats = new Set<GatedCategory | null>();
+    if (tabId !== null && Array.isArray(args['steps'])) {
+      for (const s of args['steps'] as Record<string, unknown>[]) {
+        cats.add(this.classifyAct(`act.${String(s?.['do'] ?? '')}`, s ?? {}, tabId));
+      }
+    }
+    return [...cats];
+  }
+
   private describeAction(name: string, args: Record<string, unknown>): string {
     if (name === 'tab.open') return `Открыть ${String(args['url'] ?? '')}`;
+    if (name === 'act.batch') {
+      const n = Array.isArray(args['steps']) ? (args['steps'] as unknown[]).length : 0;
+      return `act.batch (${n} шагов)`;
+    }
     return `${name} ref=${String(args['ref'] ?? '-')}`;
   }
 
@@ -291,6 +389,51 @@ export class BridgeCore {
     return { ok: true, data: { preset: name, switched: true }, hint: null, policy_reminder: this.memory.buildPolicyReminder(this.policy, null) };
   }
 
+  /**
+   * П1-3: ровно ОДИН авто-retry после STALE_REF на act.* с ref: свежий снапшот
+   * (кэш обновляется — иначе следующий page.snapshot дал бы ложный unchanged,
+   * §5.5), поиск элемента по сохранённому text из кэша refs, повтор действия.
+   * >1 кандидата — молча не выбираем (AMBIGUOUS с кандидатами, как click-by-text).
+   * Gated: новый ref классифицируется заново; категория изменилась — отказ.
+   */
+  private async retryAfterStaleRef(name: string, args: Record<string, unknown>, tabId: number | null, err: unknown): Promise<unknown> {
+    const be = err as Partial<BridgeError>;
+    if (be.code !== 'STALE_REF' || !ACT_TOOLS.has(name) || tabId === null || !args['ref']) throw err;
+    const meta = this.snapshots.get(tabId)?.refs.get(String(args['ref']));
+    if (!meta || !meta.text) throw err;
+    const origCategory = classifyElement(meta);
+
+    const res = await this.transport.request('snapshot', { tabId }) as Record<string, unknown> & { snapshot?: string; url?: string };
+    if (typeof res.snapshot !== 'string') throw err;
+    const refs = parseSnapshotRefs(res.snapshot);
+    this.snapshots.set(tabId, {
+      text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|',
+    });
+
+    let candidates = [...refs.values()].filter((m) => m.text === meta.text);
+    if (candidates.length > 1) {
+      const byRole = candidates.filter((m) => m.role === meta.role);
+      if (byRole.length > 0) candidates = byRole;
+    }
+    if (candidates.length === 0) throw err; // элемента больше нет — честный STALE_REF
+    if (candidates.length > 1) {
+      throw new BridgeError('AMBIGUOUS',
+        `авто-retry: текст "${meta.text}" совпал с несколькими элементами: ${candidates.map((c) => c.ref).join(', ')}. Сделай page.snapshot и укажи ref явно.`);
+    }
+    const newMeta = candidates[0];
+    if (classifyElement(newMeta) !== origCategory) {
+      throw new BridgeError('ACTION_DENIED',
+        `авто-retry: элемент "${meta.text}" перенайден (${newMeta.ref}), но его gated-категория изменилась — действие НЕ выполнено. Сделай page.snapshot и повтори осознанно.`);
+    }
+    this.log(`core: авто-retry ${name} ${String(args['ref'])} → ${newMeta.ref}`);
+    const data = await this.execute(name, { ...args, ref: newMeta.ref }, tabId);
+    if (data && typeof data === 'object') {
+      (data as Record<string, unknown>)['retried'] = true;
+      (data as Record<string, unknown>)['new_ref'] = newMeta.ref;
+    }
+    return data;
+  }
+
   private async execute(name: string, args: Record<string, unknown>, tabId: number | null): Promise<unknown> {
     switch (name) {
       case 'tab.list': {
@@ -329,13 +472,21 @@ export class BridgeCore {
       case 'page.snapshot': {
         const res = await this.transport.request('snapshot', { tabId, scope: args['scope'], selector: args['selector'] }) as Record<string, unknown> & { snapshot?: string; url?: string; title?: string };
         if (tabId !== null && typeof res.snapshot === 'string') {
-          this.snapshots.set(tabId, { text: res.snapshot, dom_hash: shortHash(res.snapshot), refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '' });
+          const scopeKey = `${String(args['scope'] ?? '')}|${String(args['selector'] ?? '')}`;
+          const domHash = shortHash(res.snapshot);
+          const cached = this.snapshots.get(tabId);
+          // П0-3: страница не изменилась — компактный ответ вместо полного текста.
+          // Кэш НЕ затираем: refs из него остаются валидными для act.*.
+          if (cached && cached.dom_hash === domHash && cached.scopeKey === scopeKey) {
+            return { unchanged: true, dom_hash: domHash, url: res.url ?? cached.url };
+          }
+          this.snapshots.set(tabId, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey });
         }
         if (tabId !== null && res.url) this.tabs.set(tabId, { url: res.url, title: res.title ?? '' });
         return res;
       }
       case 'page.extract':
-        return this.pageCommand('extractMarkdown', tabId, { selector: args['selector'] });
+        return this.pageCommand('extractMarkdown', tabId, { selector: args['selector'], images: args['images'], max_chars: args['max_chars'] });
       case 'page.find':
         return this.pageCommand('findText', tabId, { query: args['query'], role: args['role'] });
       case 'page.screenshot':
@@ -355,6 +506,19 @@ export class BridgeCore {
         return this.pageCommand('scroll', tabId, { dy: args['dy'] ?? 600 });
       case 'act.key':
         return this.pageCommand('pressKey', tabId, { key: args['key'] });
+      case 'act.batch':
+        return this.executeBatch(tabId, args['steps']);
+      case 'page.wait_for': {
+        // П1-1: таймаут — не ошибка gating, а {condition_met:false}. Таймаут
+        // транспорта ставим больше контентного, чтобы дождаться честный ответ.
+        const timeoutMs = Math.min(Math.max(Number(args['timeout_ms']) || 10000, 500), 30000);
+        return this.pageCommand('waitFor', tabId, {
+          condition: args['condition'], state: args['state'], timeout_ms: timeoutMs,
+        }, timeoutMs + 15000);
+      }
+      case 'page.scan':
+        // П2-3: контентный дедлайн 45 с — транспортный таймаут больше.
+        return this.pageCommand('scan', tabId, { max_screens: args['max_screens'] }, 55000);
       case 'file.download':
         return this.executeDownload(tabId, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined);
       default:
@@ -362,8 +526,54 @@ export class BridgeCore {
     }
   }
 
-  private async pageCommand(method: string, tabId: number | null, params: Record<string, unknown>): Promise<unknown> {
-    const res = await this.transport.request(method, { tabId, ...params }) as Record<string, unknown> & { url?: string; title?: string };
+  /**
+   * П1-2: пакет act-действий (≤10). Policy-check всех шагов уже прошёл в
+   * callTool (атомарно, до старта). Между шагами — уменьшенный jitter
+   * (0.3–0.8 c, НЕ нулевой: human-like pacing сохраняется), каждый шаг идёт
+   * в окно 30 act/мин. Шаг получает тот же авто-retry после STALE_REF (П1-3).
+   * Ответ — состояние после ПОСЛЕДНЕГО шага (один after-блок) + реестр шагов.
+   * Падение шага → BATCH_STEP_FAILED с числом завершённых (partial execution
+   * не скрываем).
+   */
+  private async executeBatch(tabId: number | null, stepsArg: unknown): Promise<unknown> {
+    const steps = Array.isArray(stepsArg) ? (stepsArg as Record<string, unknown>[]) : [];
+    const ALLOWED = new Set(['act.click', 'act.type', 'act.select', 'act.key']);
+    const stepNames: string[] = [];
+    for (const s of steps) {
+      const doName = `act.${String(s?.['do'] ?? '')}`;
+      if (!ALLOWED.has(doName)) {
+        throw new BridgeError('INTERNAL', `act.batch: недопустимый шаг "${String(s?.['do'])}" (click|type|select|key)`);
+      }
+      stepNames.push(doName);
+    }
+    if (steps.length < 1 || steps.length > 10) throw new BridgeError('INTERNAL', 'act.batch: нужно 1..10 шагов');
+
+    const done: Record<string, unknown>[] = [];
+    let last: unknown = null;
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i] ?? {};
+      await this.pacing.beforeAction({ min_ms: 300, max_ms: 800 });
+      try {
+        last = await this.execute(stepNames[i], { ...s, tabId }, tabId);
+      } catch (err) {
+        try {
+          last = await this.retryAfterStaleRef(stepNames[i], { ...s, tabId }, tabId, err);
+        } catch (err2) {
+          const be2 = err2 as Partial<BridgeError>;
+          throw new BridgeError('BATCH_STEP_FAILED',
+            `act.batch: шаг ${i + 1}/${steps.length} (${stepNames[i]}) не выполнен: ${be2.message ?? String(err2)}. Успешно завершено шагов: ${i}.`,
+            { steps: done, batch_completed: i });
+        }
+      }
+      done.push({ do: stepNames[i], ref: s['ref'] ?? null, ok: true });
+    }
+    const out: Record<string, unknown> = last && typeof last === 'object' ? { ...(last as Record<string, unknown>) } : {};
+    out['steps'] = done;
+    return out;
+  }
+
+  private async pageCommand(method: string, tabId: number | null, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
+    const res = await this.transport.request(method, { tabId, ...params }, timeoutMs) as Record<string, unknown> & { url?: string; title?: string };
     if (tabId !== null && typeof res?.url === 'string') {
       this.tabs.set(tabId, { url: res.url, title: typeof res.title === 'string' ? res.title : '' });
     }
@@ -390,17 +600,20 @@ export function buildMcpServer(core: BridgeCore): McpServer {
     ['tab.list', 'Список вкладок браузера', {}],
     ['tab.open', 'Открыть URL (без tabId — новая вкладка; с tabId — навигация существующей)', { url: z.string(), tabId: tabId.optional(), active: z.boolean().optional() }],
     ['tab.close', 'Закрыть вкладку', { tabId }],
-    ['page.snapshot', 'Семантический снапшот страницы (интерактивные элементы с ref-метками)', { tabId, scope: z.enum(['viewport', 'main', 'full']).optional(), selector: z.string().optional() }],
-    ['page.extract', 'Чистый markdown содержимого страницы', { tabId, selector: z.string().optional() }],
+    ['page.snapshot', 'Семантический снапшот страницы (интерактивные элементы с ref-метками). Если страница не изменилась с прошлого снапшота — ответ {unchanged:true}, refs из прошлого снапшота остаются валидными', { tabId, scope: z.enum(['viewport', 'main', 'full']).optional(), selector: z.string().optional() }],
+    ['page.extract', 'Чистый markdown содержимого страницы (div-суп — density-режим). images: "inline" (по умолчанию) | "manifest" | "off"; max_chars — лимит по границе абзаца (15000)', { tabId, selector: z.string().optional(), images: z.enum(['inline', 'manifest', 'off']).optional(), max_chars: z.number().optional() }],
     ['page.find', 'Поиск по тексту/роли без полного снапшота (≤20 совпадений)', { tabId, query: z.string(), role: z.string().optional() }],
+    ['page.wait_for', 'Событийное ожидание условия (без polling снапшотами): текст/ref/url появился или исчез. Таймаут — не ошибка: {condition_met:false}. Один активный wait на вкладку', { tabId, condition: z.object({ text: z.string().optional(), ref: z.string().optional(), url_contains: z.string().optional() }).describe('условие: text ИЛИ ref ИЛИ url_contains'), state: z.enum(['appear', 'disappear', 'stale']).optional(), timeout_ms: z.number().max(30000).optional() }],
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId }],
+    ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional() }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional() }],
     ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional() }],
     ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string() }],
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional() }],
     ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string() }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/)', { tabId, url: z.string(), name: z.string().optional() }],
+    ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10) }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию', { tabId, url: z.string(), name: z.string().optional() }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];
@@ -408,7 +621,9 @@ export function buildMcpServer(core: BridgeCore): McpServer {
   for (const [name, description, shape] of defs) {
     server.registerTool(name, { description, inputSchema: shape }, async (args) => {
       const payload = await core.callTool(name, args as Record<string, unknown>);
-      return { content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }] };
+      // П0-2: компактный JSON без indent — экономия токенов; формат снапшота
+      // внутри data остаётся построчным текстом, читаемость не страдает.
+      return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
     });
   }
   return server;

@@ -1,7 +1,12 @@
 // compress.ts — N7: страховочная резка ответов >20KB.
 // Урезается самое длинное строковое поле; в hint — код RESPONSE_TOO_LARGE
 // и подсказка «сузь селектор/область».
+// П0-5: data_jpeg_base64 (page.screenshot) из обрезки ИСКЛЮЧЁН — обрубок
+// base64 бесполезен. Поле не участвует в подсчёте лимита; выше жёсткого
+// потолка SCREENSHOT_MAX — честная ошибка SCREENSHOT_TOO_LARGE вместо куска.
 const LIMIT = 20 * 1024;
+const SCREENSHOT_KEY = 'data_jpeg_base64';
+const SCREENSHOT_MAX = 1_500_000; // символов base64 (1280px/q70 заметно меньше)
 
 export interface CappedResult {
   data: unknown;
@@ -34,6 +39,33 @@ function setByPath(obj: unknown, path: string[], value: unknown): void {
 }
 
 export function capResponse(data: unknown, limit: number = LIMIT): CappedResult {
+  // П0-5: скриншот обрабатываем отдельно — base64 не режем никогда.
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const obj = data as Record<string, unknown>;
+    const shot = obj[SCREENSHOT_KEY];
+    if (typeof shot === 'string') {
+      if (shot.length > SCREENSHOT_MAX) {
+        const rest = { ...obj };
+        delete rest[SCREENSHOT_KEY];
+        return {
+          data: { ...rest, error: 'SCREENSHOT_TOO_LARGE', bytes_base64: shot.length },
+          truncated: true,
+          hint: 'SCREENSHOT_TOO_LARGE: скриншот даже после даунскейла ≤1280px/q70 превысил серверный потолок — base64 не отдан (обрубок бесполезен). Работай через page.snapshot/page.find.',
+        };
+      }
+      // base64 не участвует в лимите и в поиске «самой длинной строки».
+      const rest = { ...obj };
+      delete rest[SCREENSHOT_KEY];
+      const cappedRest = capResponse(rest, limit);
+      if (!cappedRest.truncated) return { data, truncated: false, hint: null };
+      return {
+        data: { ...(cappedRest.data as Record<string, unknown>), [SCREENSHOT_KEY]: shot },
+        truncated: true,
+        hint: cappedRest.hint,
+      };
+    }
+  }
+
   const serialized = JSON.stringify(data);
   if (serialized.length <= limit) return { data, truncated: false, hint: null };
 

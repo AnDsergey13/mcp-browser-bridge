@@ -179,21 +179,42 @@ export class MockExtension {
         return { data_jpeg_base64: Buffer.from('fake-jpeg').toString('base64') };
       case 'click': {
         const t = this.tabOrThrow(p.tabId);
-        this.checkRef(t, p.ref);
+        if (p.ref) this.checkRef(t, p.ref); // click-by-text (без ref) — без проверки
+        (this.actions ??= []).push('click');
         return { url: t.url, title: t.title, flags: t.flags, navigated: false };
       }
       case 'type': case 'select': {
         const t = this.tabOrThrow(p.tabId);
         this.checkRef(t, p.ref);
+        (this.actions ??= []).push(method);
         return { url: t.url, title: t.title, flags: t.flags };
       }
       case 'scroll': case 'scrollIntoView': case 'pressKey': case 'hover': {
         const t = this.tabOrThrow(p.tabId);
+        (this.actions ??= []).push(method);
         return { url: t.url, title: t.title, flags: t.flags };
       }
       case 'getStateHash': {
         const t = this.tabOrThrow(p.tabId);
         return { url: t.url, dom_hash: shortHash(t.snapshot) };
+      }
+      case 'waitFor': {
+        const t = this.tabOrThrow(p.tabId);
+        const cond = p.condition ?? {};
+        const state = p.state ?? 'appear';
+        let has = false;
+        if (cond.url_contains != null) has = t.url.includes(String(cond.url_contains));
+        else if (cond.text != null) has = (t.snapshot + '\n' + t.markdown).includes(String(cond.text));
+        else if (cond.ref != null) {
+          try { this.checkRef(t, cond.ref); has = true; } catch { has = false; }
+        }
+        const met = state === 'appear' ? has : !has;
+        return { url: t.url, title: t.title, flags: t.flags, condition_met: met };
+      }
+      case 'scan': {
+        const t = this.tabOrThrow(p.tabId);
+        (this.actions ??= []).push('scan');
+        return { url: t.url, title: t.title, flags: t.flags, scan: t.snapshot, screens: 1, unique: 1 };
       }
       case 'consent.ask': {
         this.consentRequests.push(p);
