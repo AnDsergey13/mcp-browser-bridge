@@ -166,7 +166,9 @@ export class BridgeCore {
           return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`, reminder()));
         }
         // tab.close тоже идёт через policy (interact): нельзя закрыть чужую вкладку.
-        targetUrl = known.url;
+        // file.download: проверяем домен ФАЙЛА, а не вкладки — capability download
+        // должна быть выдана домену, с которого реально скачиваем.
+        targetUrl = name === 'file.download' ? String(args['url'] ?? '') : known.url;
       }
 
       // 6. Policy-проверка: домен + capability + gated-категория.
