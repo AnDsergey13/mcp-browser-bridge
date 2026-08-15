@@ -599,14 +599,38 @@ async function anchorFallbackNavigation(tabId, clickResult) {
   });
 }
 
+// П0-5: даунскейл кадра до <=1280px по ширине, JPEG q70 — как обещает
+// описание page.screenshot. Canvas доступен в persistent background page (MV2).
+const SCREENSHOT_MAX_WIDTH = 1280;
+async function downscaleScreenshot(dataUrl) {
+  try {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error("image decode failed"));
+      img.src = dataUrl;
+    });
+    if (!img.width || img.width <= SCREENSHOT_MAX_WIDTH) return dataUrl;
+    const scale = SCREENSHOT_MAX_WIDTH / img.width;
+    const canvas = document.createElement("canvas");
+    canvas.width = SCREENSHOT_MAX_WIDTH;
+    canvas.height = Math.max(1, Math.round(img.height * scale));
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.7);
+  } catch (e) {
+    console.warn("[bridge] screenshot downscale failed, отдаю оригинал:", e);
+    return dataUrl;
+  }
+}
+
 async function screenshotCommand(params) {
   const tab = await getTab(params.tabId);
-  // TODO(MVP): даунскейл до <=1280px не реализован — captureVisibleTab отдаёт полный кадр.
   const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, {
     format: "jpeg",
     quality: 70,
   });
-  const base64 = String(dataUrl).split(",")[1] || "";
+  const scaled = await downscaleScreenshot(String(dataUrl));
+  const base64 = String(scaled).split(",")[1] || "";
   return { data_jpeg_base64: base64 };
 }
 
@@ -697,6 +721,17 @@ async function handleServerReq(msg) {
     case "netList":
       await assertTabDomain(params.tabId);
       return netListCommand(params);
+    case "waitFor": {
+      // Content ждёт до 30 с — таймаут команды должен быть больше, иначе
+      // вместо честного {condition_met:false} сервер получит TIMEOUT.
+      await assertTabDomain(params.tabId);
+      const waitMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 30000);
+      return sendCmdToTab(params.tabId, "waitFor", params, waitMs + 10000);
+    }
+    case "scan":
+      // До 20 экранов с человеческим темпом — дедлайн контента 45 с (П2-3).
+      await assertTabDomain(params.tabId);
+      return sendCmdToTab(params.tabId, "scan", params, 60000);
     case "consent.ask":
       return consentCommand(params);
     default:
@@ -769,6 +804,30 @@ async function onWireMessage(raw) {
   }
 }
 
+/**
+ * П2-6: после (пере)запуска/обновления расширения уже открытые вкладки держат
+ * СТАРЫЕ content scripts (SETUP.md требовал F5). Один раз по первому
+ * policy.update переинжектируем вкладки, чьи URL попадают в match_patterns
+ * политики (только грантованные домены, только при host-правах).
+ * Скрипты идемпотентны: content-bridge.js имеет guard __BRIDGE_CONTENT_LOADED__;
+ * серверный ref-кэш протухает сам (свежий snapshot / авто-retry после STALE_REF).
+ */
+let reinjectDone = false;
+async function reinjectOpenTabs() {
+  if (reinjectDone) return;
+  reinjectDone = true;
+  try {
+    if (!(await BridgeInjector.hasHostPermission())) return;
+    const tabs = await browser.tabs.query({});
+    for (const t of tabs) {
+      if (!t.id || !t.url || !urlMatchesPolicy(t.url)) continue;
+      await tryInjectContentScripts(t.id);
+    }
+  } catch (e) {
+    console.warn("[bridge] reinject:", e);
+  }
+}
+
 async function onPolicyUpdate(data) {
   policyPatterns = Array.isArray(data.match_patterns)
     ? data.match_patterns.filter((p) => typeof p === "string" && p.length)
@@ -785,6 +844,7 @@ async function onPolicyUpdate(data) {
     console.warn("[bridge] applyPolicy failed:", e);
     await saveState({ lastError: "applyPolicy: " + e.message });
   }
+  reinjectOpenTabs(); // одноразово (П2-6), без await — не блокируем policy.update
 }
 
 // ---------- сообщения от content scripts и popup ----------
