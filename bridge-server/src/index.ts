@@ -100,6 +100,12 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
     policy.addSessionGrant(domain, capabilities);
     return { granted: true };
   });
+  transport.registerExtHandler('grant.remove', (params) => {
+    // Отзыв разового гранта — жест пользователя в popup (политику меняет только человек).
+    const domain = String(params['domain'] ?? '');
+    if (!domain) return { removed: false };
+    return { removed: policy.removeSessionGrant(domain) };
+  });
   transport.registerExtHandler('preset.switch', (params) => {
     const name = String(params['name'] ?? '');
     policy.setActivePreset(name); // popup — user gesture, разрешено всегда

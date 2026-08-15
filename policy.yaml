@@ -28,6 +28,8 @@ pacing:
 presets:
   local-services:
     description: "Локальные сервисы, без церемоний"
+    # pacing можно переопределить на уровень пресета (доверенные/локальные —
+    # быстрее): pacing: { min_delay_ms: 100, max_delay_ms: 600, max_actions_per_minute: 60 }
     domains:
       "localhost:8080":
         capabilities: [read, interact]

@@ -172,6 +172,19 @@ export class PolicyEngine {
     this.emitChange();
   }
 
+  /**
+   * Отзыв разового гранта (жест пользователя в popup). Только session-гранты:
+   * пресетные домены управляются правкой policy.yaml. Возвращает false, если
+   * session-гранта на этот домен не было.
+   */
+  removeSessionGrant(domain: string): boolean {
+    if (!this.sessionGrants.delete(domain)) return false;
+    this.updateVersion++;
+    this.audit({ kind: 'grant', domain, decision: 'session_revoke' });
+    this.emitChange();
+    return true;
+  }
+
   // ---- домены ----
 
   /** Ключи вида "host" или "host:port". "host" матчит host и его поддомены (любой порт). */
@@ -311,7 +324,11 @@ export class PolicyEngine {
   // ---- pacing (N6), читается из текущей политики (hot-reload aware) ----
 
   pacing(): { min_delay_ms: number; max_delay_ms: number; max_actions_per_minute: number } {
-    const p = this.file.pacing ?? {};
+    const g = this.file.pacing ?? {};
+    // per-preset переопределение: presets.<name>.pacing поверх глобального
+    const preset = this.file.presets?.[this.activePreset()] as Record<string, unknown> | undefined;
+    const local = (preset?.['pacing'] ?? {}) as Partial<NonNullable<PolicyFile['pacing']>>;
+    const p = { ...g, ...local };
     return {
       min_delay_ms: p.min_delay_ms ?? 400,
       max_delay_ms: p.max_delay_ms ?? 2500,

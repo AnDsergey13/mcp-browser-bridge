@@ -30,11 +30,13 @@ let state = {
   injectorRegistered: false,
   injectorPatterns: [],
   injectorTs: 0,
+  sessionGrants: [],
   serverUrl: "",
   secret: "",
 };
 
 let currentDomain = "";
+let grantMsgDirty = false; // клик-обработчик поставил своё сообщение — render не затирает
 
 function send(action, extra) {
   return browser.runtime
@@ -137,7 +139,34 @@ function render() {
   }
 
   $("grantDomain").textContent = currentDomain || "—";
-  $("btnGrant").disabled = !currentDomain || st !== "active";
+  // Разовый грант: подтверждение/дизейбл для уже выданного домена.
+  const granted = (state.sessionGrants || []).includes(currentDomain);
+  $("btnGrant").disabled = !currentDomain || st !== "active" || granted;
+  if (granted) {
+    $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (read+interact, сессия)";
+  } else if (!grantMsgDirty) {
+    $("grantMsg").textContent = "";
+  }
+
+  // Список грантов сессии с отзывом (управляет человек, не модель).
+  const grants = Array.isArray(state.sessionGrants) ? state.sessionGrants : [];
+  $("grantsBox").classList.toggle("hidden", grants.length === 0);
+  const gUl = $("grantsList");
+  gUl.innerHTML = "";
+  for (const domain of grants) {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = domain + " (read+interact)";
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = "Отозвать";
+    btn.disabled = st !== "active";
+    btn.addEventListener("click", () => send("grant.remove", { domain }));
+    li.appendChild(label);
+    li.appendChild(document.createTextNode(" "));
+    li.appendChild(btn);
+    gUl.appendChild(li);
+  }
 
   // Настройки (не затираем поле, пока пользователь его редактирует)
   if (document.activeElement !== $("inUrl")) $("inUrl").value = state.serverUrl || "";
@@ -159,6 +188,7 @@ async function loadState() {
     injectorRegistered: false,
     injectorPatterns: [],
     injectorTs: 0,
+    sessionGrants: [],
     serverUrl: "ws://127.0.0.1:18777",
     secret: "",
   });
@@ -174,6 +204,7 @@ async function loadCurrentDomain() {
   } catch (e) {
     currentDomain = "";
   }
+  grantMsgDirty = false; // смена вкладки — сообщение гранта пересоздаётся
   render();
 }
 
@@ -203,7 +234,16 @@ $("presetSelect").addEventListener("change", async (e) => {
 });
 
 $("btnGrant").addEventListener("click", async () => {
-  if (currentDomain) await send("grant.add", { domain: currentDomain });
+  if (!currentDomain) return;
+  const res = await send("grant.add", { domain: currentDomain });
+  grantMsgDirty = true;
+  if (res && res.ok) {
+    // sessionGrants в storage обновит background → render покажет подтверждение сам.
+    $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (read+interact, сессия)";
+    $("btnGrant").disabled = true;
+  } else {
+    $("grantMsg").textContent = "Ошибка гранта: " + ((res && res.error) || "нет ответа");
+  }
 });
 
 $("btnPause").addEventListener("click", () => send("pause.global", { paused: !state.paused }));

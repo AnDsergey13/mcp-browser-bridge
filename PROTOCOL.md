@@ -64,7 +64,8 @@
 
 ### Вкладки
 - `tab.list` `{}` → `{tabs:[{tabId,url,title,active}]}`
-- `tab.open` `{url, active?:bool}` → `{tabId,url,title}` (после load)
+- `tab.open` `{url, active?:bool}` → `{tabId,url,title}` (после load).
+  MCP-вариант: с `tabId` — навигация существующей вкладки (`navigate`), без — новая.
 - `tab.close` `{tabId}` → `{}`
 
 ### Страница
@@ -93,7 +94,14 @@
 
 Ошибки расширения: `NO_TAB`, `STALE_REF` (ref инвалидирован — агент должен
 сделать свежий snapshot), `NAV_TIMEOUT`, `FETCH_FAILED`, `CONTENT_SCRIPT_ABSENT`
-(домен вне match_patterns — значит и политика бы не пустила).
+(домен вне match_patterns — значит и политика бы не пустила), `DOMAIN_MISMATCH`
+(текущий URL вкладки не совпадает с match_patterns политики — команда не
+исполнена), `NOT_FOUND`/`AMBIGUOUS` (click-by-text: кандидатов ноль или >1).
+
+`click` принимает `ref` ИЛИ `text` (атомарный поиск+клик в момент исполнения,
+устойчив к перерисовкам). Ответы act.* содержат `after` — свежие
+интерактивные элементы скоупа (если DOM/URL изменились; ≤2KB) — отдельный
+snapshot после действия обычно не нужен.
 
 ## 5. Запросы расширение → сервер (req)
 
@@ -101,6 +109,10 @@
 - `grant.add` `{domain, capabilities:["read","interact",...], scope:"session"}` →
   `{granted:true}` — разовый грант из popup. Сервер пишет аудит и шлёт
   свежий `policy.update` всем.
+- `grant.remove` `{domain}` → `{removed:bool}` — отзыв разового гранта из popup
+  (только session-гранты; пресетные домены — правкой policy.yaml). Сервер пишет
+  аудит (`session_revoke`) и шлёт свежий `policy.update` — инжектор
+  перерегистрирует content scripts без этого домена.
 - `preset.switch` `{name}` → `{preset}` — переключение пресета из popup
   (user gesture, разрешено всегда). Сервер шлёт `policy.update`.
 

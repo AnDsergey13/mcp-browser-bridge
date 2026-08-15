@@ -115,6 +115,20 @@ test('policy.request_preset deny → ACTION_DENIED', async () => {
   mock.consent = 'allow';
 });
 
+test('разовый грант: add → домен в policy.update; remove → домен исчезает', async () => {
+  const versionBefore = mock.policyUpdates.at(-1).version;
+  handle.policy.addSessionGrant('example.org', ['read', 'interact']);
+  const upd1 = await mock.waitForPolicyUpdate((v) => v.version > versionBefore, 5000);
+  assert.equal(upd1.domains['example.org'].source, 'session');
+  assert.ok(upd1.match_patterns.includes('*://*.example.org/*'));
+  // Отзыв (жест пользователя в popup → grant.remove): домен выпадает из update.
+  assert.equal(handle.policy.removeSessionGrant('example.org'), true);
+  const upd2 = await mock.waitForPolicyUpdate((v) => v.version > upd1.version, 5000);
+  assert.ok(!upd2.domains['example.org']);
+  assert.ok(!upd2.match_patterns.includes('*://*.example.org/*'));
+  assert.equal(handle.policy.removeSessionGrant('example.org'), false, 'повторный отзыв — false');
+});
+
 test('аудит (N17): решения grant/deny/override пишутся в policy-audit.jsonl', async () => {
   const auditPath = env.memoryDir + '/policy-audit.jsonl';
   await waitFor(() => fs.existsSync(auditPath) && fs.readFileSync(auditPath, 'utf8').length > 0);
