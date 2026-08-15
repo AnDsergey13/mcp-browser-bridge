@@ -167,7 +167,7 @@ function startFileRepl(cmdPath: string, core: BridgeCore, log: (msg: string) => 
     try { cmd = JSON.parse(fs.readFileSync(cmdPath, 'utf8')); } catch { return; }
     fs.unlinkSync(cmdPath);
     try {
-      const payload = await core.callTool(String(cmd.tool), cmd.args ?? {});
+      const payload = await core.callTool(String(cmd.tool), cmd.args ?? {}, { uncap: true });
       fs.writeFileSync(resPath, JSON.stringify(payload, null, 2));
     } catch (e) {
       fs.writeFileSync(resPath, JSON.stringify({ ok: false, error_code: 'DRIVER_ERROR', message: String(e) }));

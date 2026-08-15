@@ -65,7 +65,7 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(os.path.join(a.out, 'images'), exist_ok=True)
-    d = bridge('page.extract', {'tabId': a.tab})
+    d = bridge('page.extract', {'tabId': a.tab, 'max_chars': 60000})
     md = d['markdown']
     source_url = d['url']
 

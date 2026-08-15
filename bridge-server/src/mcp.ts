@@ -146,8 +146,8 @@ export class BridgeCore {
     return { preset: full['preset'], domain: domain?.['key'] ?? null, reminder_version: hash };
   }
 
-  /** Главный конвейер исполнения инструмента. */
-  async callTool(name: string, args: Record<string, unknown>): Promise<ToolPayload> {
+  /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. */
+  async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean }): Promise<ToolPayload> {
     const tabId = typeof args['tabId'] === 'number' ? (args['tabId'] as number) : null;
     let urlForReminder: string | null = tabId !== null ? (this.tabs.get(tabId)?.url ?? null) : (typeof args['url'] === 'string' ? args['url'] : null);
     let resolved: ResolvedDomain | null = urlForReminder ? this.policy.resolveDomain(urlForReminder) : null;
@@ -253,8 +253,8 @@ export class BridgeCore {
         (data as Record<string, unknown>)['untrusted_page_content'] = true;
       }
 
-      // 10. N7: страховочная резка.
-      const capped = capResponse(data);
+      // 10. N7: страховочная резка (для файл-REPL пропускаем — ответ на диск).
+      const capped = opts?.uncap ? { data, truncated: false, hint: null } : capResponse(data);
       return finish({ ok: true, data: capped.data, hint: capped.hint, policy_reminder: reminder(false) });
     } catch (err) {
       if (err instanceof PacingLimitError) {
