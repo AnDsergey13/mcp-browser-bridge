@@ -1,5 +1,27 @@
 # SETUP.md — установка и запуск моста (хост + контейнер)
 
+## Быстрый рестарт контейнера (чеклист, ~2 минуты)
+
+1. Хост, папка проекта: `exitbox run kimi --no-resume -- --yolo`.
+2. Хост: socat-релей жив? `curl 127.0.0.1:18777` → `426 Upgrade Required`.
+   Нет — перезапустить (команда ниже в §1).
+3. В контейнере MCP-сервер поднимется сам из `.kimi-code/mcp.json`
+   (команда `/mcp` — статус; должен быть connected).
+   Если `ERR_UNKNOWN_FILE_EXTENSION ".ts"` — конфиг старый: должно быть
+   `node --import tsx src/index.ts` с cwd `/workspace/bridge-server`
+   (исправлено 2026-08-15; голый `node index.ts` .ts не загружает).
+4. Браузер: `about:debugging` → Load Temporary Add-on →
+   `extension/manifest.json` (если браузер перезапускался). После загрузки
+   перезагрузи вкладку курса (F5) — иначе старые content scripts.
+5. Popup: подтверди «Новая сессия агента» → выдай session-гранты доменам
+   (для курса: `course.cpsdrone.com`, `fast.wistia.com`,
+   `embed-cloudfront.wistia.com`, `files.cdn.thinkific.com` —
+   read+interact+download).
+6. Если страница курса показала Cloudflare «Just a moment» — обычно проходит
+   сама за ~8 с; после рестарта контейнера/браузера может потребовать
+   ручного прохождения (человеком).
+7. Готово. Контекст задачи — в `memory/session-handoff.md`.
+
 ## Одноразовая настройка
 
 ### 1. Контейнер (ExitBox): подключение хоста к серверу
