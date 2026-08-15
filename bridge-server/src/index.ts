@@ -94,10 +94,14 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
     core.handlePauseEvent(event, data);
   };
   transport.registerExtHandler('grant.add', (params) => {
+    // Replace-семантика: popup шлёт полный набор capabilities (чекбоксы);
+    // повторная выдача = редактирование. Невалидные capability отбрасываем.
     const domain = String(params['domain'] ?? '');
-    const capabilities = (Array.isArray(params['capabilities']) ? params['capabilities'] : []) as Capability[];
+    const VALID: Capability[] = ['read', 'interact', 'download'];
+    const capabilities = (Array.isArray(params['capabilities']) ? params['capabilities'] : [])
+      .filter((c): c is Capability => VALID.includes(c as Capability));
     if (!domain) return { granted: false };
-    policy.addSessionGrant(domain, capabilities);
+    policy.setSessionGrant(domain, capabilities);
     return { granted: true };
   });
   transport.registerExtHandler('grant.remove', (params) => {

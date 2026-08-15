@@ -744,6 +744,8 @@ async function onPolicyUpdate(data) {
   await saveState({
     policyPreset: data.preset || "",
     policyVersion: data.version || 0,
+    // Карта доменов с capabilities/source — popup рендерит чекбоксы и список грантов.
+    policyDomains: data.domains && typeof data.domains === "object" ? data.domains : {},
   });
   try {
     await BridgeInjector.applyPolicy(data); // needHostPermission выставит сам
@@ -802,9 +804,10 @@ async function handlePopupAction(msg) {
       return { ok: true, result: res };
     }
     case "grant.add": {
+      // capabilities приходят из чекбоксов popup (полный набор, replace).
       const res = await sendReq("grant.add", {
         domain: msg.domain,
-        capabilities: ["read", "interact"],
+        capabilities: Array.isArray(msg.capabilities) ? msg.capabilities : ["read", "interact"],
         scope: "session",
       });
       // Трекинг выданных грантов — popup показывает подтверждение и дизейблит кнопку.

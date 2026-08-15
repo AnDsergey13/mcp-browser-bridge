@@ -86,6 +86,8 @@
 - `getStateHash` `{tabId}` → `{url,dom_hash}` — для reconcile при resume
 - `fetchFile` `{tabId,url,name?}` → поток событий (§8); финальный res:
   `{transferId,size,sha256}` — res приходит ПОСЛЕ evt `file.end`.
+  Policy проверяет домен ФАЙЛА (`url`), а не вкладки: capability `download`
+  должна быть выдана домену, с которого скачиваем.
 
 `flags` — массив строк из `["captcha","cloudflare_challenge","otp","login_form"]`,
 вычисляется content script'ом по DOM-маркерам после каждой команды
@@ -107,7 +109,9 @@ snapshot после действия обычно не нужен.
 
 - `consent.response` НЕ нужен — согласие это res на серверный req (ниже).
 - `grant.add` `{domain, capabilities:["read","interact",...], scope:"session"}` →
-  `{granted:true}` — разовый грант из popup. Сервер пишет аудит и шлёт
+  `{granted:true}` — разовый грант из popup. REPLACE-семантика: popup шлёт полный
+  набор capabilities (чекбоксы), повторная выдача = редактирование (можно снять
+  capability). Невалидные capability отбрасываются. Сервер пишет аудит и шлёт
   свежий `policy.update` всем.
 - `grant.remove` `{domain}` → `{removed:bool}` — отзыв разового гранта из popup
   (только session-гранты; пресетные домены — правкой policy.yaml). Сервер пишет

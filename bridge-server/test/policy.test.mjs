@@ -117,16 +117,33 @@ test('policy.request_preset deny → ACTION_DENIED', async () => {
 
 test('разовый грант: add → домен в policy.update; remove → домен исчезает', async () => {
   const versionBefore = mock.policyUpdates.at(-1).version;
-  handle.policy.addSessionGrant('example.org', ['read', 'interact']);
+  handle.policy.setSessionGrant('example.org', ['read', 'interact']);
   const upd1 = await mock.waitForPolicyUpdate((v) => v.version > versionBefore, 5000);
   assert.equal(upd1.domains['example.org'].source, 'session');
   assert.ok(upd1.match_patterns.includes('*://*.example.org/*'));
+  // Replace-семантика (чекбоксы popup): повторная выдача сужает capabilities.
+  handle.policy.setSessionGrant('example.org', ['read']);
+  const upd2 = await mock.waitForPolicyUpdate((v) => v.version > upd1.version, 5000);
+  assert.deepEqual(upd2.domains['example.org'].capabilities, ['read']);
   // Отзыв (жест пользователя в popup → grant.remove): домен выпадает из update.
   assert.equal(handle.policy.removeSessionGrant('example.org'), true);
-  const upd2 = await mock.waitForPolicyUpdate((v) => v.version > upd1.version, 5000);
-  assert.ok(!upd2.domains['example.org']);
-  assert.ok(!upd2.match_patterns.includes('*://*.example.org/*'));
+  const upd3 = await mock.waitForPolicyUpdate((v) => v.version > upd2.version, 5000);
+  assert.ok(!upd3.domains['example.org']);
+  assert.ok(!upd3.match_patterns.includes('*://*.example.org/*'));
   assert.equal(handle.policy.removeSessionGrant('example.org'), false, 'повторный отзыв — false');
+});
+
+test('file.download: проверяется домен ФАЙЛА, а не вкладки', async () => {
+  handle.policy.setActivePreset('test'); // предыдущие тесты оставили пресет "other"
+  await primeTab(); // tabId 1 = localhost:8080, у него есть capability download
+  // Файл с негрантованного домена → DOMAIN_NOT_ALLOWED, хотя вкладка разрешена.
+  const res1 = await handle.core.callTool('file.download', { tabId: 1, url: 'https://forbidden.example/x.bin' });
+  assert.equal(res1.ok, false);
+  assert.equal(res1.error_code, 'DOMAIN_NOT_ALLOWED');
+  // Файл с грантованного домена БЕЗ capability download → CAPABILITY_DENIED.
+  const res2 = await handle.core.callTool('file.download', { tabId: 1, url: 'https://readonly.example/x.bin' });
+  assert.equal(res2.ok, false);
+  assert.equal(res2.error_code, 'CAPABILITY_DENIED');
 });
 
 test('аудит (N17): решения grant/deny/override пишутся в policy-audit.jsonl', async () => {

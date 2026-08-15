@@ -31,12 +31,14 @@ let state = {
   injectorPatterns: [],
   injectorTs: 0,
   sessionGrants: [],
+  policyDomains: {},
   serverUrl: "",
   secret: "",
 };
 
 let currentDomain = "";
 let grantMsgDirty = false; // клик-обработчик поставил своё сообщение — render не затирает
+let capDirty = false; // пользователь трогает чекбоксы — render не перезаполняет
 
 function send(action, extra) {
   return browser.runtime
@@ -139,24 +141,43 @@ function render() {
   }
 
   $("grantDomain").textContent = currentDomain || "—";
-  // Разовый грант: подтверждение/дизейбл для уже выданного домена.
-  const granted = (state.sessionGrants || []).includes(currentDomain);
-  $("btnGrant").disabled = !currentDomain || st !== "active" || granted;
-  if (granted) {
-    $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (read+interact, сессия)";
+  // Чекбоксы capabilities: предзаполняем текущим состоянием гранта (session
+  // или preset), но не затираем, пока пользователь редактирует (capDirty).
+  const domInfo = (state.policyDomains || {})[currentDomain] || null;
+  if (!capDirty) {
+    const caps = domInfo ? domInfo.capabilities || [] : ["read", "interact"];
+    $("capRead").checked = caps.includes("read");
+    $("capInteract").checked = caps.includes("interact");
+    $("capDownload").checked = caps.includes("download");
+  }
+  const sessionGranted = domInfo && domInfo.source === "session";
+  const presetGranted = domInfo && domInfo.source === "preset";
+  $("btnGrant").disabled = !currentDomain || st !== "active";
+  $("btnGrant").textContent = sessionGranted
+    ? "Обновить грант (сессия)"
+    : "Выдать грант (сессия)";
+  if (presetGranted && !grantMsgDirty) {
+    $("grantMsg").textContent =
+      "Доступ из пресета: " + (domInfo.capabilities || []).join(", ") +
+      " — session-грант добавит/снимет capabilities поверх (пресет правится в policy.yaml)";
+  } else if (sessionGranted && !grantMsgDirty) {
+    $("grantMsg").textContent =
+      "Грант выдан: " + currentDomain + " (" + (domInfo.capabilities || []).join(", ") + ", сессия)";
   } else if (!grantMsgDirty) {
     $("grantMsg").textContent = "";
   }
 
   // Список грантов сессии с отзывом (управляет человек, не модель).
-  const grants = Array.isArray(state.sessionGrants) ? state.sessionGrants : [];
+  // Источник — policyDomains (authoritative, приходит в policy.update).
+  const domains = state.policyDomains || {};
+  const grants = Object.keys(domains).filter((d) => domains[d] && domains[d].source === "session");
   $("grantsBox").classList.toggle("hidden", grants.length === 0);
   const gUl = $("grantsList");
   gUl.innerHTML = "";
   for (const domain of grants) {
     const li = document.createElement("li");
     const label = document.createElement("span");
-    label.textContent = domain + " (read+interact)";
+    label.textContent = domain + " (" + (domains[domain].capabilities || []).join(", ") + ")";
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.textContent = "Отозвать";
@@ -189,6 +210,7 @@ async function loadState() {
     injectorPatterns: [],
     injectorTs: 0,
     sessionGrants: [],
+    policyDomains: {},
     serverUrl: "ws://127.0.0.1:18777",
     secret: "",
   });
@@ -205,6 +227,7 @@ async function loadCurrentDomain() {
     currentDomain = "";
   }
   grantMsgDirty = false; // смена вкладки — сообщение гранта пересоздаётся
+  capDirty = false; // и чекбоксы предзаполняются под новый домен
   render();
 }
 
@@ -235,16 +258,34 @@ $("presetSelect").addEventListener("change", async (e) => {
 
 $("btnGrant").addEventListener("click", async () => {
   if (!currentDomain) return;
-  const res = await send("grant.add", { domain: currentDomain });
+  const caps = [];
+  if ($("capRead").checked) caps.push("read");
+  if ($("capInteract").checked) caps.push("interact");
+  if ($("capDownload").checked) caps.push("download");
   grantMsgDirty = true;
+  if (caps.length === 0) {
+    // Все галочки сняты = отзыв гранта (если он был).
+    const res = await send("grant.remove", { domain: currentDomain });
+    $("grantMsg").textContent =
+      res && res.ok ? "Грант отозван: " + currentDomain : "Ошибка: " + ((res && res.error) || "нет ответа");
+    capDirty = false;
+    return;
+  }
+  const res = await send("grant.add", { domain: currentDomain, capabilities: caps });
   if (res && res.ok) {
-    // sessionGrants в storage обновит background → render покажет подтверждение сам.
-    $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (read+interact, сессия)";
-    $("btnGrant").disabled = true;
+    // policy.update обновит policyDomains → render покажет состояние сам.
+    $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (" + caps.join(", ") + ", сессия)";
+    capDirty = false;
   } else {
     $("grantMsg").textContent = "Ошибка гранта: " + ((res && res.error) || "нет ответа");
   }
 });
+
+for (const id of ["capRead", "capInteract", "capDownload"]) {
+  $(id).addEventListener("change", () => {
+    capDirty = true;
+  });
+}
 
 $("btnPause").addEventListener("click", () => send("pause.global", { paused: !state.paused }));
 
