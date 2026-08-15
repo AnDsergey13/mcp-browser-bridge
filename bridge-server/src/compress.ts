@@ -14,19 +14,17 @@ export interface CappedResult {
   hint: string | null;
 }
 
-function findLongestString(obj: unknown, best: { path: string[]; value: string }): { path: string[]; value: string } {
+function findLongestString(obj: unknown, nodePath: string[], best: { path: string[]; value: string }): { path: string[]; value: string } {
   if (typeof obj === 'string') {
-    return obj.length > best.value.length ? { path: best.path, value: obj } : best;
+    return obj.length > best.value.length ? { path: nodePath, value: obj } : best;
   }
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
-      const cand = findLongestString(obj[i], { path: [...best.path, String(i)], value: best.value });
-      if (cand.value.length > best.value.length) best = { path: cand.path, value: cand.value };
+      best = findLongestString(obj[i], [...nodePath, String(i)], best);
     }
   } else if (obj && typeof obj === 'object') {
     for (const [k, v] of Object.entries(obj)) {
-      const cand = findLongestString(v, { path: [...best.path, k], value: best.value });
-      if (cand.value.length > best.value.length) best = { path: cand.path, value: cand.value };
+      best = findLongestString(v, [...nodePath, k], best);
     }
   }
   return best;
@@ -72,7 +70,7 @@ export function capResponse(data: unknown, limit: number = LIMIT): CappedResult 
   // Работаем на глубокой копии, исходный ответ не портим.
   const copy = JSON.parse(serialized) as unknown;
   const overshoot = serialized.length - limit;
-  const longest = findLongestString(copy, { path: [], value: '' });
+  const longest = findLongestString(copy, [], { path: [], value: '' });
   if (longest.path.length > 0 && longest.value.length > overshoot + 256) {
     const keep = longest.value.length - overshoot - 256;
     setByPath(copy, longest.path, longest.value.slice(0, Math.max(keep, 1024)) + '\n… [RESPONSE_TOO_LARGE: обрезано сервером]');
