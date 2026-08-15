@@ -118,14 +118,15 @@ ENVIRONMENT.md   верификация среды (чеклист хоста)
 
 ```bash
 cd bridge-server
-npm test    # 16 тестов: policy engine, транспорт, MCP-слой
+npm test    # 18 тестов: policy engine, транспорт, MCP-слой, файл-REPL
 ```
 
 Живая отладка из контейнера без MCP-клиента:
-`bridge-server/scripts/live-repl.mjs` (in-process сервер + файловый REPL
-через `.bridge/cmd.json` → `.bridge/result.json`), перезапуск —
-`scripts/restart-repl.sh`. Скрипты `hls-download.py` и `localize-page.py`
-качают медиа и локализуют страницы через живой мост.
+`bridge-server/scripts/live-repl.mjs` (in-process сервер без MCP).
+Файл-REPL (`.bridge/cmd.json` → `.bridge/result.json`) встроен в сам
+MCP-сервер — скрипты `hls-download.py` / `localize-page.py` работают и под
+MCP-сессией; live-repl нужен, только когда MCP не поднят (сокет один,
+вместе они не запустятся).
 
 > **Reload расширения ≠ обновление content scripts**: после Reload в
 > `about:debugging` уже открытые вкладки выполняют старый код —

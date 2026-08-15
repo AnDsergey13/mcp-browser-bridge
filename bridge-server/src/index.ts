@@ -27,6 +27,13 @@ export interface BridgeOptions {
   mcp?: boolean;
   /** Путь unix-сокета; false — не слушать (в тестах обязательно false). */
   unixSocket?: string | false;
+  /**
+   * Файл-REPL: путь к cmd.json (результат — result.json рядом); false —
+   * выключен. Позволяет скриптам (hls-download.py, localize-page.py) ходить
+   * через тот же процесс, что держит MCP/сокет. По умолчанию выключен;
+   * боевой entry (isMain) включает явно.
+   */
+  fileRepl?: string | false;
   log?: (msg: string) => void;
 }
 
@@ -133,13 +140,42 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
     log('MCP stdio: подключено');
   }
 
+  // Файл-REPL (по умолчанию выключен; в тестах не включать): скрипты пишут
+  // {"tool","args"} в cmd.json и забирают результат из result.json рядом.
+  const fileRepl = opts.fileRepl ??
+    (process.env.BRIDGE_FILE_REPL && process.env.BRIDGE_FILE_REPL !== '0'
+      ? process.env.BRIDGE_FILE_REPL : false);
+  const stopRepl = fileRepl ? startFileRepl(fileRepl, core, log) : null;
+
   return {
     port, secret, core, transport, policy,
     close: async () => {
+      stopRepl?.();
       policy.stopWatch();
       await transport.close();
     },
   };
+}
+
+/** Файл-REPL поверх живого сервера. Возвращает функцию остановки. */
+function startFileRepl(cmdPath: string, core: BridgeCore, log: (msg: string) => void): () => void {
+  const resPath = path.join(path.dirname(cmdPath), 'result.json');
+  try { fs.unlinkSync(cmdPath); } catch { /* не было — ок */ }
+  const timer = setInterval(async () => {
+    if (!fs.existsSync(cmdPath)) return;
+    let cmd: { tool?: string; args?: Record<string, unknown> };
+    try { cmd = JSON.parse(fs.readFileSync(cmdPath, 'utf8')); } catch { return; }
+    fs.unlinkSync(cmdPath);
+    try {
+      const payload = await core.callTool(String(cmd.tool), cmd.args ?? {});
+      fs.writeFileSync(resPath, JSON.stringify(payload, null, 2));
+    } catch (e) {
+      fs.writeFileSync(resPath, JSON.stringify({ ok: false, error_code: 'DRIVER_ERROR', message: String(e) }));
+    }
+    log(`file-repl: выполнено ${String(cmd.tool)}`);
+  }, 700);
+  log(`file-repl: слушаю ${cmdPath}`);
+  return () => clearInterval(timer);
 }
 
 function numEnv(name: string, dflt: number): number {
@@ -149,7 +185,10 @@ function numEnv(name: string, dflt: number): number {
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (isMain) {
-  startBridge().catch((err) => {
+  // Боевой запуск (MCP-сервер Kimi Code): файл-REPL включён по умолчанию,
+  // чтобы scripts/*.py работали через тот же процесс (BRIDGE_FILE_REPL=0 —
+  // отключить, или путь к cmd.json).
+  startBridge({ fileRepl: process.env.BRIDGE_FILE_REPL ?? '/workspace/.bridge/cmd.json' }).catch((err) => {
     console.error(`[bridge] fatal: ${(err as Error).stack ?? err}`);
     process.exit(1);
   });

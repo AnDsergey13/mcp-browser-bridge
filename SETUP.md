@@ -17,9 +17,8 @@
    (для курса: `course.cpsdrone.com`, `fast.wistia.com`,
    `embed-cloudfront.wistia.com`, `files.cdn.thinkific.com` —
    read+interact+download).
-6. Если страница курса показала Cloudflare «Just a moment» — обычно проходит
-   сама за ~8 с; после рестарта контейнера/браузера может потребовать
-   ручного прохождения (человеком).
+6. Если страница курса показала Cloudflare «Just a moment» — галочку проходит
+   ЧЕЛОВЕК (агенту: СТОП и доклад, не кликать и не ждать автопрохождения).
 7. Готово. Контекст задачи — в `memory/session-handoff.md`.
 
 ## Одноразовая настройка

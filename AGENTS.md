@@ -23,9 +23,11 @@
   затем доклад пользователю. Чеклист рестарта контейнера — в SETUP.md
   («Быстрый рестарт контейнера»).
 - **Сокет один**: MCP-сервер и `scripts/live-repl.mjs` слушают один и тот же
-  `.bridge/bridge.sock` — вместе не живут. Работаем по MCP; live-repl
-  поднимать только осознанно (скрипты hls-download.py / localize-page.py
-  ходят через файл-REPL, это их зависимость).
+  `.bridge/bridge.sock` — вместе не живут. Работаем по MCP; live-repl —
+  только для сессии без MCP. Скрипты (hls-download.py, localize-page.py)
+  ходят через файл-REPL `.bridge/cmd.json` → `result.json`: он встроен в
+  MCP-сервер (isMain включает его по умолчанию, BRIDGE_FILE_REPL=0 —
+  выключить), так что под MCP скрипты работают без live-repl.
 - Перед работой на известном домене читай `memory/domains/<domain>.md`
   (плейбук: селекторы, карта разделов, глюки) — он же приходит в
   `policy_reminder` ответов.
@@ -36,10 +38,11 @@
 - Скачивание медиа — готовыми скриптами из `bridge-server/scripts/` (не руками
   через отдельные file.download): `hls-download.py` (HLS: master→variant→
   сегменты→склейка .ts, ffmpeg-ремукс если есть; `--net` берёт потоки из
-  net.list) и `localize-page.py` (страница → самодостаточный content.md:
-  картинки скачаны в images/ и вписаны по месту, embed'ы видео подменены
-  локальными файлами). Оба идут через живой live-repl и file.download;
-  нужны download-гранты на домены ФАЙЛОВ (CDN), не только страницы.
+  net.list; идемпотентен — докачивает с места обрыва) и `localize-page.py`
+  (страница → самодостаточный content.md: картинки скачаны в images/ и
+  вписаны по месту, embed'ы видео подменены локальными файлами). Оба идут
+  через файл-REPL (встроен в MCP-сервер) и file.download; нужны
+  download-гранты на домены ФАЙЛОВ (CDN), не только страницы.
 - Gating не обходить никогда: `ACTION_DENIED`, `AUTO_PAUSED_HUMAN_NEEDED`,
   `PAUSED`, `STATE_DIVERGED`, `DOMAIN_NOT_ALLOWED`, `CAPABILITY_DENIED` —
   это СТОП и доклад пользователю, а не повторные попытки и не поиск обхода.
