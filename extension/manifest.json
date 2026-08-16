@@ -3,10 +3,17 @@
   "name": "Kimi Code Bridge",
   "version": "0.1.0",
   "description": "Мост между bridge-server (контейнер) и браузером: выполнение команд страницы по политике, выдаваемой сервером.",
-  "permissions": ["tabs", "notifications", "storage", "webRequest"],
+  "permissions": ["tabs", "notifications", "storage", "webRequest", "alarms"],
   "optional_permissions": ["<all_urls>"],
   "background": {
-    "scripts": ["src/injector.js", "src/background.js"],
+    "scripts": [
+      "src/compat-browser.js",
+      "src/config.js",
+      "src/owners.js",
+      "src/keepalive.js",
+      "src/injector.js",
+      "src/background.js"
+    ],
     "persistent": true
   },
   "browser_action": {
