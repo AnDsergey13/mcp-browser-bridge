@@ -1,6 +1,9 @@
-// transport.ts — WS-сервер для расширения (PROTOCOL.md §1-3):
+// transport.ts — WS-сервер для расширений (PROTOCOL.md §1-3, §11):
 // hello/auth, session.approve/deny, heartbeat (ping 15s / offline 45s),
 // BROWSER_OFFLINE без очередей, маршрутизация req/res/evt.
+// Фаза 9 (D1–D3, D6): мультиклиентность — Map<clientId, Connection>,
+// clientId = browser из hello; per-client состояния, approve переживает
+// реконнект в рамках серверной сессии; события тегируются clientId.
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -20,8 +23,36 @@ export class BridgeError extends Error {
 
 export type SessionState = 'offline' | 'pending_approval' | 'active' | 'denied';
 
-type ExtReqHandler = (params: Record<string, unknown>) => unknown | Promise<unknown>;
-type EvtHandler = (event: string, data: Record<string, unknown>) => void;
+export interface ClientInfo {
+  id: string;
+  browser: string;
+  state: SessionState;
+  ext_version: string;
+  ua: string;
+}
+
+interface PendingReq {
+  resolve: (result: unknown) => void;
+  reject: (err: BridgeError) => void;
+  timer: NodeJS.Timeout;
+}
+
+interface Connection {
+  ws: WebSocket | null; // null — клиент известен, но сокет мёртв (offline)
+  clientId: string | null; // до hello соединение безымянное
+  browser: string;
+  ext_version: string;
+  ua: string;
+  lastPong: number;
+  heartbeatTimer: NodeJS.Timeout | null;
+  state: SessionState;
+  /** true, когда сокет заменён переподключением — close старого игнорируем. */
+  replaced: boolean;
+  pending: Map<string, PendingReq>;
+}
+
+type ExtReqHandler = (params: Record<string, unknown>, clientId: string) => unknown | Promise<unknown>;
+type EvtHandler = (event: string, data: Record<string, unknown>, clientId: string) => void;
 
 const DEFAULT_REQ_TIMEOUT_MS = 30_000;
 
@@ -36,25 +67,21 @@ export class Transport {
   private wss: WebSocketServer | null = null;
   private extraWss: WebSocketServer[] = [];
   private extraHttp: http.Server[] = [];
-  private approvedOnce = false; // сессия была подтверждена (живёт до рестарта сервера)
-  private ws: WebSocket | null = null;
-  private state: SessionState = 'offline';
-  private lastPong = 0;
-  private heartbeatTimer: NodeJS.Timeout | null = null;
+  /** Именованные клиенты (прошли hello). Переживают дисконнект как offline-записи. */
+  private clients = new Map<string, Connection>();
+  /** Соединения до hello (clientId назначается в момент hello). */
+  private unnamed = new Set<Connection>();
+  /** clientId'ы, подтверждённые в рамках этой серверной сессии (D2: реконнект — без повторного approve). */
+  private approvedClients = new Set<string>();
   private seq = 0;
-  private pending = new Map<string, {
-    resolve: (result: unknown) => void;
-    reject: (err: BridgeError) => void;
-    timer: NodeJS.Timeout;
-  }>();
 
   private extReqHandlers = new Map<string, ExtReqHandler>();
   /** presets, отдаваемые в ответе на hello. */
   presetsProvider: () => string[] = () => [];
-  /** вызывается после session.approve (сервер должен отправить policy.update). */
-  onApproved: (() => void) | null = null;
+  /** вызывается после session.approve (сервер должен отправить policy.update клиенту). */
+  onApproved: ((clientId: string) => void) | null = null;
   onEvent: EvtHandler = () => {};
-  onStateChange: ((state: SessionState) => void) | null = null;
+  onStateChange: ((clientId: string, state: SessionState) => void) | null = null;
 
   constructor(opts: {
     secret: string;
@@ -71,12 +98,21 @@ export class Transport {
     this.reqTimeoutMs = opts.reqTimeoutMs ?? DEFAULT_REQ_TIMEOUT_MS;
   }
 
-  getState(): SessionState {
-    return this.state;
+  /** Состояние клиента; неизвестный clientId — 'offline'. */
+  getState(clientId: string): SessionState {
+    return this.clients.get(clientId)?.state ?? 'offline';
   }
 
-  isConnected(): boolean {
-    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+  isConnected(clientId: string): boolean {
+    const c = this.clients.get(clientId);
+    return Boolean(c?.ws && c.ws.readyState === WebSocket.OPEN);
+  }
+
+  /** Снимок известных клиентов (для policy.status / диагностики). */
+  listClients(): ClientInfo[] {
+    return [...this.clients.entries()].map(([id, c]) => ({
+      id, browser: c.browser, state: c.state, ext_version: c.ext_version, ua: c.ua,
+    }));
   }
 
   registerExtHandler(method: string, handler: ExtReqHandler): void {
@@ -121,95 +157,104 @@ export class Transport {
     });
   }
 
-  private setState(s: SessionState): void {
-    if (this.state === s) return;
-    this.state = s;
-    this.log(`transport: состояние → ${s}`);
-    if (this.onStateChange) this.onStateChange(s);
+  private setState(conn: Connection, s: SessionState): void {
+    if (conn.state === s) return;
+    conn.state = s;
+    this.log(`transport: ${conn.clientId ?? '(безымянный)'} состояние → ${s}`);
+    if (this.onStateChange && conn.clientId) this.onStateChange(conn.clientId, s);
   }
 
   private onConnection(ws: WebSocket): void {
-    // Одно соединение расширения; новое заменяет старое.
-    if (this.ws && this.ws !== ws) {
-      this.log('transport: новое соединение заменяет прежнее');
-      this.dropSocket(this.ws);
-    }
-    this.ws = ws;
-    this.lastPong = Date.now();
-    this.setState('pending_approval'); // до hello считаем, что ждём подтверждения
-    ws.on('message', (raw) => this.onMessage(ws, raw.toString()));
-    ws.on('pong', () => { this.lastPong = Date.now(); });
-    ws.on('close', () => this.onClose(ws));
+    // До hello соединение безымянное; clientId назначит hello (params.browser).
+    const conn: Connection = {
+      ws, clientId: null, browser: '', ext_version: '', ua: '',
+      lastPong: Date.now(), heartbeatTimer: null,
+      state: 'pending_approval', replaced: false, pending: new Map(),
+    };
+    this.unnamed.add(conn);
+    ws.on('message', (raw) => this.onMessage(conn, raw.toString()));
+    ws.on('pong', () => { conn.lastPong = Date.now(); });
+    ws.on('close', () => this.onClose(conn));
     ws.on('error', () => {});
-    this.startHeartbeat(ws);
+    this.startHeartbeat(conn);
   }
 
-  private startHeartbeat(ws: WebSocket): void {
-    this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws !== ws) { this.stopHeartbeat(); return; }
-      if (Date.now() - this.lastPong > this.offlineTimeoutMs) {
-        this.log('transport: heartbeat timeout → offline');
-        this.dropSocket(ws);
+  private startHeartbeat(conn: Connection): void {
+    this.stopHeartbeat(conn);
+    conn.heartbeatTimer = setInterval(() => {
+      if (conn.replaced || !conn.ws) { this.stopHeartbeat(conn); return; }
+      if (Date.now() - conn.lastPong > this.offlineTimeoutMs) {
+        this.log(`transport: ${conn.clientId ?? '(безымянный)'} heartbeat timeout → offline`);
+        this.dropSocket(conn);
         return;
       }
-      try { ws.ping(); } catch { /* сокет уже мёртв */ }
+      try { conn.ws.ping(); } catch { /* сокет уже мёртв */ }
     }, this.heartbeatMs);
   }
 
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+  private stopHeartbeat(conn: Connection): void {
+    if (conn.heartbeatTimer) { clearInterval(conn.heartbeatTimer); conn.heartbeatTimer = null; }
   }
 
-  private dropSocket(ws: WebSocket): void {
-    try { ws.terminate(); } catch { /* ignore */ }
-    this.onClose(ws);
+  private dropSocket(conn: Connection): void {
+    try { conn.ws?.terminate(); } catch { /* ignore */ }
+    this.onClose(conn);
   }
 
-  private onClose(ws: WebSocket): void {
-    if (this.ws !== ws) return; // старое соединение, уже заменено
-    this.ws = null;
-    this.stopHeartbeat();
-    // Очередей нет: все незавершённые req → BROWSER_OFFLINE.
-    for (const [id, p] of this.pending) {
+  private onClose(conn: Connection): void {
+    if (conn.replaced) return; // старый сокет, уже заменён переподключением
+    this.stopHeartbeat(conn);
+    conn.ws = null;
+    this.unnamed.delete(conn);
+    // Очередей нет: все незавершённые req ЭТОГО клиента → BROWSER_OFFLINE.
+    for (const [id, p] of conn.pending) {
       clearTimeout(p.timer);
       p.reject(new BridgeError('BROWSER_OFFLINE', 'соединение с браузером потеряно'));
-      this.pending.delete(id);
+      conn.pending.delete(id);
     }
-    this.setState('offline');
+    if (conn.clientId) this.setState(conn, 'offline');
   }
 
-  private send(obj: unknown): void {
-    if (this.isConnected()) this.ws!.send(JSON.stringify(obj));
+  private send(conn: Connection, obj: unknown): void {
+    if (conn.ws && conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(obj));
   }
 
-  /** Сервер → расширение req. Без активной сессии — немедленная ошибка (очередей нет). */
-  request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
-    if (!this.isConnected() || this.state === 'offline') {
-      return Promise.reject(new BridgeError('BROWSER_OFFLINE', 'расширение не подключено'));
+  /** Сервер → расширение req конкретному клиенту. Без активной сессии — немедленная ошибка (очередей нет). */
+  request(clientId: string, method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
+    const conn = this.clients.get(clientId);
+    if (!conn || !this.isConnected(clientId) || conn.state === 'offline') {
+      return Promise.reject(new BridgeError('BROWSER_OFFLINE', `расширение не подключено (browser: ${clientId})`));
     }
-    if (this.state === 'pending_approval') {
+    if (conn.state === 'pending_approval') {
       return Promise.reject(new BridgeError('SESSION_NOT_APPROVED', 'сессия не подтверждена пользователем'));
     }
-    if (this.state === 'denied') {
+    if (conn.state === 'denied') {
       return Promise.reject(new BridgeError('SESSION_DENIED', 'сессия отклонена пользователем'));
     }
     const id = `m_${++this.seq}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
+        conn.pending.delete(id);
         reject(new BridgeError('TIMEOUT', `нет ответа на ${method} за ${timeoutMs ?? this.reqTimeoutMs} мс`));
       }, timeoutMs ?? this.reqTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      this.send({ type: 'req', id, method, params });
+      conn.pending.set(id, { resolve, reject, timer });
+      this.send(conn, { type: 'req', id, method, params });
     });
   }
 
-  sendEvent(event: string, data: Record<string, unknown>): void {
-    this.send({ type: 'evt', event, data });
+  sendEvent(clientId: string, event: string, data: Record<string, unknown>): void {
+    const conn = this.clients.get(clientId);
+    if (conn) this.send(conn, { type: 'evt', event, data });
   }
 
-  private async onMessage(ws: WebSocket, text: string): Promise<void> {
+  /** Событие всем подключённым именованным клиентам. */
+  broadcast(event: string, data: Record<string, unknown>): void {
+    for (const conn of this.clients.values()) {
+      if (conn.ws && conn.ws.readyState === WebSocket.OPEN) this.send(conn, { type: 'evt', event, data });
+    }
+  }
+
+  private async onMessage(conn: Connection, text: string): Promise<void> {
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(text) as Record<string, unknown>;
@@ -220,9 +265,9 @@ export class Transport {
     const type = msg['type'];
     if (type === 'res') {
       const id = String(msg['id'] ?? '');
-      const p = this.pending.get(id);
+      const p = conn.pending.get(id);
       if (!p) return;
-      this.pending.delete(id);
+      conn.pending.delete(id);
       clearTimeout(p.timer);
       const err = msg['error'] as { code?: string; message?: string } | undefined;
       if (err) p.reject(new BridgeError(err.code ?? 'INTERNAL', err.message ?? err.code ?? 'error'));
@@ -230,7 +275,8 @@ export class Transport {
       return;
     }
     if (type === 'evt') {
-      this.onEvent(String(msg['event'] ?? ''), (msg['data'] ?? {}) as Record<string, unknown>);
+      // Безымянное соединение событий не шлёт (до hello их некому тегировать).
+      this.onEvent(String(msg['event'] ?? ''), (msg['data'] ?? {}) as Record<string, unknown>, conn.clientId ?? '');
       return;
     }
     if (type === 'req') {
@@ -238,16 +284,16 @@ export class Transport {
       const method = String(msg['method'] ?? '');
       const params = (msg['params'] ?? {}) as Record<string, unknown>;
       try {
-        const result = await this.handleExtRequest(ws, method, params);
-        this.send({ type: 'res', id, result: result ?? {} });
+        const result = await this.handleExtRequest(conn, method, params);
+        this.send(conn, { type: 'res', id, result: result ?? {} });
       } catch (err) {
         const be = err as Partial<BridgeError>;
-        this.send({ type: 'res', id, error: { code: be.code ?? 'INTERNAL', message: be.message ?? String(err) } });
+        this.send(conn, { type: 'res', id, error: { code: be.code ?? 'INTERNAL', message: be.message ?? String(err) } });
       }
     }
   }
 
-  private async handleExtRequest(ws: WebSocket, method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async handleExtRequest(conn: Connection, method: string, params: Record<string, unknown>): Promise<unknown> {
     switch (method) {
       case 'hello': {
         const secret = String(params['secret'] ?? '');
@@ -257,42 +303,69 @@ export class Transport {
         if (!ok) {
           this.log('transport: AUTH_FAILED, закрываю сокет');
           // res с ошибкой отправится из onMessage, сокет закрываем после.
-          setImmediate(() => { try { ws.close(); } catch { /* ignore */ } });
+          setImmediate(() => { try { conn.ws?.close(); } catch { /* ignore */ } });
           throw new BridgeError('AUTH_FAILED', 'неверный секрет');
         }
-        this.log(`transport: hello ok (ext ${params['ext_version'] ?? '?'}, ${params['browser'] ?? '?'})`);
+        // clientId = browser из hello (D1); без поля — 'default'.
+        const clientId = String(params['browser'] ?? '') || 'default';
+        this.log(`transport: hello ok от "${clientId}" (ext ${params['ext_version'] ?? '?'}, ${params['browser'] ?? '?'})`);
+        // Переподключение того же браузера — замена старого сокета (per-client).
+        const existing = this.clients.get(clientId);
+        if (existing && existing !== conn) {
+          this.log(`transport: "${clientId}" переподключился — заменяю прежний сокет`);
+          existing.replaced = true;
+          for (const [pid, p] of existing.pending) {
+            clearTimeout(p.timer);
+            p.reject(new BridgeError('BROWSER_OFFLINE', 'соединение заменено переподключением'));
+            existing.pending.delete(pid);
+          }
+          this.stopHeartbeat(existing);
+          try { existing.ws?.terminate(); } catch { /* ignore */ }
+        }
+        this.unnamed.delete(conn);
+        conn.clientId = clientId;
+        conn.browser = clientId;
+        conn.ext_version = String(params['ext_version'] ?? '');
+        conn.ua = String(params['ua'] ?? '');
+        this.clients.set(clientId, conn);
         // Переподключение в рамках той же серверной сессии — без повторного
         // подтверждения (протокол §3: approve заново только при смене
         // server_session_id, т.е. новый запуск сервера/контейнера).
-        if (this.approvedOnce) {
-          this.setState('active');
-          setImmediate(() => { if (this.onApproved) this.onApproved!(); });
+        if (this.approvedClients.has(clientId)) {
+          this.setState(conn, 'active');
+          setImmediate(() => { if (this.onApproved) this.onApproved!(clientId); });
           return { status: 'active', server_session_id: this.sessionId, presets: this.presetsProvider() };
         }
-        this.setState('pending_approval');
+        this.setState(conn, 'pending_approval');
         return { status: 'pending_approval', server_session_id: this.sessionId, presets: this.presetsProvider() };
       }
       case 'session.approve': {
-        this.approvedOnce = true;
-        this.setState('active');
-        if (this.onApproved) setImmediate(() => this.onApproved!());
+        if (!conn.clientId) throw new BridgeError('INTERNAL', 'session.approve до hello');
+        this.approvedClients.add(conn.clientId);
+        this.setState(conn, 'active');
+        if (this.onApproved) setImmediate(() => this.onApproved!(conn.clientId!));
         return { status: 'active' };
       }
       case 'session.deny': {
-        this.setState('denied');
+        // deny не переживает реконнект (как и раньше): повторный hello → pending.
+        this.setState(conn, 'denied');
         return { status: 'denied' };
       }
       default: {
         const handler = this.extReqHandlers.get(method);
         if (!handler) throw new BridgeError('INTERNAL', `неизвестный метод: ${method}`);
-        return handler(params);
+        return handler(params, conn.clientId ?? '');
       }
     }
   }
 
   async close(): Promise<void> {
-    this.stopHeartbeat();
-    if (this.ws) this.dropSocket(this.ws);
+    for (const conn of this.clients.values()) this.dropSocket(conn);
+    for (const conn of this.unnamed) {
+      conn.replaced = true;
+      this.stopHeartbeat(conn);
+      try { conn.ws?.terminate(); } catch { /* ignore */ }
+    }
     await new Promise<void>((resolve) => {
       if (!this.wss) return resolve();
       this.wss.close(() => resolve());

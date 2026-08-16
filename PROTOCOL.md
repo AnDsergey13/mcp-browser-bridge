@@ -240,6 +240,7 @@ title: …
 `DOMAIN_NOT_ALLOWED`, `CAPABILITY_DENIED`, `ACTION_DENIED` (consent deny/timeout),
 `PAUSED`, `AUTO_PAUSED_HUMAN_NEEDED`, `STATE_DIVERGED`, `PACING_LIMIT`,
 `STALE_REF`, `AMBIGUOUS` (авто-retry нашёл >1 кандидата по тексту),
+`AMBIGUOUS_BROWSER` (§11: tabId есть в нескольких браузерах — указать `browser`),
 `BATCH_STEP_FAILED` (act.batch: шаг упал, `data.batch_completed` — сколько успело),
 `WAIT_BUSY` (на вкладке уже активен page.wait_for),
 `SCREENSHOT_TOO_LARGE` (скриншот за потолком — base64 не отдан),
@@ -248,3 +249,48 @@ title: …
 Формат ответа MCP-инструмента: `{ok, data|error_code, hint, policy_reminder}`.
 `policy_reminder`: активный пресет + security-ограничения домена +
 содержимое `memory/domains/<domain>.md` и `memory/global-notes.md`, если есть.
+
+## 11. Мультиклиентность (несколько браузеров у одного сервера)
+
+**Wire-формат сообщений не изменился** — конверты req/res/evt, методы и поля
+те же (§1–§8). Меняется только серверная маршрутизация: расширение вообще не
+знает о других браузерах.
+
+- **clientId = `browser` из `hello`** (§2; без поля — `'default'`). Сервер
+  держит `Map<clientId, Connection>`; до `hello` соединение безымянное.
+  Переподключение с тем же clientId заменяет старый сокет (незавершённые req
+  старого сокета → `BROWSER_OFFLINE`).
+- **Состояния и approve — per-client** (§2–§3 применяются к каждому клиенту
+  отдельно): `offline`/`pending_approval`/`active`/`denied` свои у каждого
+  браузера; approve переживает реконнект в рамках серверной сессии (тот же
+  `server_session_id`); дисконнект одного браузера не меняет состояние
+  остальных. Heartbeat (ping 15 c / offline 45 c) — per-connection.
+- **Политика per-browser (D4):** у записи домена в пресете policy.yaml может
+  быть поле `browsers: [clientId, …]` — домен доступен только перечисленным
+  браузерам; без поля — всем (обратная совместимость). Session-гранты
+  (`grant.add`/`grant.remove`, §5) привязаны к браузеру-источнику: грант из
+  popup firefox не действует в chromium. Проверка домена, не грантованного
+  этому браузеру, → `DOMAIN_NOT_ALLOWED`.
+- **`policy.update` — per-client:** каждому клиенту сервер шлёт вид только его
+  доменов (match_patterns и domains отфильтрованы по clientId; глобальные
+  `gated_defaults`/`version` — общие).
+- **MCP-инструменты:** во все tab-инструменты добавлен опциональный параметр
+  `browser` (clientId из `tab.list`/`policy.status`; не нужен, когда онлайн
+  один браузер). Резолв цели: `browser` → clientId; иначе по `tabId` в реестре
+  (0 владельцев → `NO_TAB`; >1 → `AMBIGUOUS_BROWSER` с hint «укажи browser: …»);
+  `tab.open` без `tabId` при нескольких онлайн-браузерах требует `browser`.
+  Реестры вкладок/снапшотов/пауз ключированы `clientId:tabId` (tabId в wire
+  остаётся числом браузера и может совпадать у разных клиентов).
+- **`tab.list`** опрашивает всех active-клиентов и объединяет ответ; каждая
+  вкладка тегируется полем `browser`. `hidden_tabs` считается по политике
+  браузера-владельца вкладки. `policy.status` дополнен полем
+  `browsers: [{id, browser, state, ext_version, ua}]`.
+- **События тегируются clientId** на стороне сервера (по соединению-источнику;
+  wire не меняется): `pause.auto`/`resume`/`pause.global` и `consent.ask`
+  маршрутизируются в браузер-владелец вкладки. `pause.global` (красная кнопка)
+  остаётся глобальной паузой агента.
+- **Параллельные файловые трансферы (§8):** релей связывает `file.start` с
+  ожиданием `file.download` того же клиента (FIFO по клиенту),
+  `file.ack {transferId, seq}` уходит только клиенту-владельцу трансфера;
+  трансферы разных браузеров (или несколько у одного) завершаются независимо.
+  Дисконнект клиента отменяет только его трансферы и ожидания.

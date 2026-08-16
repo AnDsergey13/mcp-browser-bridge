@@ -1,10 +1,13 @@
-// mcp.ts — 15 MCP-инструментов (фаза 7). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
+// mcp.ts — 19 MCP-инструментов (фаза 7). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
 // Здесь же общее состояние моста: реестр вкладок, кэш снапшотов (для классификатора
 // и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу.
+// Фаза 9 (D5, D6): мультиклиентность — реестры по ключу `clientId:tabId`,
+// опциональный параметр browser во всех tab-инструментах, AMBIGUOUS_BROWSER
+// при коллизии tabId, consent/события — в браузер-владелец вкладки.
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Transport, BridgeError } from './transport.ts';
+import { Transport, BridgeError, type SessionState } from './transport.ts';
 import { PolicyEngine, hostOf, type GatedCategory, type ResolvedDomain } from './policy.ts';
 import { classifyUrl, classifyElement, parseSnapshotRefs, type ElementMeta } from './classifier.ts';
 import { Pacing, PacingLimitError } from './pacing.ts';
@@ -20,7 +23,8 @@ export interface ToolPayload {
   policy_reminder: Record<string, unknown>;
 }
 
-interface TabInfo { url: string; title: string }
+// Запись реестра вкладок: tabId — число браузера (как в wire), clientId — владелец (D5).
+interface TabInfo { tabId: number; url: string; title: string; clientId: string }
 // П0-3: scopeKey = scope|selector — без него снапшот scope:"full" после
 // scope:"viewport" при совпадающем dom_hash дал бы ложный unchanged.
 interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string }
@@ -43,11 +47,13 @@ export class BridgeCore {
   consentTimeoutMs: number;
   log: (msg: string) => void;
 
-  private tabs = new Map<number, TabInfo>();
-  private snapshots = new Map<number, CachedSnapshot>();
-  private globalPaused = false;
-  private autoPaused = new Map<number, AutoPause>();
-  private diverged = new Map<number, { url: string; dom_hash: string }>();
+  // Реестры по композитному ключу `${clientId}:${tabId}` (D5): tabId в wire
+  // остаётся числом браузера и может совпадать у разных клиентов.
+  private tabs = new Map<string, TabInfo>();
+  private snapshots = new Map<string, CachedSnapshot>();
+  private globalPaused = false; // красная кнопка — глобальная, из какого бы браузера ни нажали
+  private autoPaused = new Map<string, AutoPause>();
+  private diverged = new Map<string, { url: string; dom_hash: string }>();
   private consentSeq = 0;
   // П0-1: состояние версионирования policy_reminder.
   private reminderCounter = 0;
@@ -71,47 +77,116 @@ export class BridgeCore {
     this.log = deps.log ?? (() => {});
   }
 
-  /** События паузы от расширения (вызывается из index). */
-  handlePauseEvent(event: string, data: Record<string, unknown>): void {
+  private tabKey(clientId: string, tabId: number): string {
+    return `${clientId}:${tabId}`;
+  }
+
+  /** Владельцы вкладки по реестру (clientId'ы, в т.ч. offline — их состояние проверится ниже). */
+  private tabOwners(tabId: number): string[] {
+    const owners: string[] = [];
+    for (const t of this.tabs.values()) {
+      if (t.tabId === tabId && !owners.includes(t.clientId)) owners.push(t.clientId);
+    }
+    return owners;
+  }
+
+  /** Любая запись реестра по tabId (для reminder до резолва клиента). */
+  private findAnyTab(tabId: number): TabInfo | null {
+    for (const t of this.tabs.values()) if (t.tabId === tabId) return t;
+    return null;
+  }
+
+  /** Агрегатное состояние сессии (tab.list без целевого клиента, policy.status). */
+  private aggregateState(): SessionState {
+    const clients = this.transport.listClients();
+    if (clients.some((c) => c.state === 'active')) return 'active';
+    if (clients.some((c) => c.state === 'pending_approval')) return 'pending_approval';
+    if (clients.some((c) => c.state === 'denied')) return 'denied';
+    return 'offline';
+  }
+
+  /**
+   * Резолв целевого клиента (D5): args.browser → clientId; иначе по tabId в
+   * реестре (0 владельцев → NO_TAB, >1 → AMBIGUOUS_BROWSER); без tabId
+   * (tab.open новой вкладки, policy.request_preset) — единственный active
+   * клиент. tab.list — null (опрашивает всех active). Ошибки — BridgeError,
+   * message которого и есть hint для модели.
+   */
+  private resolveClientId(name: string, tabId: number | null, browserArg: string | undefined): string | null {
+    if (name === 'tab.list') return null;
+    const clients = this.transport.listClients();
+    if (browserArg) {
+      if (!clients.some((c) => c.id === browserArg)) {
+        throw new BridgeError('BROWSER_OFFLINE',
+          `Браузер "${browserArg}" не подключён. Подключённые: ${clients.map((c) => c.id).join(', ') || 'нет'} (см. tab.list/policy.status).`);
+      }
+      return browserArg;
+    }
+    if (tabId !== null) {
+      const owners = this.tabOwners(tabId);
+      if (owners.length === 0) throw new BridgeError('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`);
+      if (owners.length > 1) {
+        throw new BridgeError('AMBIGUOUS_BROWSER',
+          `Вкладка ${tabId} есть в нескольких браузерах (${owners.join(', ')}). Укажи browser: один из ${owners.join(', ')}.`);
+      }
+      return owners[0];
+    }
+    const active = clients.filter((c) => c.state === 'active');
+    if (active.length === 1) return active[0].id;
+    if (active.length > 1) {
+      // policy.request_preset: пресет глобален, consent-баннеру достаточно любого активного браузера.
+      if (name === 'policy.request_preset') return active[0].id;
+      throw new BridgeError('AMBIGUOUS_BROWSER',
+        `Онлайн несколько браузеров (${active.map((c) => c.id).join(', ')}). Укажи browser: один из ${active.map((c) => c.id).join(', ')}.`);
+    }
+    // Active нет — берём любого известного: проверка состояния ниже даст точный код
+    // (SESSION_NOT_APPROVED / SESSION_DENIED / BROWSER_OFFLINE).
+    return clients[0]?.id ?? null;
+  }
+
+  /** События паузы от расширения (вызывается из index; clientId — браузер-источник, D6). */
+  handlePauseEvent(event: string, data: Record<string, unknown>, clientId: string): void {
     if (event === 'pause.global') {
       this.globalPaused = data['paused'] === true;
-      this.log(`core: pause.global=${this.globalPaused}`);
+      this.log(`core: pause.global=${this.globalPaused} (от ${clientId || '?'})`);
       return;
     }
     const tabId = Number(data['tabId']);
-    if (!Number.isFinite(tabId)) return;
+    if (!Number.isFinite(tabId) || !clientId) return;
+    const key = this.tabKey(clientId, tabId);
     if (event === 'pause.auto') {
-      const known = this.tabs.get(tabId);
-      const snap = this.snapshots.get(tabId);
-      this.autoPaused.set(tabId, {
+      const known = this.tabs.get(key);
+      const snap = this.snapshots.get(key);
+      this.autoPaused.set(key, {
         reason: String(data['reason'] ?? 'auto'),
         checkpoint: { url: known?.url ?? snap?.url ?? null, dom_hash: snap?.dom_hash ?? null },
       });
-      this.log(`core: pause.auto tab=${tabId} reason=${data['reason'] ?? '?'}`);
+      this.log(`core: pause.auto ${key} reason=${data['reason'] ?? '?'}`);
       // Уточняем чекпоинт свежим getStateHash (best effort).
-      this.transport.request('getStateHash', { tabId }).then((res) => {
+      this.transport.request(clientId, 'getStateHash', { tabId }).then((res) => {
         const r = res as { url?: string; dom_hash?: string };
-        const p = this.autoPaused.get(tabId);
+        const p = this.autoPaused.get(key);
         if (p) p.checkpoint = { url: r.url ?? p.checkpoint.url, dom_hash: r.dom_hash ?? p.checkpoint.dom_hash };
       }).catch(() => {});
       return;
     }
     if (event === 'resume') {
-      void this.handleResume(tabId);
+      void this.handleResume(clientId, tabId);
     }
   }
 
-  private async handleResume(tabId: number): Promise<void> {
-    const pause = this.autoPaused.get(tabId);
-    this.autoPaused.delete(tabId);
+  private async handleResume(clientId: string, tabId: number): Promise<void> {
+    const key = this.tabKey(clientId, tabId);
+    const pause = this.autoPaused.get(key);
+    this.autoPaused.delete(key);
     if (!pause) return;
     try {
-      const res = await this.transport.request('getStateHash', { tabId }) as { url?: string; dom_hash?: string };
+      const res = await this.transport.request(clientId, 'getStateHash', { tabId }) as { url?: string; dom_hash?: string };
       const cp = pause.checkpoint;
       const divergedNow = (cp.url && res.url !== cp.url) || (cp.dom_hash && res.dom_hash !== cp.dom_hash);
       if (divergedNow) {
-        this.log(`core: STATE_DIVERGED tab=${tabId}`);
-        this.diverged.set(tabId, { url: res.url ?? '', dom_hash: res.dom_hash ?? '' });
+        this.log(`core: STATE_DIVERGED ${key}`);
+        this.diverged.set(key, { url: res.url ?? '', dom_hash: res.dom_hash ?? '' });
       }
     } catch {
       // Браузер офлайн — инструменты и так упадут с BROWSER_OFFLINE.
@@ -149,14 +224,17 @@ export class BridgeCore {
   /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. */
   async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean }): Promise<ToolPayload> {
     const tabId = typeof args['tabId'] === 'number' ? (args['tabId'] as number) : null;
-    let urlForReminder: string | null = tabId !== null ? (this.tabs.get(tabId)?.url ?? null) : (typeof args['url'] === 'string' ? args['url'] : null);
+    const browserArg = typeof args['browser'] === 'string' && args['browser'] !== '' ? args['browser'] as string : undefined;
+    // Целевой клиент после резолва (шаг 1) — нужен finish для маскировки паролей в журнале.
+    let resolvedClientId: string | null = null;
+    let urlForReminder: string | null = tabId !== null ? (this.findAnyTab(tabId)?.url ?? null) : (typeof args['url'] === 'string' ? args['url'] : null);
     let resolved: ResolvedDomain | null = urlForReminder ? this.policy.resolveDomain(urlForReminder) : null;
 
     const finish = (payload: ToolPayload): ToolPayload => {
       this.memory.journal({
         tool: name, args, result: payload, tabId, url: urlForReminder,
         // П2-4: полные args — только при journal_full_args: true (default off).
-        ...(this.policy.journalFullArgs() ? { argsFull: this.sanitizedArgs(name, args, tabId) } : {}),
+        ...(this.policy.journalFullArgs() ? { argsFull: this.sanitizedArgs(name, args, tabId, resolvedClientId) } : {}),
       });
       return payload;
     };
@@ -165,37 +243,50 @@ export class BridgeCore {
       this.versionedReminder(this.memory.buildPolicyReminder(this.policy, resolved), forceFull);
 
     try {
-      // 1. Состояние сессии (policy.status работает всегда — он и докладывает состояние).
-      if (name !== 'policy.status') {
-        const st = this.transport.getState();
-        if (st === 'offline') return finish(this.fail('BROWSER_OFFLINE', 'Расширение не подключено. Попроси пользователя открыть браузер с расширением моста.', reminder()));
-        if (st === 'pending_approval') return finish(this.fail('SESSION_NOT_APPROVED', 'Пользователь ещё не подтвердил сессию агента в расширении.', reminder()));
-        if (st === 'denied') return finish(this.fail('SESSION_DENIED', 'Пользователь отклонил сессию агента. Работа невозможна.', reminder()));
-        // 2. Паузы.
-        if (this.globalPaused) return finish(this.fail('PAUSED', 'Глобальная пауза (красная кнопка в popup). Жди снятия паузы пользователем.', reminder()));
-        if (tabId !== null && this.autoPaused.has(tabId)) {
-          const p = this.autoPaused.get(tabId)!;
-          return finish(this.fail('AUTO_PAUSED_HUMAN_NEEDED', `Вкладка на авто-паузе (${p.reason}). Нужен человек; не повторяй действие до resume.`, reminder()));
-        }
-        // 3. N5: после resume с расхождением — один раз STATE_DIVERGED + свежие {url, dom_hash}.
-        if (tabId !== null && this.diverged.has(tabId)) {
-          const d = this.diverged.get(tabId)!;
-          this.diverged.delete(tabId);
-          return finish(this.fail('STATE_DIVERGED', 'Состояние вкладки изменилось за время паузы. Сделай свежий page.snapshot и перепланируй действия.', reminder(), { url: d.url, dom_hash: d.dom_hash }));
-        }
+      // 0. policy.status работает всегда — он и докладывает состояние.
+      if (name === 'policy.status') return finish(this.toolPolicyStatus());
+
+      // 1. Целевой клиент (D5). Ошибки резолва (NO_TAB / AMBIGUOUS_BROWSER /
+      // BROWSER_OFFLINE с указанием подключённых) — message = hint для модели.
+      let clientId: string | null;
+      try {
+        clientId = this.resolveClientId(name, tabId, browserArg);
+      } catch (err) {
+        const be = err as Partial<BridgeError>;
+        return finish(this.fail(be.code ?? 'INTERNAL', be.message ?? String(err), reminder()));
+      }
+      resolvedClientId = clientId;
+
+      // 2. Состояние сессии — по ЦЕЛЕВОМУ клиенту: offline/pending одного
+      // браузера не мешает работе с другим (D2/D5).
+      const st = clientId ? this.transport.getState(clientId) : this.aggregateState();
+      if (st === 'offline') return finish(this.fail('BROWSER_OFFLINE', 'Расширение не подключено. Попроси пользователя открыть браузер с расширением моста.', reminder()));
+      if (st === 'pending_approval') return finish(this.fail('SESSION_NOT_APPROVED', 'Пользователь ещё не подтвердил сессию агента в расширении.', reminder()));
+      if (st === 'denied') return finish(this.fail('SESSION_DENIED', 'Пользователь отклонил сессию агента. Работа невозможна.', reminder()));
+      // 3. Паузы.
+      if (this.globalPaused) return finish(this.fail('PAUSED', 'Глобальная пауза (красная кнопка в popup). Жди снятия паузы пользователем.', reminder()));
+      const key = clientId !== null && tabId !== null ? this.tabKey(clientId, tabId) : null;
+      if (key && this.autoPaused.has(key)) {
+        const p = this.autoPaused.get(key)!;
+        return finish(this.fail('AUTO_PAUSED_HUMAN_NEEDED', `Вкладка на авто-паузе (${p.reason}). Нужен человек; не повторяй действие до resume.`, reminder()));
+      }
+      // 4. N5: после resume с расхождением — один раз STATE_DIVERGED + свежие {url, dom_hash}.
+      if (key && this.diverged.has(key)) {
+        const d = this.diverged.get(key)!;
+        this.diverged.delete(key);
+        return finish(this.fail('STATE_DIVERGED', 'Состояние вкладки изменилось за время паузы. Сделай свежий page.snapshot и перепланируй действия.', reminder(), { url: d.url, dom_hash: d.dom_hash }));
       }
 
-      // 4. Специальные инструменты без page-конвейера.
-      if (name === 'policy.status') return finish(this.toolPolicyStatus());
-      if (name === 'policy.request_preset') return finish(await this.toolRequestPreset(String(args['name'] ?? ''), reminder));
+      // 5. Специальные инструменты без page-конвейера.
+      if (name === 'policy.request_preset') return finish(await this.toolRequestPreset(String(args['name'] ?? ''), reminder, clientId));
 
-      // 5. Определяем целевой URL и capability.
+      // 6. Определяем целевой URL и capability.
       const capability = PAGE_TOOLS.has(name) ? 'read' : ACT_TOOLS.has(name) ? 'interact' : name === 'file.download' ? 'download' : null;
       let targetUrl: string | null = null;
       if (name === 'tab.open') {
         targetUrl = String(args['url'] ?? '');
       } else if (tabId !== null && name !== 'tab.list') {
-        const known = this.tabs.get(tabId);
+        const known = this.tabs.get(key!);
         if (!known) {
           return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`, reminder()));
         }
@@ -205,17 +296,18 @@ export class BridgeCore {
         targetUrl = name === 'file.download' ? String(args['url'] ?? '') : known.url;
       }
 
-      // 6. Policy-проверка: домен + capability + gated-категория.
+      // 7. Policy-проверка: домен + capability + gated-категория — от имени
+      // целевого клиента (D4: грант браузера A не действует в браузере B).
       // act.batch: каждый шаг проходит check ПОШТУЧНО и АТОМАРНО в начале
       // (П1-2) — gated-шаг без гранта отклоняет весь пакет, partial execution
       // для gated недопустим. Одинаковые категории проверяются один раз.
       if (targetUrl) {
-        for (const category of this.classifyAll(name, args, tabId, targetUrl)) {
-          const check = this.policy.check(targetUrl, capability as 'read' | 'interact' | 'download' | null, category);
+        for (const category of this.classifyAll(name, args, tabId, clientId, targetUrl)) {
+          const check = this.policy.check(targetUrl, capability as 'read' | 'interact' | 'download' | null, category, clientId ?? undefined);
           if (check.decision === 'deny') return finish(this.fail(check.error_code, check.hint, reminder()));
           resolved = check.resolved;
           if (check.decision === 'consent') {
-            const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0);
+            const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0, clientId!);
             if (decision === 'deny') {
               this.policy.audit({ kind: 'deny', domain: check.resolved.key, category: check.category, decision: 'consent_deny' });
               return finish(this.fail('ACTION_DENIED', `Пользователь не подтвердил действие категории "${check.category}" (deny/timeout). Не повторяй без изменения замысла.`, reminder()));
@@ -226,7 +318,7 @@ export class BridgeCore {
         }
       }
 
-      // 7. Pacing (N6) для act.*. act.batch: ёмкость окна проверяется на весь
+      // 8. Pacing (N6) для act.*. act.batch: ёмкость окна проверяется на весь
       // пакет заранее, сами шаги проходят beforeAction с малым jitter в execute.
       if (ACT_TOOLS.has(name)) {
         if (name === 'act.batch') {
@@ -236,24 +328,24 @@ export class BridgeCore {
         }
       }
 
-      // 8. Исполнение (с одноразовым авто-retry после STALE_REF — П1-3).
+      // 9. Исполнение (с одноразовым авто-retry после STALE_REF — П1-3).
       let data: unknown;
       try {
-        data = await this.execute(name, args, tabId);
+        data = await this.execute(name, args, tabId, clientId);
       } catch (err) {
-        data = await this.retryAfterStaleRef(name, args, tabId, err);
+        data = await this.retryAfterStaleRef(name, args, tabId, clientId, err);
       }
       urlForReminder = (data && typeof data === 'object' && typeof (data as Record<string, unknown>)['url'] === 'string')
         ? (data as Record<string, unknown>)['url'] as string
         : urlForReminder;
       resolved = urlForReminder ? this.policy.resolveDomain(urlForReminder) : resolved;
 
-      // 9. N15: контент страниц — untrusted.
+      // 10. N15: контент страниц — untrusted.
       if ((PAGE_TOOLS.has(name) || name === 'page.scan') && data && typeof data === 'object') {
         (data as Record<string, unknown>)['untrusted_page_content'] = true;
       }
 
-      // 10. N7: страховочная резка (для файл-REPL пропускаем — ответ на диск).
+      // 11. N7: страховочная резка (для файл-REPL пропускаем — ответ на диск).
       const capped = opts?.uncap ? { data, truncated: false, hint: null } : capResponse(data);
       return finish({ ok: true, data: capped.data, hint: capped.hint, policy_reminder: reminder(false) });
     } catch (err) {
@@ -271,7 +363,10 @@ export class BridgeCore {
         CONTENT_SCRIPT_ABSENT: 'Домен вне match_patterns политики — content script не загружен.',
         NAV_TIMEOUT: 'Навигация не завершилась вовремя.',
       };
-      return finish(this.fail(code, hints[code] ?? (be.message ?? 'Внутренняя ошибка сервера'), reminder(), be.data));
+      // AMBIGUOUS_BROWSER: message несёт список браузеров — это и есть hint.
+      const hint = code === 'AMBIGUOUS_BROWSER' ? (be.message ?? 'Укажи browser явно.')
+        : (hints[code] ?? be.message ?? 'Внутренняя ошибка сервера');
+      return finish(this.fail(code, hint, reminder(), be.data));
     }
   }
 
@@ -279,12 +374,12 @@ export class BridgeCore {
    * П2-4: args для журнала при journal_full_args: true. Значения act.type в
    * login-формах (password-поле или gated-категория login) маскируются.
    */
-  private sanitizedArgs(name: string, args: Record<string, unknown>, tabId: number | null): Record<string, unknown> {
+  private sanitizedArgs(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null): Record<string, unknown> {
     const clone = JSON.parse(JSON.stringify(args)) as Record<string, unknown>;
     const maskIfLogin = (tool: string, a: Record<string, unknown>): void => {
-      if (tool !== 'act.type' || typeof a['text'] !== 'string' || tabId === null) return;
-      const meta = this.snapshots.get(tabId)?.refs.get(String(a['ref'] ?? ''));
-      if (meta?.attrs['type'] === 'password' || this.classifyAct(tool, a, tabId) === 'login') {
+      if (tool !== 'act.type' || typeof a['text'] !== 'string' || tabId === null || clientId === null) return;
+      const meta = this.snapshots.get(this.tabKey(clientId, tabId))?.refs.get(String(a['ref'] ?? ''));
+      if (meta?.attrs['type'] === 'password' || this.classifyAct(tool, a, tabId, clientId) === 'login') {
         a['text'] = '***';
       }
     };
@@ -298,21 +393,21 @@ export class BridgeCore {
     return clone;
   }
 
-  private classify(name: string, args: Record<string, unknown>, tabId: number | null, targetUrl: string): GatedCategory | null {
+  private classify(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, targetUrl: string): GatedCategory | null {
     if (name === 'tab.open') return classifyUrl(targetUrl);
-    if (tabId !== null) return this.classifyAct(name, args, tabId);
+    if (tabId !== null && clientId !== null) return this.classifyAct(name, args, tabId, clientId);
     return null;
   }
 
   /** Категория одного act-действия (используется и для шагов act.batch). */
-  private classifyAct(name: string, args: Record<string, unknown>, tabId: number): GatedCategory | null {
+  private classifyAct(name: string, args: Record<string, unknown>, tabId: number, clientId: string): GatedCategory | null {
     // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
     if (name === 'act.click' && !args['ref'] && args['text']) {
       return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
     }
     if (name === 'act.click' || name === 'act.type' || name === 'act.select') {
       const ref = String(args['ref'] ?? '');
-      const snap = this.snapshots.get(tabId);
+      const snap = this.snapshots.get(this.tabKey(clientId, tabId));
       return classifyElement(snap?.refs.get(ref));
     }
     return null;
@@ -322,12 +417,12 @@ export class BridgeCore {
    * Категории для policy-check (П1-2): для act.batch — поштучно по всем
    * шагам (уникальные), для остальных инструментов — одна категория.
    */
-  private classifyAll(name: string, args: Record<string, unknown>, tabId: number | null, targetUrl: string): (GatedCategory | null)[] {
-    if (name !== 'act.batch') return [this.classify(name, args, tabId, targetUrl)];
+  private classifyAll(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, targetUrl: string): (GatedCategory | null)[] {
+    if (name !== 'act.batch') return [this.classify(name, args, tabId, clientId, targetUrl)];
     const cats = new Set<GatedCategory | null>();
-    if (tabId !== null && Array.isArray(args['steps'])) {
+    if (tabId !== null && clientId !== null && Array.isArray(args['steps'])) {
       for (const s of args['steps'] as Record<string, unknown>[]) {
-        cats.add(this.classifyAct(`act.${String(s?.['do'] ?? '')}`, s ?? {}, tabId));
+        cats.add(this.classifyAct(`act.${String(s?.['do'] ?? '')}`, s ?? {}, tabId, clientId));
       }
     }
     return [...cats];
@@ -342,10 +437,11 @@ export class BridgeCore {
     return `${name} ref=${String(args['ref'] ?? '-')}`;
   }
 
-  private async askConsent(category: GatedCategory | 'custom', description: string, domain: string, tabId: number): Promise<'allow' | 'deny' | 'allow_10min'> {
+  /** consent.ask — в браузер-владелец вкладки (D6). */
+  private async askConsent(category: GatedCategory | 'custom', description: string, domain: string, tabId: number, clientId: string): Promise<'allow' | 'deny' | 'allow_10min'> {
     const requestId = `c_${++this.consentSeq}`;
     try {
-      const res = await this.transport.request('consent.ask', {
+      const res = await this.transport.request(clientId, 'consent.ask', {
         requestId, category, description, domain, tabId, timeout_ms: this.consentTimeoutMs,
       }, this.consentTimeoutMs + 1000) as { decision?: string };
       if (res && (res.decision === 'allow' || res.decision === 'allow_10min' || res.decision === 'deny')) return res.decision;
@@ -364,14 +460,15 @@ export class BridgeCore {
       domains: view.domains,
       gated_defaults: view.gated_defaults,
       policy_version: view.version,
-      session_state: this.transport.getState(),
+      session_state: this.aggregateState(),
+      browsers: this.transport.listClients(), // D5: кто онлайн и в каком состоянии
       paused: { global: this.globalPaused, auto_tabs: [...this.autoPaused.keys()] },
       pacing: this.policy.pacing(),
     };
     return { ok: true, data, hint: null, policy_reminder: this.memory.buildPolicyReminder(this.policy, null) };
   }
 
-  private async toolRequestPreset(name: string, reminder: () => Record<string, unknown>): Promise<ToolPayload> {
+  private async toolRequestPreset(name: string, reminder: () => Record<string, unknown>, clientId: string | null): Promise<ToolPayload> {
     if (!name) return this.fail('INTERNAL', 'Укажи имя пресета (name).', reminder());
     if (!this.policy.hasPreset(name)) {
       return this.fail('INTERNAL', `Неизвестный пресет "${name}". Доступные: ${this.policy.presetNames().join(', ')}.`, reminder());
@@ -380,7 +477,7 @@ export class BridgeCore {
       return { ok: true, data: { preset: name, switched: false }, hint: null, policy_reminder: reminder() };
     }
     // Агент не может сам себе расширить права: переключение — через баннер подтверждения.
-    const decision = await this.askConsent('custom', `Агент просит переключить пресет политики: "${this.policy.activePreset()}" → "${name}"`, '', 0);
+    const decision = await this.askConsent('custom', `Агент просит переключить пресет политики: "${this.policy.activePreset()}" → "${name}"`, '', 0, clientId!);
     if (decision === 'deny') {
       this.policy.audit({ kind: 'deny', decision: 'preset_switch_denied', preset: name });
       return this.fail('ACTION_DENIED', `Пользователь не подтвердил переключение на пресет "${name}". Продолжай в рамках текущего пресета.`, reminder());
@@ -396,17 +493,18 @@ export class BridgeCore {
    * >1 кандидата — молча не выбираем (AMBIGUOUS с кандидатами, как click-by-text).
    * Gated: новый ref классифицируется заново; категория изменилась — отказ.
    */
-  private async retryAfterStaleRef(name: string, args: Record<string, unknown>, tabId: number | null, err: unknown): Promise<unknown> {
+  private async retryAfterStaleRef(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, err: unknown): Promise<unknown> {
     const be = err as Partial<BridgeError>;
-    if (be.code !== 'STALE_REF' || !ACT_TOOLS.has(name) || tabId === null || !args['ref']) throw err;
-    const meta = this.snapshots.get(tabId)?.refs.get(String(args['ref']));
+    if (be.code !== 'STALE_REF' || !ACT_TOOLS.has(name) || tabId === null || clientId === null || !args['ref']) throw err;
+    const key = this.tabKey(clientId, tabId);
+    const meta = this.snapshots.get(key)?.refs.get(String(args['ref']));
     if (!meta || !meta.text) throw err;
     const origCategory = classifyElement(meta);
 
-    const res = await this.transport.request('snapshot', { tabId }) as Record<string, unknown> & { snapshot?: string; url?: string };
+    const res = await this.transport.request(clientId, 'snapshot', { tabId }) as Record<string, unknown> & { snapshot?: string; url?: string };
     if (typeof res.snapshot !== 'string') throw err;
     const refs = parseSnapshotRefs(res.snapshot);
-    this.snapshots.set(tabId, {
+    this.snapshots.set(key, {
       text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|',
     });
 
@@ -425,8 +523,8 @@ export class BridgeCore {
       throw new BridgeError('ACTION_DENIED',
         `авто-retry: элемент "${meta.text}" перенайден (${newMeta.ref}), но его gated-категория изменилась — действие НЕ выполнено. Сделай page.snapshot и повтори осознанно.`);
     }
-    this.log(`core: авто-retry ${name} ${String(args['ref'])} → ${newMeta.ref}`);
-    const data = await this.execute(name, { ...args, ref: newMeta.ref }, tabId);
+    this.log(`core: авто-retry ${name} ${String(args['ref'])} → ${newMeta.ref} (${clientId})`);
+    const data = await this.execute(name, { ...args, ref: newMeta.ref }, tabId, clientId);
     if (data && typeof data === 'object') {
       (data as Record<string, unknown>)['retried'] = true;
       (data as Record<string, unknown>)['new_ref'] = newMeta.ref;
@@ -434,21 +532,25 @@ export class BridgeCore {
     return data;
   }
 
-  private async execute(name: string, args: Record<string, unknown>, tabId: number | null): Promise<unknown> {
+  private async execute(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null): Promise<unknown> {
     switch (name) {
       case 'tab.list': {
-        const res = await this.transport.request('tab.list', {}) as { tabs?: { tabId: number; url: string; title: string; active?: boolean }[] };
-        const all = res.tabs ?? [];
-        // N15/default-deny: агенту видны только вкладки с грантованных доменов;
-        // чужие вкладки не раскрываем (ни URL, ни title) — только их количество.
-        const visible: typeof all = [];
+        // Опрос всех active-клиентов (D5): вкладки объединяются, каждая
+        // тегируется browser. hidden_tabs — по политике браузера-владельца.
+        const visible: Record<string, unknown>[] = [];
         let hidden = 0;
-        for (const t of all) {
-          if (this.policy.check(t.url, 'read', null).decision === 'allow') {
-            this.tabs.set(t.tabId, { url: t.url, title: t.title });
-            visible.push(t);
-          } else {
-            hidden++;
+        for (const c of this.transport.listClients()) {
+          if (c.state !== 'active') continue;
+          const res = await this.transport.request(c.id, 'tab.list', {}) as { tabs?: { tabId: number; url: string; title: string; active?: boolean }[] };
+          for (const t of res.tabs ?? []) {
+            // N15/default-deny: агенту видны только вкладки с грантованных доменов;
+            // чужие вкладки не раскрываем (ни URL, ни title) — только их количество.
+            if (this.policy.check(t.url, 'read', null, c.id).decision === 'allow') {
+              this.tabs.set(this.tabKey(c.id, t.tabId), { tabId: t.tabId, url: t.url, title: t.title, clientId: c.id });
+              visible.push({ ...t, browser: c.id });
+            } else {
+              hidden++;
+            }
           }
         }
         return { tabs: visible, hidden_tabs: hidden };
@@ -456,71 +558,76 @@ export class BridgeCore {
       case 'tab.open': {
         // С tabId — навигация существующей вкладки (без новой); без — tabs.create.
         if (tabId !== null) {
-          const res = await this.transport.request('navigate', { tabId, url: args['url'] }) as { url?: string; title?: string };
-          if (res.url) this.tabs.set(tabId, { url: res.url, title: res.title ?? '' });
+          const res = await this.transport.request(clientId!, 'navigate', { tabId, url: args['url'] }) as { url?: string; title?: string };
+          if (res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
           return { tabId, ...res };
         }
-        const res = await this.transport.request('tab.open', { url: args['url'], active: args['active'] }) as { tabId: number; url: string; title: string };
-        this.tabs.set(res.tabId, { url: res.url, title: res.title });
+        const res = await this.transport.request(clientId!, 'tab.open', { url: args['url'], active: args['active'] }) as { tabId: number; url: string; title: string };
+        this.tabs.set(this.tabKey(clientId!, res.tabId), { tabId: res.tabId, url: res.url, title: res.title, clientId: clientId! });
         return res;
       }
       case 'tab.close': {
-        const res = await this.transport.request('tab.close', { tabId });
-        if (tabId !== null) { this.tabs.delete(tabId); this.snapshots.delete(tabId); }
+        const res = await this.transport.request(clientId!, 'tab.close', { tabId });
+        if (tabId !== null) {
+          const key = this.tabKey(clientId!, tabId);
+          this.tabs.delete(key);
+          this.snapshots.delete(key);
+        }
         return res;
       }
       case 'page.snapshot': {
-        const res = await this.transport.request('snapshot', { tabId, scope: args['scope'], selector: args['selector'] }) as Record<string, unknown> & { snapshot?: string; url?: string; title?: string };
+        const res = await this.transport.request(clientId!, 'snapshot', { tabId, scope: args['scope'], selector: args['selector'] }) as Record<string, unknown> & { snapshot?: string; url?: string; title?: string };
         if (tabId !== null && typeof res.snapshot === 'string') {
+          const key = this.tabKey(clientId!, tabId);
           const scopeKey = `${String(args['scope'] ?? '')}|${String(args['selector'] ?? '')}`;
           const domHash = shortHash(res.snapshot);
-          const cached = this.snapshots.get(tabId);
+          const cached = this.snapshots.get(key);
           // П0-3: страница не изменилась — компактный ответ вместо полного текста.
           // Кэш НЕ затираем: refs из него остаются валидными для act.*.
           if (cached && cached.dom_hash === domHash && cached.scopeKey === scopeKey) {
             return { unchanged: true, dom_hash: domHash, url: res.url ?? cached.url };
           }
-          this.snapshots.set(tabId, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey });
+          this.snapshots.set(key, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey });
         }
-        if (tabId !== null && res.url) this.tabs.set(tabId, { url: res.url, title: res.title ?? '' });
+        if (tabId !== null && res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
         return res;
       }
       case 'page.extract':
-        return this.pageCommand('extractMarkdown', tabId, { selector: args['selector'], images: args['images'], max_chars: args['max_chars'] });
+        return this.pageCommand('extractMarkdown', tabId, clientId!, { selector: args['selector'], images: args['images'], max_chars: args['max_chars'] });
       case 'page.find':
-        return this.pageCommand('findText', tabId, { query: args['query'], role: args['role'] });
+        return this.pageCommand('findText', tabId, clientId!, { query: args['query'], role: args['role'] });
       case 'page.screenshot':
-        return this.pageCommand('screenshot', tabId, {});
+        return this.pageCommand('screenshot', tabId, clientId!, {});
       case 'net.list':
-        return this.transport.request('netList', { tabId });
+        return this.transport.request(clientId!, 'netList', { tabId });
       case 'act.click': {
         if (!args['ref'] && !args['text']) throw new Error('act.click: нужен ref или text');
-        return this.pageCommand('click', tabId, { ref: args['ref'], text: args['text'] });
+        return this.pageCommand('click', tabId, clientId!, { ref: args['ref'], text: args['text'] });
       }
       case 'act.type':
-        return this.pageCommand('type', tabId, { ref: args['ref'], text: args['text'], clear: args['clear'] });
+        return this.pageCommand('type', tabId, clientId!, { ref: args['ref'], text: args['text'], clear: args['clear'] });
       case 'act.select':
-        return this.pageCommand('select', tabId, { ref: args['ref'], value: args['value'] });
+        return this.pageCommand('select', tabId, clientId!, { ref: args['ref'], value: args['value'] });
       case 'act.scroll':
-        if (args['ref']) return this.pageCommand('scrollIntoView', tabId, { ref: args['ref'] });
-        return this.pageCommand('scroll', tabId, { dy: args['dy'] ?? 600 });
+        if (args['ref']) return this.pageCommand('scrollIntoView', tabId, clientId!, { ref: args['ref'] });
+        return this.pageCommand('scroll', tabId, clientId!, { dy: args['dy'] ?? 600 });
       case 'act.key':
-        return this.pageCommand('pressKey', tabId, { key: args['key'] });
+        return this.pageCommand('pressKey', tabId, clientId!, { key: args['key'] });
       case 'act.batch':
-        return this.executeBatch(tabId, args['steps']);
+        return this.executeBatch(tabId, clientId!, args['steps']);
       case 'page.wait_for': {
         // П1-1: таймаут — не ошибка gating, а {condition_met:false}. Таймаут
         // транспорта ставим больше контентного, чтобы дождаться честный ответ.
         const timeoutMs = Math.min(Math.max(Number(args['timeout_ms']) || 10000, 500), 30000);
-        return this.pageCommand('waitFor', tabId, {
+        return this.pageCommand('waitFor', tabId, clientId!, {
           condition: args['condition'], state: args['state'], timeout_ms: timeoutMs,
         }, timeoutMs + 15000);
       }
       case 'page.scan':
         // П2-3: контентный дедлайн 45 с — транспортный таймаут больше.
-        return this.pageCommand('scan', tabId, { max_screens: args['max_screens'] }, 55000);
+        return this.pageCommand('scan', tabId, clientId!, { max_screens: args['max_screens'] }, 55000);
       case 'file.download':
-        return this.executeDownload(tabId, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined);
+        return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined);
       default:
         throw new BridgeError('INTERNAL', `неизвестный инструмент: ${name}`);
     }
@@ -535,7 +642,7 @@ export class BridgeCore {
    * Падение шага → BATCH_STEP_FAILED с числом завершённых (partial execution
    * не скрываем).
    */
-  private async executeBatch(tabId: number | null, stepsArg: unknown): Promise<unknown> {
+  private async executeBatch(tabId: number | null, clientId: string, stepsArg: unknown): Promise<unknown> {
     const steps = Array.isArray(stepsArg) ? (stepsArg as Record<string, unknown>[]) : [];
     const ALLOWED = new Set(['act.click', 'act.type', 'act.select', 'act.key']);
     const stepNames: string[] = [];
@@ -554,10 +661,10 @@ export class BridgeCore {
       const s = steps[i] ?? {};
       await this.pacing.beforeAction({ min_ms: 300, max_ms: 800 });
       try {
-        last = await this.execute(stepNames[i], { ...s, tabId }, tabId);
+        last = await this.execute(stepNames[i], { ...s, tabId }, tabId, clientId);
       } catch (err) {
         try {
-          last = await this.retryAfterStaleRef(stepNames[i], { ...s, tabId }, tabId, err);
+          last = await this.retryAfterStaleRef(stepNames[i], { ...s, tabId }, tabId, clientId, err);
         } catch (err2) {
           const be2 = err2 as Partial<BridgeError>;
           throw new BridgeError('BATCH_STEP_FAILED',
@@ -572,18 +679,20 @@ export class BridgeCore {
     return out;
   }
 
-  private async pageCommand(method: string, tabId: number | null, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
-    const res = await this.transport.request(method, { tabId, ...params }, timeoutMs) as Record<string, unknown> & { url?: string; title?: string };
+  private async pageCommand(method: string, tabId: number | null, clientId: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
+    const res = await this.transport.request(clientId, method, { tabId, ...params }, timeoutMs) as Record<string, unknown> & { url?: string; title?: string };
     if (tabId !== null && typeof res?.url === 'string') {
-      this.tabs.set(tabId, { url: res.url, title: typeof res.title === 'string' ? res.title : '' });
+      this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId });
     }
     return res;
   }
 
-  private async executeDownload(tabId: number | null, url: string, name?: string): Promise<unknown> {
-    const transferPromise = this.downloads.expectTransfer(url);
+  private async executeDownload(tabId: number | null, clientId: string, url: string, name?: string): Promise<unknown> {
+    // D7: ожидание привязано к клиенту — параллельные трансферы разных
+    // браузеров (или одного) не пересекаются, ack уходит владельцу.
+    const transferPromise = this.downloads.expectTransfer(url, clientId);
     transferPromise.catch(() => {}); // страховка от unhandled rejection
-    const resPromise = this.transport.request('fetchFile', { tabId, url, name }, 120_000);
+    const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
     const [completed, res] = await Promise.all([transferPromise, resPromise]);
     return { ...(res as Record<string, unknown>), file: completed.name, size: completed.size, sha256: completed.sha256 };
   }
@@ -595,25 +704,26 @@ export function buildMcpServer(core: BridgeCore): McpServer {
   const server = new McpServer({ name: 'bridge-server', version: '0.1.0' });
   const tabId = z.number().describe('ID вкладки из tab.list');
   const ref = z.string().describe('ref-метка элемента из page.snapshot (e1, e2, …)');
+  const browser = z.string().optional().describe('ID браузера из tab.list/policy.status; не нужен, если онлайн один браузер');
 
   const defs: [string, string, Record<string, z.ZodTypeAny>][] = [
-    ['tab.list', 'Список вкладок браузера', {}],
-    ['tab.open', 'Открыть URL (без tabId — новая вкладка; с tabId — навигация существующей)', { url: z.string(), tabId: tabId.optional(), active: z.boolean().optional() }],
-    ['tab.close', 'Закрыть вкладку', { tabId }],
-    ['page.snapshot', 'Семантический снапшот страницы (интерактивные элементы с ref-метками). Если страница не изменилась с прошлого снапшота — ответ {unchanged:true}, refs из прошлого снапшота остаются валидными', { tabId, scope: z.enum(['viewport', 'main', 'full']).optional(), selector: z.string().optional() }],
-    ['page.extract', 'Чистый markdown содержимого страницы (div-суп — density-режим). images: "inline" (по умолчанию) | "manifest" | "off"; max_chars — лимит по границе абзаца (15000)', { tabId, selector: z.string().optional(), images: z.enum(['inline', 'manifest', 'off']).optional(), max_chars: z.number().optional() }],
-    ['page.find', 'Поиск по тексту/роли без полного снапшота (≤20 совпадений)', { tabId, query: z.string(), role: z.string().optional() }],
-    ['page.wait_for', 'Событийное ожидание условия (без polling снапшотами): текст/ref/url появился или исчез. Таймаут — не ошибка: {condition_met:false}. Один активный wait на вкладку', { tabId, condition: z.object({ text: z.string().optional(), ref: z.string().optional(), url_contains: z.string().optional() }).describe('условие: text ИЛИ ref ИЛИ url_contains'), state: z.enum(['appear', 'disappear', 'stale']).optional(), timeout_ms: z.number().max(30000).optional() }],
-    ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId }],
-    ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId }],
-    ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional() }],
-    ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional() }],
-    ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional() }],
-    ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string() }],
-    ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional() }],
-    ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string() }],
-    ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10) }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию', { tabId, url: z.string(), name: z.string().optional() }],
+    ['tab.list', 'Список вкладок браузера', { browser }],
+    ['tab.open', 'Открыть URL (без tabId — новая вкладка; с tabId — навигация существующей)', { url: z.string(), tabId: tabId.optional(), active: z.boolean().optional(), browser }],
+    ['tab.close', 'Закрыть вкладку', { tabId, browser }],
+    ['page.snapshot', 'Семантический снапшот страницы (интерактивные элементы с ref-метками). Если страница не изменилась с прошлого снапшота — ответ {unchanged:true}, refs из прошлого снапшота остаются валидными', { tabId, scope: z.enum(['viewport', 'main', 'full']).optional(), selector: z.string().optional(), browser }],
+    ['page.extract', 'Чистый markdown содержимого страницы (div-суп — density-режим). images: "inline" (по умолчанию) | "manifest" | "off"; max_chars — лимит по границе абзаца (15000)', { tabId, selector: z.string().optional(), images: z.enum(['inline', 'manifest', 'off']).optional(), max_chars: z.number().optional(), browser }],
+    ['page.find', 'Поиск по тексту/роли без полного снапшота (≤20 совпадений)', { tabId, query: z.string(), role: z.string().optional(), browser }],
+    ['page.wait_for', 'Событийное ожидание условия (без polling снапшотами): текст/ref/url появился или исчез. Таймаут — не ошибка: {condition_met:false}. Один активный wait на вкладку', { tabId, condition: z.object({ text: z.string().optional(), ref: z.string().optional(), url_contains: z.string().optional() }).describe('условие: text ИЛИ ref ИЛИ url_contains'), state: z.enum(['appear', 'disappear', 'stale']).optional(), timeout_ms: z.number().max(30000).optional(), browser }],
+    ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
+    ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
+    ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
+    ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
+    ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional(), browser }],
+    ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string(), browser }],
+    ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],
+    ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string(), browser }],
+    ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10), browser }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию', { tabId, url: z.string(), name: z.string().optional(), browser }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];

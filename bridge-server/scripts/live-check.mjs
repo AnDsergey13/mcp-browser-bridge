@@ -10,18 +10,22 @@ const log = (msg) => console.error(`[live-check] ${msg}`);
 const handle = await startBridge({ mcp: false });
 log('сервер поднят, жду active (подтверди сессию в popup расширения)…');
 
+// Фаза 9: состояния per-client (мультиклиентность) — ждём ПЕРВЫЙ active клиент.
+const anyActive = () =>
+  handle.transport.listClients().some((c) => c.state === 'active');
+
 await new Promise((resolve) => {
-  if (handle.transport.state === 'active') return resolve();
+  if (anyActive()) return resolve();
   const prev = handle.transport.onStateChange;
-  handle.transport.onStateChange = (s) => {
-    if (prev) prev(s);
+  handle.transport.onStateChange = (clientId, s) => {
+    if (prev) prev(clientId, s);
     if (s === 'active') resolve();
   };
   setTimeout(resolve, 5 * 60 * 1000); // страховка — не висеть вечно
 });
 
-log(`состояние: ${handle.transport.state}`);
-if (handle.transport.state !== 'active') {
+log(`клиенты: ${JSON.stringify(handle.transport.listClients())}`);
+if (!anyActive()) {
   log('не дождался подтверждения за 5 минут');
   process.exit(1);
 }
