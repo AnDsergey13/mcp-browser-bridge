@@ -24,11 +24,19 @@ export interface ToolPayload {
 }
 
 // Запись реестра вкладок: tabId — число браузера (как в wire), clientId — владелец (D5).
-interface TabInfo { tabId: number; url: string; title: string; clientId: string }
+// ts — последнее обновление записи; нужен TTL-вытеснению (фаза 8).
+interface TabInfo { tabId: number; url: string; title: string; clientId: string; ts: number }
 // П0-3: scopeKey = scope|selector — без него снапшот scope:"full" после
 // scope:"viewport" при совпадающем dom_hash дал бы ложный unchanged.
-interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string }
+interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string; ts: number }
 interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash: string | null } }
+
+// Фаза 8 (REPO-ANALYSIS §4.5): события tab.closed от расширения в протоколе нет,
+// поэтому записи о вкладках, закрытых в браузере вручную, вытесняются двумя
+// механизмами: reconcile в tab.list (см. execute) + TTL-зачистка старых записей
+// (страховка на случай, если tab.list больше не зовут — напр. браузер офлайн).
+const REGISTRY_TTL_MS = 30 * 60_000;
+const SWEEP_INTERVAL_MS = 60_000;
 
 const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for']);
 // page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
@@ -58,6 +66,7 @@ export class BridgeCore {
   // П0-1: состояние версионирования policy_reminder.
   private reminderCounter = 0;
   private lastReminderHash: string | null = null;
+  private sweepTimer: NodeJS.Timeout;
 
   constructor(deps: {
     transport: Transport;
@@ -75,6 +84,23 @@ export class BridgeCore {
     this.downloads = deps.downloads;
     this.consentTimeoutMs = deps.consentTimeoutMs ?? 120_000;
     this.log = deps.log ?? (() => {});
+    // TTL-зачистка реестров (фаза 8). unref — таймер не держит процесс.
+    this.sweepTimer = setInterval(() => this.sweepExpired(), SWEEP_INTERVAL_MS);
+    this.sweepTimer.unref();
+  }
+
+  /**
+   * Вытеснение записей старше REGISTRY_TTL_MS из реестра вкладок и кэша
+   * снапшотов (вкладки, закрытые в браузере вручную/на офлайн-клиенте).
+   * Публичный метод: тесты вызывают его с «будущим» now, не дожидаясь TTL.
+   */
+  sweepExpired(now: number = Date.now()): void {
+    for (const [key, t] of this.tabs) if (now - t.ts > REGISTRY_TTL_MS) this.tabs.delete(key);
+    for (const [key, s] of this.snapshots) if (now - s.ts > REGISTRY_TTL_MS) this.snapshots.delete(key);
+  }
+
+  close(): void {
+    clearInterval(this.sweepTimer);
   }
 
   private tabKey(clientId: string, tabId: number): string {
@@ -505,7 +531,7 @@ export class BridgeCore {
     if (typeof res.snapshot !== 'string') throw err;
     const refs = parseSnapshotRefs(res.snapshot);
     this.snapshots.set(key, {
-      text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|',
+      text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|', ts: Date.now(),
     });
 
     let candidates = [...refs.values()].filter((m) => m.text === meta.text);
@@ -539,14 +565,25 @@ export class BridgeCore {
         // тегируется browser. hidden_tabs — по политике браузера-владельца.
         const visible: Record<string, unknown>[] = [];
         let hidden = 0;
+        const now = Date.now();
         for (const c of this.transport.listClients()) {
           if (c.state !== 'active') continue;
           const res = await this.transport.request(c.id, 'tab.list', {}) as { tabs?: { tabId: number; url: string; title: string; active?: boolean }[] };
+          // Reconcile (фаза 8): записи вкладок ЭТОГО браузера, которые он
+          // больше не сообщает (закрыты вручную), удаляем вместе с кэшем
+          // снапшотов — иначе реестры растут до перезапуска (§4.5).
+          const alive = new Set((res.tabs ?? []).map((t) => this.tabKey(c.id, t.tabId)));
+          for (const [key, info] of this.tabs) {
+            if (info.clientId === c.id && !alive.has(key)) {
+              this.tabs.delete(key);
+              this.snapshots.delete(key);
+            }
+          }
           for (const t of res.tabs ?? []) {
             // N15/default-deny: агенту видны только вкладки с грантованных доменов;
             // чужие вкладки не раскрываем (ни URL, ни title) — только их количество.
             if (this.policy.check(t.url, 'read', null, c.id).decision === 'allow') {
-              this.tabs.set(this.tabKey(c.id, t.tabId), { tabId: t.tabId, url: t.url, title: t.title, clientId: c.id });
+              this.tabs.set(this.tabKey(c.id, t.tabId), { tabId: t.tabId, url: t.url, title: t.title, clientId: c.id, ts: now });
               visible.push({ ...t, browser: c.id });
             } else {
               hidden++;
@@ -559,11 +596,11 @@ export class BridgeCore {
         // С tabId — навигация существующей вкладки (без новой); без — tabs.create.
         if (tabId !== null) {
           const res = await this.transport.request(clientId!, 'navigate', { tabId, url: args['url'] }) as { url?: string; title?: string };
-          if (res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
+          if (res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId!, ts: Date.now() });
           return { tabId, ...res };
         }
         const res = await this.transport.request(clientId!, 'tab.open', { url: args['url'], active: args['active'] }) as { tabId: number; url: string; title: string };
-        this.tabs.set(this.tabKey(clientId!, res.tabId), { tabId: res.tabId, url: res.url, title: res.title, clientId: clientId! });
+        this.tabs.set(this.tabKey(clientId!, res.tabId), { tabId: res.tabId, url: res.url, title: res.title, clientId: clientId!, ts: Date.now() });
         return res;
       }
       case 'tab.close': {
@@ -585,11 +622,12 @@ export class BridgeCore {
           // П0-3: страница не изменилась — компактный ответ вместо полного текста.
           // Кэш НЕ затираем: refs из него остаются валидными для act.*.
           if (cached && cached.dom_hash === domHash && cached.scopeKey === scopeKey) {
+            cached.ts = Date.now(); // живое использование — TTL-зачистка не трогает
             return { unchanged: true, dom_hash: domHash, url: res.url ?? cached.url };
           }
-          this.snapshots.set(key, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey });
+          this.snapshots.set(key, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey, ts: Date.now() });
         }
-        if (tabId !== null && res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
+        if (tabId !== null && res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId!, ts: Date.now() });
         return res;
       }
       case 'page.extract':
@@ -682,7 +720,7 @@ export class BridgeCore {
   private async pageCommand(method: string, tabId: number | null, clientId: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
     const res = await this.transport.request(clientId, method, { tabId, ...params }, timeoutMs) as Record<string, unknown> & { url?: string; title?: string };
     if (tabId !== null && typeof res?.url === 'string') {
-      this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId });
+      this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId, ts: Date.now() });
     }
     return res;
   }

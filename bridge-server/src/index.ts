@@ -161,6 +161,7 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
     port, secret, core, transport, policy,
     close: async () => {
       stopRepl?.();
+      core.close();
       policy.stopWatch();
       await transport.close();
     },
