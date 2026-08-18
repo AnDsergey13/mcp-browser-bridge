@@ -219,6 +219,16 @@ evt `file.abort {transferId, reason}` и res ошибкой `FETCH_FAILED`.
 Сервер пишет в `/workspace/downloads/<uniquified name>` и строку в
 `downloads/manifest.jsonl` `{ts,url,name,size,sha256,status}`.
 
+MCP-прогресс (П.5): на каждый принятый чанк сервер (поверх релея, без влияния
+на ack/backpressure) шлёт MCP-клиенту `notifications/progress`
+`{progressToken, progress: байты, total: size?}` — только если вызов
+`tools/call file.download` нёс `_meta.progressToken`. Троттлинг: первое
+уведомление сразу, дальше не чаще 1/с. SDK-клиенты с
+`resetTimeoutOnProgress: true` сбрасывают по этим уведомлениям таймаут запроса
+и не видят `-32001` на больших файлах; клиенты без этого флага (или без
+progressToken) работают ровно как раньше — правило «при -32001 не ретраить,
+проверить manifest.jsonl» остаётся в силе.
+
 ## 9. Семантический снапшот (формат `snapshot`)
 
 Текст, человеко-ориентированный (агент видит «что видит человек», не HTML):

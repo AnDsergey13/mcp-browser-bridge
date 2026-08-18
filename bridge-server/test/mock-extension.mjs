@@ -261,8 +261,10 @@ export class MockExtension {
     const sha256 = crypto.createHash('sha256').update(content).digest('hex');
     this.send({ type: 'evt', event: 'file.start', data: { transferId, name: p.name ?? file.name, size: content.length, mime: 'application/octet-stream' } });
     const chunkSize = file.chunkSize ?? 400;
+    const chunkDelayMs = file.chunkDelayMs ?? 0; // медленный трансфер (тесты progress)
     let seq = 0;
     for (let off = 0; off < content.length; off += chunkSize, seq++) {
+      if (chunkDelayMs) await new Promise((r) => setTimeout(r, chunkDelayMs));
       this.send({ type: 'evt', event: 'file.chunk', data: { transferId, seq, data_base64: content.subarray(off, off + chunkSize).toString('base64') } });
       // backpressure: ждём ack перед следующим чанком
       await new Promise((resolve, reject) => {

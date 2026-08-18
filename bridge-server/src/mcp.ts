@@ -13,7 +13,7 @@ import { classifyUrl, classifyElement, parseSnapshotRefs, type ElementMeta } fro
 import { Pacing, PacingLimitError } from './pacing.ts';
 import { capResponse } from './compress.ts';
 import { MemoryStore } from './memory.ts';
-import { DownloadRelay } from './downloads.ts';
+import { DownloadRelay, type TransferProgress } from './downloads.ts';
 
 export interface ToolPayload {
   ok: boolean;
@@ -247,8 +247,8 @@ export class BridgeCore {
     return { preset: full['preset'], domain: domain?.['key'] ?? null, reminder_version: hash };
   }
 
-  /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. */
-  async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean }): Promise<ToolPayload> {
+  /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. opts.onProgress — прогресс file.download (П.5: MCP notifications/progress). */
+  async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean; onProgress?: TransferProgress }): Promise<ToolPayload> {
     const tabId = typeof args['tabId'] === 'number' ? (args['tabId'] as number) : null;
     const browserArg = typeof args['browser'] === 'string' && args['browser'] !== '' ? args['browser'] as string : undefined;
     // Целевой клиент после резолва (шаг 1) — нужен finish для маскировки паролей в журнале.
@@ -357,7 +357,7 @@ export class BridgeCore {
       // 9. Исполнение (с одноразовым авто-retry после STALE_REF — П1-3).
       let data: unknown;
       try {
-        data = await this.execute(name, args, tabId, clientId);
+        data = await this.execute(name, args, tabId, clientId, opts?.onProgress);
       } catch (err) {
         data = await this.retryAfterStaleRef(name, args, tabId, clientId, err);
       }
@@ -560,7 +560,7 @@ export class BridgeCore {
     return data;
   }
 
-  private async execute(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null): Promise<unknown> {
+  private async execute(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, onProgress?: TransferProgress): Promise<unknown> {
     switch (name) {
       case 'tab.list': {
         // Опрос всех active-клиентов (D5): вкладки объединяются, каждая
@@ -675,7 +675,7 @@ export class BridgeCore {
         // П2-3: контентный дедлайн 45 с — транспортный таймаут больше.
         return this.pageCommand('scan', tabId, clientId!, { max_screens: args['max_screens'] }, 55000);
       case 'file.download':
-        return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined);
+        return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined, onProgress);
       default:
         throw new BridgeError('INTERNAL', `неизвестный инструмент: ${name}`);
     }
@@ -735,10 +735,11 @@ export class BridgeCore {
     return res;
   }
 
-  private async executeDownload(tabId: number | null, clientId: string, url: string, name?: string): Promise<unknown> {
+  private async executeDownload(tabId: number | null, clientId: string, url: string, name?: string, onProgress?: TransferProgress): Promise<unknown> {
     // D7: ожидание привязано к клиенту — параллельные трансферы разных
     // браузеров (или одного) не пересекаются, ack уходит владельцу.
-    const transferPromise = this.downloads.expectTransfer(url, clientId);
+    // onProgress (П.5) — только наблюдатель: ack/backpressure не зависят от него.
+    const transferPromise = this.downloads.expectTransfer(url, clientId, onProgress);
     transferPromise.catch(() => {}); // страховка от unhandled rejection
     const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
     const [completed, res] = await Promise.all([transferPromise, resPromise]);
@@ -748,7 +749,34 @@ export class BridgeCore {
 
 // ---- регистрация в MCP SDK ----
 
-export function buildMcpServer(core: BridgeCore): McpServer {
+/**
+ * П.5: троттлим прогресс-колбэк релея в MCP notifications/progress. Первое
+ * событие шлём сразу (клиентский таймаут сбрасывается как можно раньше),
+ * дальше — не чаще minIntervalMs. Ошибки отправки гасим: прогресс — best
+ * effort, трансфер от него зависеть не должен. Экспорт — для юнит-теста.
+ */
+export function makeProgressReporter(
+  send: (notification: {
+    method: 'notifications/progress';
+    params: { progressToken: string | number; progress: number; total?: number };
+  }) => Promise<unknown>,
+  progressToken: string | number,
+  minIntervalMs = 1000,
+  now: () => number = Date.now,
+): TransferProgress {
+  let lastSent = -Infinity;
+  return (progress, total) => {
+    const t = now();
+    if (t - lastSent < minIntervalMs) return;
+    lastSent = t;
+    void send({
+      method: 'notifications/progress',
+      params: { progressToken, progress, ...(total !== null ? { total } : {}) },
+    }).catch(() => {});
+  };
+}
+
+export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?: number }): McpServer {
   const server = new McpServer({ name: 'bridge-server', version: '0.1.0' });
   const tabId = z.number().describe('ID вкладки из tab.list');
   const ref = z.string().describe('ref-метка элемента из page.snapshot (e1, e2, …)');
@@ -773,14 +801,27 @@ export function buildMcpServer(core: BridgeCore): McpServer {
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],
     ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string(), browser }],
     ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10), browser }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию', { tabId, url: z.string(), name: z.string().optional(), browser }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];
 
   for (const [name, description, shape] of defs) {
-    server.registerTool(name, { description, inputSchema: shape }, async (args) => {
-      const payload = await core.callTool(name, args as Record<string, unknown>);
+    server.registerTool(name, { description, inputSchema: shape }, async (args, extra) => {
+      // П.5: file.download при наличии progressToken (клиент попросил прогресс
+      // через _meta) шлёт notifications/progress — SDK-клиенты с
+      // resetTimeoutOnProgress сбрасывают по ним таймаут запроса. Без токена
+      // поведение идентично прежнему (спека: нотификации без токена не шлём).
+      let onProgress: TransferProgress | undefined;
+      const progressToken = extra._meta?.progressToken;
+      if (name === 'file.download' && progressToken !== undefined) {
+        onProgress = makeProgressReporter(
+          (n) => extra.sendNotification(n),
+          progressToken,
+          opts?.progressMinIntervalMs ?? 1000,
+        );
+      }
+      const payload = await core.callTool(name, args as Record<string, unknown>, { onProgress });
       // П0-2: компактный JSON без indent — экономия токенов; формат снапшота
       // внутри data остаётся построчным текстом, читаемость не страдает.
       return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
