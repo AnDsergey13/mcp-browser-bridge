@@ -656,18 +656,29 @@ popup, кнопка «сохранить session-грант в пресет», �
 
 ### Очередь (утверждено начинать с п.1–5: высокая/средняя важность, без рисковых операций)
 
-1. **Фаза 8: prompt-injection тест** (+ нагрузка 50 страниц, приёмочный
-   чеклист из 10 сценариев). Горит: ядро безопасности (N15) не верифицировано
-   end-to-end, а дальше по плану — мощные инструменты лаборатории. Заодно:
-   TTL для кэшей вкладок/снапшотов (REPO-ANALYSIS §4.5 — вскроется нагрузкой).
-2. **`act.hover`** (lab L1.3): экспонировать готовое; smoke 19→20 +
-   PROTOCOL.md + AGENTS.md одним коммитом.
-3. **lab-полигон** (lab L.6): страница на `localhost:8080` (пресет
-   local-services уже подходит); дешевеет приёмка всего ниже.
-4. **`page.console`** (lab L1.4): пассивный кольцевой буфер, ~0.5 дня.
-5. **MCP progress-нотификации для `file.download`**: закрывают класс
-   `-32001`; предварительно сверить поддержку `notifications/progress` в
-   `@modelcontextprotocol/sdk ^1.30`; per-chunk ack релея НЕ трогать.
+Статус на 2026-08-18 (ветка 0.1.5): п.1–5 выполнены и закоммичены; тесты
+68/68 сервер + 36/36 extension, поверхность — 21 инструмент.
+
+1. ✔ **Фаза 8: prompt-injection тест** (коммит 6da232c): CI-инварианты
+   (untrusted-маркировка, DOMAIN_NOT_ALLOWED для инъецированных URL,
+   preset_switch_denied при таймауте consent, классификатор не понижается
+   от текста страницы) + нагрузочный тест 50 вкладок + вытеснение реестров
+   (reconcile в tab.list + TTL 30 мин — §4.5 REPO-ANALYSIS закрыт).
+   Живой приёмочный чеклист (10 сценариев) и red-team прогон — на хосте
+   (lab-полигон + `scripts/redteam-check.py`, lab L.8).
+2. ✔ **`act.hover`** (коммит 423019f): smoke 19→21 вместе с п.4,
+   PROTOCOL.md + AGENTS.md + README.md в том же коммите.
+3. ✔ **lab-полигон** (коммит bae2b38): `lab/` (формы, shadow DOM, SPA,
+   лента, fetch/XHR, media, WS) + режим инъекций `?seed=N` (13 канареечных
+   payload'ов по каналам) + `bridge-server/scripts/redteam-check.py`.
+4. ✔ **`page.console`** (коммит 423019f): MAIN-world хук
+   (web_accessible_resources), кольцевой буфер 100, честный маркер
+   `console_unavailable` при CSP-запрете.
+5. ✔ **MCP progress-нотификации для `file.download`** (коммит de6e6ba):
+   спек-совместимые `notifications/progress` при progressToken, троттлинг
+   1/с, ack-релей не тронут. Остаток на живую проверку: шлёт ли Kimi CLI
+   `_meta.progressToken`/`resetTimeoutOnProgress` — если нет, класс -32001
+   закрывается настройкой клиента или файл-REPL путём.
 
 ### Далее — отдельным решением пользователя (рисковые, но ценные; детали в lab-expansion-plan.md)
 
