@@ -1,16 +1,22 @@
 # MCP Browser Bridge
 
-Мост между AI-агентом (Kimi Code CLI в контейнере ExitBox) и реальным
-браузером пользователя (Firefox / LibreWolf). Агент читает страницы и
-действует в них через MCP-инструменты — строго в рамках политики, которую
-контролирует человек.
+Мост между AI-агентом (Kimi Code CLI в контейнере ExitBox) и реальными
+браузерами пользователя (Firefox / LibreWolf и Chromium — одновременно,
+фаза 9). Агент читает страницы и действует в них через MCP-инструменты —
+строго в рамках политики, которую контролирует человек.
 
 ## Коротко для профессионала
 
 - **Три компонента**: `bridge-server/` (Node ≥22, TypeScript через `tsx`,
   MCP-сервер по stdio + WS-эндпоинт + policy engine), `extension/`
-  (Firefox MV2, persistent background), `policy.yaml` (единственный
-  источник правил безопасности, hot-reload).
+  (общая кодовая база, две сборки: Firefox MV2 persistent background и
+  Chromium MV3 service worker — `extension/build-chromium.sh` → `dist/chromium/`),
+  `policy.yaml` (единственный источник правил безопасности, hot-reload).
+- **Мульти-браузер**: один сервер обслуживает несколько браузеров сразу;
+  доступы per-browser (грант Firefox не действует в Chromium — см. PROTOCOL.md
+  §11); неподключённый браузер «молчит», остальные работают.
+- **Мульти-агент**: расширение держит несколько серверных подключений;
+  вкладка — единица изоляции (владелец-агент, `TAB_NOT_OWNED` чужим).
 - **Транспорт**: rootless podman не маршрутизирует сеть контейнера до
   хоста, поэтому сервер слушает unix-сокет `.bridge/bridge.sock` в общей
   bind-mount папке; на хосте `socat` релеит его в `127.0.0.1:18777`.
@@ -32,7 +38,8 @@
 | контейнер ExitBox | хост (папка проекта) | `exitbox run kimi --no-resume -- --yolo` |
 | bridge-server | контейнер (`/workspace`) | `cd bridge-server && npm install && npm start` |
 | socat-релей | хост (Linux, папка проекта) | `socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock` |
-| расширение | хост, Firefox / LibreWolf | `about:debugging` → Load Temporary Add-on → `extension/manifest.json` |
+| расширение (Firefox / LibreWolf) | хост | `about:debugging` → Load Temporary Add-on → `extension/manifest.json` |
+| расширение (Chromium) | хост | `bash extension/build-chromium.sh` → `chrome://extensions` → Developer mode → Load unpacked → `dist/chromium/` |
 | Kimi Code CLI | контейнер | подхватывает сервер как MCP из `.kimi-code/mcp.json` автоматически |
 
 ## Быстрый старт (пошагово)
@@ -65,15 +72,20 @@ socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/b
 
 Проверка: `curl 127.0.0.1:18777` → `426 Upgrade Required` — значит живо.
 
-**3. Хост, браузер** — расширение:
+**3. Хост, браузер** — расширение (для каждого браузера своё):
 
-1. `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** →
-   `extension/manifest.json`. (Временное: слетает при перезапуске
-   браузера — загружай заново.)
-2. Popup расширения → **Настройки**: URL `ws://127.0.0.1:18777`, секрет из
-   `.bridge/secret` → Сохранить.
-3. Там же — **«Выдать доступ к сайтам»** (`<all_urls>`, один раз; реальный
-   доступ всё равно режет `policy.yaml`).
+- **Firefox / LibreWolf**: `about:debugging#/runtime/this-firefox` →
+  **Load Temporary Add-on** → `extension/manifest.json`. (Временное:
+  слетает при перезапуске браузера — загружай заново.)
+- **Chromium**: `bash extension/build-chromium.sh` (соберёт `dist/chromium/`)
+  → `chrome://extensions` → Developer mode → **Load unpacked** →
+  `dist/chromium/`. Постоянная установка, флаги не нужны (MV3).
+
+Дальше в popup каждого браузера: **Настройки** → добавить сервер (URL уже
+предзаполнен `ws://127.0.0.1:18777`, вставь секрет из `.bridge/secret`) →
+**«Выдать доступ к сайтам»** (`<all_urls>`, один раз; реальный доступ всё
+равно режет `policy.yaml`). Подтверждение сессии — per-browser: каждый
+браузер подтверждает своё подключение из своего popup.
 
 **4. Подтверждение сессии.** При первом подключении нового контейнера popup
 покажет «Новая сессия агента — разрешить?». Подтверждается **один раз на
@@ -85,15 +97,18 @@ socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/b
 
 ## Использование
 
-- **Агенту** доступны 16 MCP-инструментов: `policy.status`,
+- **Агенту** доступны 19 MCP-инструментов: `policy.status`,
   `policy.request_preset`, `tab.list` / `tab.open` / `tab.close`,
-  `page.snapshot` / `page.extract` / `page.find` / `page.screenshot`,
-  `act.click` / `act.type` / `act.select` / `act.scroll` / `act.key`,
-  `file.download`, `net.list`. Ответ каждого — `{ok, data|error_code,
-  hint, policy_reminder}`.
-- **Человеку** — popup расширения: переключение пресета, разовые гранты
-  доменам (read / interact / download), красная кнопка **ПАУЗА**, журнал
-  последних 20 действий, возобновление авто-пауз.
+  `page.snapshot` / `page.extract` / `page.find` / `page.screenshot` /
+  `page.wait_for` / `page.scan`, `act.click` / `act.type` / `act.select` /
+  `act.scroll` / `act.key` / `act.batch`, `file.download`, `net.list`
+  (в Chromium недоступен — нет webRequest в MV3 service worker).
+  У tab-инструментов опциональный параметр `browser` (`firefox`/`chromium`).
+  Ответ каждого — `{ok, data|error_code, hint, policy_reminder}`.
+- **Человеку** — popup расширения: список серверов-подключений (мульти-
+  агент), переключение пресета, разовые гранты доменам (read / interact /
+  download, per-browser), назначение вкладки агенту, красная кнопка
+  **ПАУЗА**, журнал последних 20 действий, возобновление авто-пауз.
 - **Правила** — только `policy.yaml`: пресеты доменов, capabilities,
   gated-категории, pacing. Hot-reload: сохранил файл — расширение и агент
   получили обновление.
@@ -104,7 +119,10 @@ socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/b
 
 ```
 bridge-server/   MCP-сервер + WS + policy engine (src/*.ts), тесты, скрипты
-extension/       расширение Firefox MV2 (background, content scripts, popup)
+extension/       расширение (общая кодовая база): Firefox MV2 грузится отсюда
+                 напрямую, Chromium MV3 — сборка build-chromium.sh → dist/
+extension/test/  unit-тесты расширения (node --test, без браузера)
+dist/chromium/   сборка для Chromium (генерируется, в git не идёт)
 policy.yaml      политика безопасности (правит только человек)
 memory/          заметки агента: global-notes.md (в git), domains/*.md (локально)
 downloads/       файлы, скачанные агентом через браузер
@@ -118,7 +136,8 @@ ENVIRONMENT.md   верификация среды (чеклист хоста)
 
 ```bash
 cd bridge-server
-npm test    # 18 тестов: policy engine, транспорт, MCP-слой, файл-REPL
+npm test                                   # 47 тестов: policy, транспорт, MCP, релей, мультиклиент
+node --test 'extension/test/**/*.test.mjs' # 31 тест расширения (шим, инжектор, owners, keepalive)
 ```
 
 Живая отладка из контейнера без MCP-клиента:
@@ -128,14 +147,14 @@ MCP-сервер — скрипты `hls-download.py` / `localize-page.py` ра�
 MCP-сессией; live-repl нужен, только когда MCP не поднят (сокет один,
 вместе они не запустятся).
 
-> **Reload расширения ≠ обновление content scripts**: после Reload в
-> `about:debugging` уже открытые вкладки выполняют старый код —
-> перезагрузи вкладку (F5).
+> **Reload расширения**: открытые вкладки грантованных доменов
+> переинжектируются автоматически при первом policy.update (П2-6); если
+> вкладка «не отвечает» (CONTENT_SCRIPT_ABSENT) — перезагрузи её (F5).
 
-## Ограничения MVP
+## Ограничения
 
-Firefox-семейство (порт на Chromium позже — браузерозависимая инжекция
-вынесена в `extension/src/injector.js`); временное расширение без
-постоянной установки; скриншот без даунскейла; один файловый трансфер за
-раз; только верхний фрейм (без iframe). Дальше по плану —
-`kimi-code-browser-bridge-plan.md`.
+Только верхний фрейм (без iframe). В Chromium не работает `net.list`
+(нет webRequest bindings в MV3 service worker — HLS-сниффинг делай из
+Firefox). Firefox-расширение — временное (слетаёт при перезапуске
+браузера; постоянная установка — `web-ext sign --channel unlisted`).
+Дальше по плану — `kimi-code-browser-bridge-plan.md`.

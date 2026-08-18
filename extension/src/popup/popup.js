@@ -5,6 +5,12 @@
  * popup.js — UI расширения. Состояние читает из storage.local (пишет background),
  * действия шлёт background'у сообщениями {kind:"popup", action, ...}.
  * permissions.request вызывается только здесь и только по жесту пользователя (N2).
+ *
+ * Мульти-подключения (D11): список серверов (storage "servers"), per-connection
+ * статус и approve/deny (storage "connState"), назначение текущей вкладки
+ * подключению-владельцу (storage "tabOwners" читаем напрямую, меняем через
+ * действия tab.assign/tab.unassign). Пресеты/гранты адресуются выбранному
+ * подключению (targetConn).
  */
 
 const $ = (id) => document.getElementById(id);
@@ -17,11 +23,9 @@ const STATUS_TEXT = {
 };
 
 let state = {
-  sessionStatus: "offline",
+  servers: [],
+  connState: {},
   lastError: "",
-  presets: [],
-  policyPreset: "",
-  policyVersion: 0,
   needHostPermission: false,
   paused: false,
   journal: [],
@@ -30,13 +34,12 @@ let state = {
   injectorRegistered: false,
   injectorPatterns: [],
   injectorTs: 0,
-  sessionGrants: [],
-  policyDomains: {},
-  serverUrl: "",
-  secret: "",
+  tabOwners: {},
 };
 
 let currentDomain = "";
+let currentTabId = 0;
+let targetLabel = ""; // подключение, которому адресованы пресет/гранты
 let grantMsgDirty = false; // клик-обработчик поставил своё сообщение — render не затирает
 let capDirty = false; // пользователь трогает чекбоксы — render не перезаполняет
 
@@ -54,11 +57,35 @@ function fmtTime(ts) {
   }
 }
 
+function serverLabels() {
+  return (Array.isArray(state.servers) ? state.servers : []).map((s) => s.label);
+}
+
+function connInfo(label) {
+  return (state.connState && state.connState[label]) || { status: "offline", lastError: "" };
+}
+
+/** Подключение-цель пресета/грантов: выбранное, иначе первое. */
+function resolveTarget() {
+  const labels = serverLabels();
+  if (targetLabel && labels.includes(targetLabel)) return targetLabel;
+  return labels[0] || "";
+}
+
 function render() {
-  const st = state.sessionStatus || "offline";
-  $("connText").textContent = STATUS_TEXT[st] || st;
+  const labels = serverLabels();
+  const infos = labels.map((l) => connInfo(l));
+
+  // Агрегатный статус в шапке
+  let agg = "offline";
+  if (infos.some((i) => i.status === "pending_approval")) agg = "pending_approval";
+  else if (infos.some((i) => i.status === "active")) agg = "active";
+  const activeCount = infos.filter((i) => i.status === "active").length;
+  $("connText").textContent = labels.length
+    ? STATUS_TEXT[agg] + " (" + activeCount + "/" + labels.length + " активно)"
+    : "Нет подключений";
   $("connDot").className =
-    "dot " + (st === "active" ? "on" : st === "pending_approval" ? "wait" : "off");
+    "dot " + (agg === "active" ? "on" : agg === "pending_approval" ? "wait" : "off");
 
   const err = state.lastError || "";
   $("lastError").classList.toggle("hidden", !err);
@@ -71,8 +98,51 @@ function render() {
     : "Инжектор: НЕ зарегистрирован";
   $("injectorStatus").title = injPatterns.join("\n");
 
-  $("approvalBox").classList.toggle("hidden", st !== "pending_approval");
   $("hostPermBox").classList.toggle("hidden", !state.needHostPermission);
+
+  // Список подключений: статус, approve/deny, удаление
+  const ul = $("connList");
+  ul.innerHTML = "";
+  if (!labels.length) {
+    const li = document.createElement("li");
+    li.textContent = "нет серверов — добавьте в «Настройках»";
+    ul.appendChild(li);
+  }
+  for (const label of labels) {
+    const info = connInfo(label);
+    const li = document.createElement("li");
+    const dot = document.createElement("span");
+    dot.className =
+      "dot " +
+      (info.status === "active" ? "on" : info.status === "pending_approval" ? "wait" : "off");
+    const text = document.createElement("span");
+    text.className = "conn-label";
+    text.textContent = label + " — " + (STATUS_TEXT[info.status] || info.status);
+    text.title = info.lastError || "";
+    li.appendChild(dot);
+    li.appendChild(text);
+    if (info.status === "pending_approval") {
+      const ok = document.createElement("button");
+      ok.className = "btn conn-btn ok";
+      ok.textContent = "Разрешить";
+      ok.addEventListener("click", () => send("approve", { label }));
+      const no = document.createElement("button");
+      no.className = "btn conn-btn danger";
+      no.textContent = "Запретить";
+      no.addEventListener("click", () => send("deny", { label }));
+      li.appendChild(ok);
+      li.appendChild(no);
+    }
+    if (labels.length > 1) {
+      const del = document.createElement("button");
+      del.className = "btn conn-btn";
+      del.textContent = "✕";
+      del.title = "Удалить подключение (его вкладки станут неназначенными)";
+      del.addEventListener("click", () => send("server.remove", { label }));
+      li.appendChild(del);
+    }
+    ul.appendChild(li);
+  }
 
   // Авто-паузенные вкладки (§6)
   const autoPaused = Array.isArray(state.autoPaused) ? state.autoPaused : [];
@@ -85,7 +155,7 @@ function render() {
     label.className = "ap-label";
     const reason = String(item.reason || "").replace(/^auto:/, "");
     label.textContent = `${item.domain || "вкладка " + item.tabId} — ${reason}`;
-    label.title = (item.flags || []).join(", ");
+    label.title = (item.flags || []).join(", ") + (item.conn ? " [" + item.conn + "]" : "");
     const btn = document.createElement("button");
     btn.className = "btn ap-resume";
     btn.textContent = "Возобновить";
@@ -95,9 +165,28 @@ function render() {
     apUl.appendChild(li);
   }
 
-  // Пресеты
+  // Владелец текущей вкладки + селектор назначения
+  const owners = state.tabOwners && typeof state.tabOwners === "object" ? state.tabOwners : {};
+  const owner = currentTabId ? owners[currentTabId] || "" : "";
+  $("tabOwner").textContent = currentTabId
+    ? owner || "никто (при " + (labels.length > 1 ? "нескольких" : "одном") +
+      " подключени" + (labels.length > 1 ? "ях" : "и") + " — " +
+      (labels.length > 1 ? "недоступна" : "авто-назначение") + ")"
+    : "—";
+  const assignSel = $("assignSelect");
+  fillSelect(assignSel, labels, owner || "");
+  $("btnAssign").disabled = !currentTabId || !labels.length;
+  $("btnUnassign").disabled = !currentTabId || !owner;
+
+  // Подключение-цель пресета/грантов
+  const target = resolveTarget();
+  fillSelect($("targetConn"), labels, target);
+  const tInfo = connInfo(target);
+  const tActive = tInfo.status === "active";
+
+  // Пресеты целевого подключения
   const sel = $("presetSelect");
-  const presets = Array.isArray(state.presets) ? state.presets : [];
+  const presets = Array.isArray(tInfo.presets) ? tInfo.presets : [];
   sel.innerHTML = "";
   if (!presets.length) {
     const o = document.createElement("option");
@@ -108,13 +197,13 @@ function render() {
   for (const name of presets) {
     const o = document.createElement("option");
     o.value = name;
-    o.textContent = name + (name === state.policyPreset ? " (активный)" : "");
-    if (name === state.policyPreset) o.selected = true;
+    o.textContent = name + (name === tInfo.policyPreset ? " (активный)" : "");
+    if (name === tInfo.policyPreset) o.selected = true;
     sel.appendChild(o);
   }
-  sel.disabled = !presets.length || st !== "active";
+  sel.disabled = !presets.length || !tActive;
 
-  // Пауза
+  // Пауза (глобальная, рассылается всем подключениям)
   const btn = $("btnPause");
   btn.textContent = state.paused ? "СНЯТЬ ПАУЗУ" : "ПАУЗА";
   btn.classList.toggle("paused", !!state.paused);
@@ -122,28 +211,29 @@ function render() {
   // Последнее действие
   const la = state.lastAction;
   $("lastAction").textContent = la
-    ? `${fmtTime(la.ts)}  ${la.method}  ${la.domain || ""}  — ${la.outcome}`
+    ? `${fmtTime(la.ts)}  ${la.conn ? "[" + la.conn + "] " : ""}${la.method}  ${la.domain || ""}  — ${la.outcome}`
     : "—";
 
   // Журнал
-  const ul = $("journal");
-  ul.innerHTML = "";
+  const jul = $("journal");
+  jul.innerHTML = "";
   const items = (state.journal || []).slice(-20).reverse();
   for (const it of items) {
     const li = document.createElement("li");
-    li.textContent = `${fmtTime(it.ts)}  ${it.method}  ${it.domain || ""}  — ${it.outcome}`;
-    ul.appendChild(li);
+    li.textContent = `${fmtTime(it.ts)}  ${it.conn ? "[" + it.conn + "] " : ""}${it.method}  ${it.domain || ""}  — ${it.outcome}`;
+    jul.appendChild(li);
   }
   if (!items.length) {
     const li = document.createElement("li");
     li.textContent = "пусто";
-    ul.appendChild(li);
+    jul.appendChild(li);
   }
 
   $("grantDomain").textContent = currentDomain || "—";
   // Чекбоксы capabilities: предзаполняем текущим состоянием гранта (session
   // или preset), но не затираем, пока пользователь редактирует (capDirty).
-  const domInfo = (state.policyDomains || {})[currentDomain] || null;
+  const policyDomains = tInfo.policyDomains || {};
+  const domInfo = policyDomains[currentDomain] || null;
   if (!capDirty) {
     const caps = domInfo ? domInfo.capabilities || [] : ["read", "interact"];
     $("capRead").checked = caps.includes("read");
@@ -152,7 +242,7 @@ function render() {
   }
   const sessionGranted = domInfo && domInfo.source === "session";
   const presetGranted = domInfo && domInfo.source === "preset";
-  $("btnGrant").disabled = !currentDomain || st !== "active";
+  $("btnGrant").disabled = !currentDomain || !tActive;
   $("btnGrant").textContent = sessionGranted
     ? "Обновить грант (сессия)"
     : "Выдать грант (сессия)";
@@ -169,38 +259,48 @@ function render() {
 
   // Список грантов сессии с отзывом (управляет человек, не модель).
   // Источник — policyDomains (authoritative, приходит в policy.update).
-  const domains = state.policyDomains || {};
-  const grants = Object.keys(domains).filter((d) => domains[d] && domains[d].source === "session");
+  const grants = Object.keys(policyDomains).filter(
+    (d) => policyDomains[d] && policyDomains[d].source === "session"
+  );
   $("grantsBox").classList.toggle("hidden", grants.length === 0);
   const gUl = $("grantsList");
   gUl.innerHTML = "";
   for (const domain of grants) {
     const li = document.createElement("li");
-    const label = document.createElement("span");
-    label.textContent = domain + " (" + (domains[domain].capabilities || []).join(", ") + ")";
-    const btn = document.createElement("button");
-    btn.className = "btn";
-    btn.textContent = "Отозвать";
-    btn.disabled = st !== "active";
-    btn.addEventListener("click", () => send("grant.remove", { domain }));
-    li.appendChild(label);
+    const lab = document.createElement("span");
+    lab.textContent = domain + " (" + (policyDomains[domain].capabilities || []).join(", ") + ")";
+    const revoke = document.createElement("button");
+    revoke.className = "btn";
+    revoke.textContent = "Отозвать";
+    revoke.disabled = !tActive;
+    revoke.addEventListener("click", () =>
+      send("grant.remove", { domain, label: target })
+    );
+    li.appendChild(lab);
     li.appendChild(document.createTextNode(" "));
-    li.appendChild(btn);
+    li.appendChild(revoke);
     gUl.appendChild(li);
   }
+}
 
-  // Настройки (не затираем поле, пока пользователь его редактирует)
-  if (document.activeElement !== $("inUrl")) $("inUrl").value = state.serverUrl || "";
-  if (document.activeElement !== $("inSecret")) $("inSecret").value = state.secret || "";
+/** Заполнить select значениями, не затирая фокус ввода. */
+function fillSelect(sel, values, selected) {
+  if (document.activeElement === sel) return;
+  sel.innerHTML = "";
+  for (const v of values) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v;
+    if (v === selected) o.selected = true;
+    sel.appendChild(o);
+  }
 }
 
 async function loadState() {
   const stored = await browser.storage.local.get({
-    sessionStatus: "offline",
+    servers: [],
+    connState: {},
     lastError: "",
-    presets: [],
-    policyPreset: "",
-    policyVersion: 0,
     needHostPermission: false,
     paused: false,
     journal: [],
@@ -209,21 +309,21 @@ async function loadState() {
     injectorRegistered: false,
     injectorPatterns: [],
     injectorTs: 0,
-    sessionGrants: [],
-    policyDomains: {},
-    serverUrl: "ws://127.0.0.1:18777",
-    secret: "",
+    tabOwners: {},
   });
   state = stored;
   render();
 }
 
-async function loadCurrentDomain() {
+async function loadCurrentTab() {
   try {
     const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    const url = tabs[0] && tabs[0].url;
+    const tab = tabs[0];
+    currentTabId = tab && tab.id ? tab.id : 0;
+    const url = tab && tab.url;
     currentDomain = url && /^https?:/.test(url) ? new URL(url).host : "";
   } catch (e) {
+    currentTabId = 0;
     currentDomain = "";
   }
   grantMsgDirty = false; // смена вкладки — сообщение гранта пересоздаётся
@@ -240,9 +340,6 @@ function flashSave(msg) {
 
 // ---------- обработчики ----------
 
-$("btnApprove").addEventListener("click", () => send("approve"));
-$("btnDeny").addEventListener("click", () => send("deny"));
-
 $("btnHostPerm").addEventListener("click", async () => {
   // Только здесь и только по жесту пользователя (N2).
   const granted = await browser.permissions
@@ -251,9 +348,24 @@ $("btnHostPerm").addEventListener("click", async () => {
   if (granted) await send("hostPermissionGranted");
 });
 
+$("targetConn").addEventListener("change", (e) => {
+  targetLabel = e.target.value;
+  render();
+});
+
 $("presetSelect").addEventListener("change", async (e) => {
   const name = e.target.value;
-  if (name) await send("preset.switch", { name });
+  if (name) await send("preset.switch", { name, label: resolveTarget() });
+});
+
+$("btnAssign").addEventListener("click", async () => {
+  if (!currentTabId) return;
+  await send("tab.assign", { tabId: currentTabId, label: $("assignSelect").value });
+});
+
+$("btnUnassign").addEventListener("click", async () => {
+  if (!currentTabId) return;
+  await send("tab.unassign", { tabId: currentTabId });
 });
 
 $("btnGrant").addEventListener("click", async () => {
@@ -262,16 +374,17 @@ $("btnGrant").addEventListener("click", async () => {
   if ($("capRead").checked) caps.push("read");
   if ($("capInteract").checked) caps.push("interact");
   if ($("capDownload").checked) caps.push("download");
+  const label = resolveTarget();
   grantMsgDirty = true;
   if (caps.length === 0) {
     // Все галочки сняты = отзыв гранта (если он был).
-    const res = await send("grant.remove", { domain: currentDomain });
+    const res = await send("grant.remove", { domain: currentDomain, label });
     $("grantMsg").textContent =
       res && res.ok ? "Грант отозван: " + currentDomain : "Ошибка: " + ((res && res.error) || "нет ответа");
     capDirty = false;
     return;
   }
-  const res = await send("grant.add", { domain: currentDomain, capabilities: caps });
+  const res = await send("grant.add", { domain: currentDomain, capabilities: caps, label });
   if (res && res.ok) {
     // policy.update обновит policyDomains → render покажет состояние сам.
     $("grantMsg").textContent = "Грант выдан: " + currentDomain + " (" + caps.join(", ") + ", сессия)";
@@ -289,12 +402,22 @@ for (const id of ["capRead", "capInteract", "capDownload"]) {
 
 $("btnPause").addEventListener("click", () => send("pause.global", { paused: !state.paused }));
 
-$("btnSave").addEventListener("click", async () => {
-  await browser.storage.local.set({
-    serverUrl: $("inUrl").value.trim() || "ws://127.0.0.1:18777",
+$("btnAddServer").addEventListener("click", async () => {
+  const res = await send("server.add", {
+    label: $("inLabel").value.trim(),
+    url: $("inUrl").value.trim(),
     secret: $("inSecret").value.trim(),
   });
-  flashSave("сохранено — переподключение…");
+  if (res && res.ok) {
+    $("inLabel").value = "";
+    // URL возвращаем к дефолту, а не очищаем: popup закрывается при потере
+    // фокуса, перепечатывать адрес при каждом добавлении сервера не нужно.
+    $("inUrl").value = "ws://127.0.0.1:18777";
+    $("inSecret").value = "";
+    flashSave("добавлено — подключение…");
+  } else {
+    flashSave("Ошибка: " + ((res && res.error) || "нет ответа"));
+  }
 });
 
 // ---------- live-обновление ----------
@@ -307,4 +430,4 @@ browser.storage.onChanged.addListener((changes, area) => {
 });
 
 loadState();
-loadCurrentDomain();
+loadCurrentTab();

@@ -13,12 +13,9 @@
   <div id="injectorStatus" class="hint">Инжектор: —</div>
   <div id="lastError" class="error hidden"></div>
 
-  <section id="approvalBox" class="panel warn hidden">
-    <p>Новая сессия агента запрашивает доступ к браузеру.</p>
-    <div class="row">
-      <button id="btnApprove" class="btn ok">Разрешить</button>
-      <button id="btnDeny" class="btn danger">Запретить</button>
-    </div>
+  <section class="panel">
+    <div class="hint">Подключения к серверам</div>
+    <ul id="connList" class="connlist"></ul>
   </section>
 
   <section id="hostPermBox" class="panel hidden">
@@ -32,6 +29,24 @@
   </section>
 
   <section class="panel">
+    <div class="hint">
+      Текущая вкладка: владелец — <span id="tabOwner">—</span>
+    </div>
+    <div class="row">
+      <select id="assignSelect"></select>
+    </div>
+    <div class="row">
+      <button id="btnAssign" class="btn">Отдать вкладку</button>
+      <button id="btnUnassign" class="btn">Снять владельца</button>
+    </div>
+    <div class="hint">При нескольких подключениях неназначенные вкладки недоступны никому.</div>
+  </section>
+
+  <section class="panel">
+    <label class="field">
+      <span>Подключение (для пресета и грантов)</span>
+      <select id="targetConn"></select>
+    </label>
     <label class="field">
       <span>Пресет политики</span>
       <select id="presetSelect"></select>
@@ -67,19 +82,24 @@
   </details>
 
   <details class="panel">
-    <summary>Настройки</summary>
+    <summary>Настройки: добавить сервер</summary>
+    <label class="field">
+      <span>Название (label)</span>
+      <input id="inLabel" type="text" spellcheck="false" placeholder="main">
+    </label>
     <label class="field">
       <span>URL сервера</span>
-      <input id="inUrl" type="text" spellcheck="false" placeholder="ws://127.0.0.1:18777">
+      <input id="inUrl" type="text" spellcheck="false" value="ws://127.0.0.1:18777" placeholder="ws://127.0.0.1:18777">
     </label>
     <label class="field">
       <span>Секрет</span>
       <input id="inSecret" type="password" spellcheck="false">
     </label>
-    <button id="btnSave" class="btn">Сохранить</button>
+    <button id="btnAddServer" class="btn">Добавить</button>
     <span id="saveMsg" class="hint"></span>
   </details>
 
+  <script src="../compat-browser.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -32,3 +32,12 @@
    Ввести один раз в настройках popup расширения.
 6. **Хост-права:** при первом подключении popup предложит выдать
    `<all_urls>` (кнопка, один раз; дальше доступ режется policy.yaml).
+
+## Chromium (фаза 9, 2026-08-16)
+
+| Пункт | Статус | Значение |
+|---|---|---|
+| Версия | ✅ (со слов пользователя) | Chromium 144.0.7559.109 (Official Build, ungoogled-chromium) Arch Linux 64-bit |
+| Путь манифеста | ✅ выбран | MV3 (MV2-флаги краткосрочны: подтверждены лишь для 139/140; Chrome 150/151 убирает остатки; ungoogled-chromium MV2 не патчит — issue #3812) |
+| G1: живучесть SW с WS (spike) | ✅ 2026-08-16 | ~50 мин простоя, bootCount=1, keepalive 30 с стабилен, WS open. MV3-путь подтверждён полностью (лучший исход) |
+| G4: полный контур dist/chromium | ✅ 2026-08-16 | snapshot/act.scroll/tab.open работают; per-browser изоляция проверена вживую (DOMAIN_NOT_ALLOWED кросс-доступ); net.list НЕ работает (нет webRequest bindings в MV3 SW — маркер netlog_unavailable) |

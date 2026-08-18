@@ -14,6 +14,8 @@ let transferSeq = 0;
 export class MockExtension {
   /**
    * @param opts.secret — секрет для hello
+   * @param opts.browser — clientId для hello (default 'MockFox'); два мока с
+   *   разными browser = мультиклиентские тесты (фаза 9)
    * @param opts.tabs — [{tabId, url, title, flags?, snapshot?, markdown?}]
    * @param opts.pages — {url: {title, snapshot, markdown, flags}} для tab.open
    * @param opts.consent — 'allow'|'deny'|'allow_10min'|'timeout'|function(params) => decision|'timeout'
@@ -21,6 +23,7 @@ export class MockExtension {
    */
   constructor(opts) {
     this.secret = opts.secret;
+    this.browser = opts.browser ?? 'MockFox';
     this.tabs = new Map();
     for (const t of opts.tabs ?? []) {
       this.tabs.set(t.tabId, {
@@ -50,9 +53,10 @@ export class MockExtension {
       this.ws = new WebSocket(`ws://127.0.0.1:${port}`);
       this.ws.on('error', reject);
       this.ws.on('open', () => {
-        this.sendReq('hello', { secret: this.secret, ext_version: '0.0-test', browser: 'MockFox', ua: 'mock' })
+        this.sendReq('hello', { secret: this.secret, ext_version: '0.0-test', browser: this.browser, ua: 'mock' })
           .then((res) => {
-            if (res.status !== 'pending_approval') return reject(new Error('unexpected hello res: ' + JSON.stringify(res)));
+            // 'active' — реконнект уже подтверждённого клиента (фаза 9, D2).
+            if (res.status !== 'pending_approval' && res.status !== 'active') return reject(new Error('unexpected hello res: ' + JSON.stringify(res)));
             this.helloRes = res;
             resolve(res);
           }, reject);

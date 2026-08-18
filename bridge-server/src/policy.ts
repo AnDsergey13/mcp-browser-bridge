@@ -20,6 +20,11 @@ export interface DomainGrant {
   source: 'preset' | 'session';
 }
 
+/** Session-грант (D4): привязан к браузеру-источнику; clientId undefined — для всех (back-compat вызовов без clientId). */
+interface SessionGrant extends DomainGrant {
+  clientId?: string;
+}
+
 export interface ResolvedDomain {
   key: string;
   capabilities: Capability[];
@@ -44,7 +49,12 @@ interface PolicyFile {
   presets?: Record<string, {
     description?: string;
     allow_unsafe?: boolean;
-    domains?: Record<string, { capabilities?: string[]; gated?: Partial<Record<GatedCategory, GatedDecision>> }>;
+    domains?: Record<string, {
+      capabilities?: string[];
+      gated?: Partial<Record<GatedCategory, GatedDecision>>;
+      /** D4: clientId'ы браузеров, которым доступен домен; без поля — всем. */
+      browsers?: string[];
+    }>;
   }>;
 }
 
@@ -66,7 +76,8 @@ export class PolicyEngine {
   private log: (msg: string) => void;
   private file: PolicyFile = {};
   private runtimePreset: string | null = null; // переключение из popup/агента (не перезаписывает yaml)
-  private sessionGrants = new Map<string, DomainGrant>();
+  // Ключ: `${clientId}\n${domain}` (per-browser изоляция, D4); clientId '' — грант для всех (вызовы без clientId).
+  private sessionGrants = new Map<string, SessionGrant>();
   private allow10min = new Map<string, number>(); // "domain|category" → expiry ts
   private updateVersion = 0; // монотонный счётчик policy.update
   private watcher: fs.FSWatcher | null = null;
@@ -166,37 +177,44 @@ export class PolicyEngine {
    * (чекбоксы), поэтому повторная выдача = редактирование — capability можно
    * и снять. Пресетные домены не перезаписываются: session-грант лишь
    * дополняет/переопределяет поверх пресета (grantFor мержит).
+   * D4: грант привязан к браузеру-источнику (clientId); без clientId — для всех.
    */
-  setSessionGrant(domain: string, capabilities: Capability[]): void {
-    const existing = this.sessionGrants.get(domain);
+  setSessionGrant(domain: string, capabilities: Capability[], clientId?: string): void {
+    const key = this.sessionKey(clientId, domain);
+    const existing = this.sessionGrants.get(key);
     const caps = [...new Set(capabilities)];
-    this.sessionGrants.set(domain, {
+    this.sessionGrants.set(key, {
       capabilities: caps,
       gated: existing?.gated ?? {},
       source: 'session',
+      clientId,
     });
     this.updateVersion++;
-    this.audit({ kind: 'grant', domain, decision: existing ? 'session_grant_update' : 'session_grant', capabilities: caps });
+    this.audit({ kind: 'grant', domain, browser: clientId ?? null, decision: existing ? 'session_grant_update' : 'session_grant', capabilities: caps });
     this.emitChange();
   }
 
   /**
    * Отзыв разового гранта (жест пользователя в popup). Только session-гранты:
    * пресетные домены управляются правкой policy.yaml. Возвращает false, если
-   * session-гранта на этот домен не было.
+   * session-гранта на этот домен у этого браузера не было.
    */
-  removeSessionGrant(domain: string): boolean {
-    if (!this.sessionGrants.delete(domain)) return false;
+  removeSessionGrant(domain: string, clientId?: string): boolean {
+    if (!this.sessionGrants.delete(this.sessionKey(clientId, domain))) return false;
     this.updateVersion++;
-    this.audit({ kind: 'grant', domain, decision: 'session_revoke' });
+    this.audit({ kind: 'grant', domain, browser: clientId ?? null, decision: 'session_revoke' });
     this.emitChange();
     return true;
+  }
+
+  private sessionKey(clientId: string | undefined, domain: string): string {
+    return `${clientId ?? ''}\n${domain}`;
   }
 
   // ---- домены ----
 
   /** Ключи вида "host" или "host:port". "host" матчит host и его поддомены (любой порт). */
-  private matchKey(url: string): string | null {
+  private matchKey(url: string, clientId?: string): string | null {
     let u: URL;
     try {
       u = new URL(url);
@@ -205,7 +223,7 @@ export class PolicyEngine {
     }
     const hostname = u.hostname.toLowerCase();
     const port = u.port; // '' для дефолтных портов схемы
-    const keys = this.allDomainKeys();
+    const keys = this.allDomainKeys(clientId);
     // 1) точный host:port
     if (port) {
       const hp = `${hostname}:${port}`;
@@ -220,27 +238,54 @@ export class PolicyEngine {
     return null;
   }
 
-  private allDomainKeys(): Set<string> {
+  /** Домен пресета виден клиенту? Поля browsers нет — всем; clientId undefined — старое поведение (всем). */
+  private presetVisible(key: string, clientId?: string): boolean {
+    if (clientId === undefined) return true;
+    const b = this.file.presets?.[this.activePreset()]?.domains?.[key]?.browsers;
+    return !b || b.includes(clientId);
+  }
+
+  private sessionVisible(grant: SessionGrant, clientId?: string): boolean {
+    if (clientId === undefined) return true;
+    return !grant.clientId || grant.clientId === clientId;
+  }
+
+  private allDomainKeys(clientId?: string): Set<string> {
     const keys = new Set<string>();
     const preset = this.file.presets?.[this.activePreset()];
-    for (const k of Object.keys(preset?.domains ?? {})) keys.add(k);
-    for (const k of this.sessionGrants.keys()) keys.add(k);
+    for (const k of Object.keys(preset?.domains ?? {})) {
+      if (this.presetVisible(k, clientId)) keys.add(k);
+    }
+    for (const [k, g] of this.sessionGrants) {
+      if (this.sessionVisible(g, clientId)) keys.add(k.slice(k.indexOf('\n') + 1));
+    }
     return keys;
   }
 
-  private grantFor(key: string): DomainGrant | null {
+  /** Session-гранты домена, видимые клиенту (обычно 0–1: грант per (clientId, domain)). */
+  private sessionGrantsFor(key: string, clientId?: string): SessionGrant[] {
+    const out: SessionGrant[] = [];
+    for (const [k, g] of this.sessionGrants) {
+      if (k.slice(k.indexOf('\n') + 1) === key && this.sessionVisible(g, clientId)) out.push(g);
+    }
+    return out;
+  }
+
+  private grantFor(key: string, clientId?: string): DomainGrant | null {
     const preset = this.file.presets?.[this.activePreset()];
-    const fromPreset = preset?.domains?.[key];
-    const fromSession = this.sessionGrants.get(key);
-    if (!fromPreset && !fromSession) return null;
-    const caps = new Set<Capability>([
-      ...((fromPreset?.capabilities ?? []) as Capability[]),
-      ...(fromSession?.capabilities ?? []),
-    ]);
+    const fromPreset = this.presetVisible(key, clientId) ? preset?.domains?.[key] : undefined;
+    const sessions = this.sessionGrantsFor(key, clientId);
+    if (!fromPreset && sessions.length === 0) return null;
+    const caps = new Set<Capability>((fromPreset?.capabilities ?? []) as Capability[]);
+    const gated: Partial<Record<GatedCategory, GatedDecision>> = { ...(fromPreset?.gated ?? {}) };
+    for (const s of sessions) {
+      for (const c of s.capabilities) caps.add(c);
+      Object.assign(gated, s.gated);
+    }
     return {
       capabilities: [...caps],
-      gated: { ...(fromPreset?.gated ?? {}), ...(fromSession?.gated ?? {}) },
-      source: fromSession && !fromPreset ? 'session' : 'preset',
+      gated,
+      source: sessions.length > 0 && !fromPreset ? 'session' : 'preset',
     };
   }
 
@@ -272,24 +317,31 @@ export class PolicyEngine {
     return out;
   }
 
-  resolveDomain(url: string): ResolvedDomain | null {
-    const key = this.matchKey(url);
+  resolveDomain(url: string, clientId?: string): ResolvedDomain | null {
+    const key = this.matchKey(url, clientId);
     if (!key) return null;
-    const grant = this.grantFor(key);
+    const grant = this.grantFor(key, clientId);
     if (!grant) return null;
     return { key, capabilities: grant.capabilities, gated: this.resolveGated(key, grant), source: grant.source };
   }
 
   // ---- проверка команды ----
 
-  check(url: string, capability: Capability | null, category: GatedCategory | null): CheckResult {
-    const resolved = this.resolveDomain(url);
+  /**
+   * D4: clientId — браузер, от имени которого идёт команда. Домен с полем
+   * browsers, не включающим clientId, → deny как DOMAIN_NOT_ALLOWED.
+   * clientId undefined — старое поведение без per-browser фильтра.
+   */
+  check(url: string, capability: Capability | null, category: GatedCategory | null, clientId?: string): CheckResult {
+    const resolved = this.resolveDomain(url, clientId);
     if (!resolved) {
-      this.audit({ kind: 'deny', domain: hostOf(url), capability, decision: 'DOMAIN_NOT_ALLOWED' });
-      return {
-        decision: 'deny', resolved: null, error_code: 'DOMAIN_NOT_ALLOWED',
-        hint: `Домен ${hostOf(url)} не входит в активный пресет "${this.activePreset()}". Попроси пользователя добавить грант через popup расширения или сменить пресет (policy.request_preset).`,
-      };
+      // Домен грантован, но не этому браузеру — подсказка честнее общей.
+      const globally = clientId !== undefined ? this.resolveDomain(url) : null;
+      const hint = globally
+        ? `Домен ${globally.key} грантован другому браузеру (не "${clientId}"). Попроси пользователя выдать грант через popup этого браузера или добавь "${clientId}" в browsers домена в policy.yaml.`
+        : `Домен ${hostOf(url)} не входит в активный пресет "${this.activePreset()}". Попроси пользователя добавить грант через popup расширения или сменить пресет (policy.request_preset).`;
+      this.audit({ kind: 'deny', domain: hostOf(url), browser: clientId ?? null, capability, decision: 'DOMAIN_NOT_ALLOWED' });
+      return { decision: 'deny', resolved: null, error_code: 'DOMAIN_NOT_ALLOWED', hint };
     }
     if (capability && !resolved.capabilities.includes(capability)) {
       this.audit({ kind: 'deny', domain: resolved.key, capability, decision: 'CAPABILITY_DENIED' });
@@ -351,11 +403,12 @@ export class PolicyEngine {
 
   // ---- вид для расширения ----
 
-  buildPolicyUpdate(): PolicyUpdateView {
+  /** Вид для расширения; с clientId — только домены этого браузера (D4), без — все (старое поведение). */
+  buildPolicyUpdate(clientId?: string): PolicyUpdateView {
     const domains: PolicyUpdateView['domains'] = {};
     const patterns: string[] = [];
-    for (const key of this.allDomainKeys()) {
-      const grant = this.grantFor(key);
+    for (const key of this.allDomainKeys(clientId)) {
+      const grant = this.grantFor(key, clientId);
       if (!grant) continue;
       domains[key] = {
         capabilities: grant.capabilities,

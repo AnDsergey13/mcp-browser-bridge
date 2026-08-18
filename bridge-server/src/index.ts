@@ -84,7 +84,8 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
   const memory = new MemoryStore({ memoryDir, log });
   const downloads = new DownloadRelay({
     downloadsDir, log,
-    sendAck: (transferId, seq) => transport.sendEvent('file.ack', { transferId, seq }),
+    // ack — только клиенту-владельцу трансфера (D6/D7).
+    sendAck: (transferId, seq, clientId) => transport.sendEvent(clientId, 'file.ack', { transferId, seq }),
   });
   const pacing = new Pacing(() => policy.pacing());
   const core = new BridgeCore({
@@ -93,29 +94,38 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
   });
 
   // --- связывание ---
-  policy.onChange = (view) => transport.sendEvent('policy.update', view as unknown as Record<string, unknown>);
-  transport.onApproved = () => transport.sendEvent('policy.update', policy.buildPolicyUpdate() as unknown as Record<string, unknown>);
-  transport.onStateChange = (state) => { if (state === 'offline') downloads.resetAll('BROWSER_OFFLINE'); };
-  transport.onEvent = (event, data) => {
-    if (downloads.handleEvent(event, data)) return;
-    core.handlePauseEvent(event, data);
+  // D4/D6: policy.update — per-client (у каждого браузера свой вид доменов).
+  const pushPolicyUpdate = (clientId: string) =>
+    transport.sendEvent(clientId, 'policy.update', policy.buildPolicyUpdate(clientId) as unknown as Record<string, unknown>);
+  policy.onChange = () => {
+    for (const c of transport.listClients()) {
+      if (c.state === 'active' || c.state === 'pending_approval') pushPolicyUpdate(c.id);
+    }
   };
-  transport.registerExtHandler('grant.add', (params) => {
+  transport.onApproved = (clientId) => pushPolicyUpdate(clientId);
+  // Дисконнект клиента рвёт только ЕГО трансферы и ожидания (D7).
+  transport.onStateChange = (clientId, state) => { if (state === 'offline') downloads.resetClient(clientId, 'BROWSER_OFFLINE'); };
+  transport.onEvent = (event, data, clientId) => {
+    if (downloads.handleEvent(event, data, clientId)) return;
+    core.handlePauseEvent(event, data, clientId);
+  };
+  transport.registerExtHandler('grant.add', (params, clientId) => {
     // Replace-семантика: popup шлёт полный набор capabilities (чекбоксы);
     // повторная выдача = редактирование. Невалидные capability отбрасываем.
+    // D4: грант привязан к браузеру-источнику (в другом браузере не действует).
     const domain = String(params['domain'] ?? '');
     const VALID: Capability[] = ['read', 'interact', 'download'];
     const capabilities = (Array.isArray(params['capabilities']) ? params['capabilities'] : [])
       .filter((c): c is Capability => VALID.includes(c as Capability));
     if (!domain) return { granted: false };
-    policy.setSessionGrant(domain, capabilities);
+    policy.setSessionGrant(domain, capabilities, clientId || undefined);
     return { granted: true };
   });
-  transport.registerExtHandler('grant.remove', (params) => {
+  transport.registerExtHandler('grant.remove', (params, clientId) => {
     // Отзыв разового гранта — жест пользователя в popup (политику меняет только человек).
     const domain = String(params['domain'] ?? '');
     if (!domain) return { removed: false };
-    return { removed: policy.removeSessionGrant(domain) };
+    return { removed: policy.removeSessionGrant(domain, clientId || undefined) };
   });
   transport.registerExtHandler('preset.switch', (params) => {
     const name = String(params['name'] ?? '');

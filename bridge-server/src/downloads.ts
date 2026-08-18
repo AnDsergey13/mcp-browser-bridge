@@ -1,6 +1,8 @@
 // downloads.ts — файловый релей (PROTOCOL.md §8): file.start/chunk/end,
 // ack каждого чанка (backpressure на стороне расширения), sha256, uniquify,
 // запись в downloadsDir + строка в manifest.jsonl.
+// Фаза 9 (D7): параллельные трансферы — реестр ожиданий per (clientId, FIFO),
+// transferId → {clientId, ожидание}; ack уходит только клиенту-владельцу.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -15,6 +17,7 @@ export class RelayError extends Error {
 
 interface Transfer {
   transferId: string;
+  clientId: string; // браузер-владелец трансфера (ack — только ему)
   name: string;
   size: number | null;
   mime: string | null;
@@ -28,6 +31,14 @@ interface Transfer {
   fail: (err: RelayError) => void;
 }
 
+/** Ожидание трансфера из file.download (D7): связь по clientId, FIFO внутри клиента. */
+interface PendingExpect {
+  url: string;
+  clientId: string;
+  resolve: (r: CompletedTransfer) => void;
+  reject: (err: RelayError) => void;
+}
+
 export interface CompletedTransfer {
   transferId: string;
   name: string;   // финальное (uniquified) имя в downloadsDir
@@ -38,36 +49,31 @@ export interface CompletedTransfer {
 export class DownloadRelay {
   private downloadsDir: string;
   private log: (msg: string) => void;
-  private sendAck: (transferId: string, seq: number) => void;
+  private sendAck: (transferId: string, seq: number, clientId: string) => void;
   private transfers = new Map<string, Transfer>();
-  private pendingUrl: string | null = null; // url из текущего file.download
+  private expects: PendingExpect[] = [];
 
   constructor(opts: {
     downloadsDir: string;
     log?: (msg: string) => void;
-    sendAck: (transferId: string, seq: number) => void;
+    sendAck: (transferId: string, seq: number, clientId: string) => void;
   }) {
     this.downloadsDir = opts.downloadsDir;
     this.log = opts.log ?? (() => {});
     this.sendAck = opts.sendAck;
   }
 
-  /** Ожидание следующего трансфера (вызывается перед req fetchFile). */
-  expectTransfer(url: string): Promise<CompletedTransfer> {
-    this.pendingUrl = url;
+  /** Ожидание трансфера этого клиента (вызывается перед req fetchFile). */
+  expectTransfer(url: string, clientId: string): Promise<CompletedTransfer> {
     return new Promise((resolve, reject) => {
-      this.pendingResolve = resolve;
-      this.pendingReject = reject;
+      this.expects.push({ url, clientId, resolve, reject });
     });
   }
 
-  private pendingResolve: ((r: CompletedTransfer) => void) | null = null;
-  private pendingReject: ((err: RelayError) => void) | null = null;
-
-  /** События file.* от расширения. Возвращает true, если событие обработано. */
-  handleEvent(event: string, data: Record<string, unknown>): boolean {
+  /** События file.* от расширения (clientId — браузер-источник). Возвращает true, если событие обработано. */
+  handleEvent(event: string, data: Record<string, unknown>, clientId: string): boolean {
     switch (event) {
-      case 'file.start': this.onStart(data); return true;
+      case 'file.start': this.onStart(data, clientId); return true;
       case 'file.chunk': this.onChunk(data); return true;
       case 'file.end': this.onEnd(data); return true;
       case 'file.abort': this.onAbort(data); return true;
@@ -75,14 +81,23 @@ export class DownloadRelay {
     }
   }
 
-  private onStart(data: Record<string, unknown>): void {
+  /** Первое (FIFO) ожидание этого клиента — ему и принадлежит начинающийся трансфер. */
+  private takeExpect(clientId: string): PendingExpect | null {
+    const idx = this.expects.findIndex((e) => e.clientId === clientId);
+    if (idx < 0) return null;
+    return this.expects.splice(idx, 1)[0];
+  }
+
+  private onStart(data: Record<string, unknown>, clientId: string): void {
     const transferId = String(data['transferId'] ?? '');
     if (!transferId) return;
     fs.mkdirSync(this.downloadsDir, { recursive: true });
     const tmpPath = path.join(this.downloadsDir, `.partial-${transferId}`);
     const fd = fs.openSync(tmpPath, 'w');
+    const expect = this.takeExpect(clientId);
     const t: Transfer = {
       transferId,
+      clientId,
       name: sanitizeName(String(data['name'] ?? 'download.bin')),
       size: typeof data['size'] === 'number' ? data['size'] : null,
       mime: typeof data['mime'] === 'string' ? data['mime'] : null,
@@ -91,12 +106,13 @@ export class DownloadRelay {
       nextSeq: 0,
       bytes: 0,
       hash: crypto.createHash('sha256'),
-      url: this.pendingUrl,
-      done: () => {},
-      fail: () => {},
+      url: expect?.url ?? null,
+      done: (r) => expect?.resolve({ transferId, ...r }),
+      fail: (err) => expect?.reject(err),
     };
     this.transfers.set(transferId, t);
-    this.log(`relay: start ${transferId} "${t.name}" (${t.size ?? '?'} bytes)`);
+    if (!expect) this.log(`relay: start ${transferId} без ожидания file.download (clientId=${clientId})`);
+    this.log(`relay: start ${transferId} "${t.name}" (${t.size ?? '?'} bytes) от ${clientId}`);
   }
 
   private onChunk(data: Record<string, unknown>): void {
@@ -113,8 +129,9 @@ export class DownloadRelay {
     t.hash.update(buf);
     t.bytes += buf.length;
     t.nextSeq++;
-    // ack — расширение ждёт его перед следующим чанком (backpressure).
-    this.sendAck(transferId, seq);
+    // ack — расширение ждёт его перед следующим чанком (backpressure);
+    // уходит только клиенту-владельцу трансфера (D6/D7).
+    this.sendAck(transferId, seq, t.clientId);
   }
 
   private onEnd(data: Record<string, unknown>): void {
@@ -127,7 +144,7 @@ export class DownloadRelay {
     const expected = typeof data['sha256'] === 'string' ? data['sha256'] : null;
     if (expected && expected !== sha256) {
       fs.rmSync(t.tmpPath, { force: true });
-      this.finishFail(transferId, new RelayError('FETCH_FAILED', `sha256 не сошёлся: ext=${expected} server=${sha256}`));
+      t.fail(new RelayError('FETCH_FAILED', `sha256 не сошёлся: ext=${expected} server=${sha256}`));
       return;
     }
     // П0-6: идемпотентность ретрая после клиентского -32001 — тот же url и
@@ -138,14 +155,14 @@ export class DownloadRelay {
       fs.rmSync(t.tmpPath, { force: true });
       this.manifest({ ts: new Date().toISOString(), url: t.url, name: existing, size: t.bytes, sha256, status: 'ok', dedup: true });
       this.log(`relay: dedup ${transferId} → существующий ${existing} (${t.bytes} bytes)`);
-      this.finishOk({ transferId, name: existing, size: t.bytes, sha256 });
+      t.done({ name: existing, size: t.bytes, sha256 });
       return;
     }
     const finalName = this.uniquify(t.name);
     fs.renameSync(t.tmpPath, path.join(this.downloadsDir, finalName));
     this.manifest({ ts: new Date().toISOString(), url: t.url, name: finalName, size: t.bytes, sha256, status: 'ok' });
     this.log(`relay: done ${transferId} → ${finalName} (${t.bytes} bytes)`);
-    this.finishOk({ transferId, name: finalName, size: t.bytes, sha256 });
+    t.done({ name: finalName, size: t.bytes, sha256 });
   }
 
   /** Завершённая запись manifest с тем же url+size+sha256 и живым файлом на диске. */
@@ -175,9 +192,9 @@ export class DownloadRelay {
     const reason = String(data['reason'] ?? 'aborted by extension');
     if (t) {
       this.abortTransfer(t, reason);
-    } else {
-      this.finishFail(transferId, new RelayError('FETCH_FAILED', reason));
     }
+    // Трансфер неизвестен (уже завершён/чужой) — ожидание не трогаем:
+    // его reject придёт через свой file.abort или resetClient.
   }
 
   private abortTransfer(t: Transfer, reason: string): void {
@@ -185,19 +202,7 @@ export class DownloadRelay {
     try { fs.closeSync(t.fd); } catch { /* уже закрыт */ }
     fs.rmSync(t.tmpPath, { force: true });
     this.manifest({ ts: new Date().toISOString(), url: t.url, name: t.name, size: t.bytes, sha256: null, status: `failed: ${reason}` });
-    this.finishFail(t.transferId, new RelayError('FETCH_FAILED', reason));
-  }
-
-  private finishOk(r: CompletedTransfer): void {
-    const resolve = this.pendingResolve;
-    this.pendingResolve = this.pendingReject = null;
-    if (resolve) resolve(r);
-  }
-
-  private finishFail(_transferId: string, err: RelayError): void {
-    const reject = this.pendingReject;
-    this.pendingResolve = this.pendingReject = null;
-    if (reject) reject(err);
+    t.fail(new RelayError('FETCH_FAILED', reason));
   }
 
   private uniquify(name: string): string {
@@ -219,9 +224,14 @@ export class DownloadRelay {
     }
   }
 
-  /** Отмена всех активных трансферов (при дисконнекте). */
-  resetAll(reason: string): void {
-    for (const t of [...this.transfers.values()]) this.abortTransfer(t, reason);
+  /** Отмена всех активных трансферов и ожиданий ЭТОГО клиента (при его дисконнекте). */
+  resetClient(clientId: string, reason: string): void {
+    for (const t of [...this.transfers.values()]) {
+      if (t.clientId === clientId) this.abortTransfer(t, reason);
+    }
+    const mine = this.expects.filter((e) => e.clientId === clientId);
+    this.expects = this.expects.filter((e) => e.clientId !== clientId);
+    for (const e of mine) e.reject(new RelayError('BROWSER_OFFLINE', reason));
   }
 }
 
