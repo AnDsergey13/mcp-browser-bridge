@@ -193,7 +193,13 @@ export class MockExtension {
         (this.actions ??= []).push(method);
         return { url: t.url, title: t.title, flags: t.flags };
       }
-      case 'scroll': case 'scrollIntoView': case 'pressKey': case 'hover': {
+      case 'hover': {
+        const t = this.tabOrThrow(p.tabId);
+        if (p.ref) this.checkRef(t, p.ref); // hover-by-text (без ref) — без проверки
+        (this.actions ??= []).push('hover');
+        return { url: t.url, title: t.title, flags: t.flags };
+      }
+      case 'scroll': case 'scrollIntoView': case 'pressKey': {
         const t = this.tabOrThrow(p.tabId);
         (this.actions ??= []).push(method);
         return { url: t.url, title: t.title, flags: t.flags };
@@ -201,6 +207,17 @@ export class MockExtension {
       case 'getStateHash': {
         const t = this.tabOrThrow(p.tabId);
         return { url: t.url, dom_hash: shortHash(t.snapshot) };
+      }
+      case 'consoleLog': {
+        const t = this.tabOrThrow(p.tabId);
+        const all = t.consoleEntries ?? [];
+        const limit = Math.min(Math.max(Number(p.limit) || 100, 1), 100);
+        return {
+          url: t.url, title: t.title, flags: t.flags,
+          entries: all.slice(-limit),
+          // тест может выставить t.consoleUnavailable — маркер деградации (CSP)
+          ...(t.consoleUnavailable ? { console_unavailable: t.consoleUnavailable } : {}),
+        };
       }
       case 'waitFor': {
         const t = this.tabOrThrow(p.tabId);

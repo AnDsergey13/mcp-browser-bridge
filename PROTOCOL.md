@@ -100,6 +100,21 @@
   media-запросов вкладки (webRequest, тип `media` + URL `*.m3u8|*.mpd`;
   кольцевой буфер 50 записей, чистится при навигации/закрытии вкладки).
   MCP-инструмент: `net.list`, capability `read` по домену вкладки.
+- `consoleLog` `{tabId, limit?:≤100}` →
+  `{url,title,flags,entries:[{ts,level,text,count?}][,console_unavailable]}` —
+  пассивный лог `console.*` + `window.onerror`/`unhandledrejection` страницы
+  (боковая линия, как net.list). Кольцевой буфер 100 записей на вкладку,
+  `text` ≤500 символов, подряд идущие одинаковые записи складываются в `count`.
+  Content script в isolated world console страницы НЕ видит — сбор делает
+  MAIN-world хук `src/console-hook.js` (web_accessible_resources; внедряется
+  content script'ом через `<script src>`, т.е. только на доменах политики),
+  записи идут в content script через `window.postMessage` (маркер
+  `__bridge_console`; rate-limit 50 записей/с в хуке). Буфер живёт в контексте
+  документа → чистится при полной навигации сам; записи до инъекции хука
+  (document_idle) теряются. Страница с жёстким CSP может запретить загрузку
+  хука → честный маркер `console_unavailable` (по образцу
+  `netlog_unavailable`), а не молчаливый пустой буфер.
+  MCP-инструмент: `page.console`, capability `read`.
 - `scan` `{tabId, max_screens?:≤20}` → `{url,title,flags,scan,screens,unique[,scan_truncated]}` —
   автоскролл ленты с агрегацией уникальных интерактивных (П2-3): дедуп по
   сигнатуре строки, стоп после 3 экранов без роста или у дна ленты, жёсткие
@@ -110,7 +125,10 @@
 - `select` `{tabId,ref,value}` → `{url,title,flags}`
 - `scroll` `{tabId,dy}` / `scrollIntoView` `{tabId,ref}` → `{url,title,flags}`
 - `pressKey` `{tabId,key}` (`"Enter"`,`"Tab"`,`"Escape"`…) → `{url,title,flags}`
-- `hover` `{tabId,ref}` → `{url,title,flags}`
+- `hover` `{tabId,ref|text}` → `{url,title,flags}` — наведение без клика
+  (pointerover/mouseover/mousemove): раскрыть hover-меню/тултип. MCP-инструмент
+  `act.hover`: capability `interact` + pacing, gated-классификация ref/text —
+  как у `act.click`, авто-retry после STALE_REF общий (П1-3).
 - `getStateHash` `{tabId}` → `{url,dom_hash}` — для reconcile при resume
 - `fetchFile` `{tabId,url,name?}` → поток событий (§8); финальный res:
   `{transferId,size,sha256}` — res приходит ПОСЛЕ evt `file.end`.

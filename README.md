@@ -97,11 +97,12 @@ socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/b
 
 ## Использование
 
-- **Агенту** доступны 19 MCP-инструментов: `policy.status`,
+- **Агенту** доступен 21 MCP-инструмент: `policy.status`,
   `policy.request_preset`, `tab.list` / `tab.open` / `tab.close`,
   `page.snapshot` / `page.extract` / `page.find` / `page.screenshot` /
-  `page.wait_for` / `page.scan`, `act.click` / `act.type` / `act.select` /
-  `act.scroll` / `act.key` / `act.batch`, `file.download`, `net.list`
+  `page.wait_for` / `page.scan` / `page.console`, `act.click` / `act.hover` /
+  `act.type` / `act.select` / `act.scroll` / `act.key` / `act.batch`,
+  `file.download`, `net.list`
   (в Chromium недоступен — нет webRequest в MV3 service worker).
   У tab-инструментов опциональный параметр `browser` (`firefox`/`chromium`).
   Ответ каждого — `{ok, data|error_code, hint, policy_reminder}`.

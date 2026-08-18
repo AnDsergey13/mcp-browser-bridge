@@ -1,4 +1,4 @@
-// mcp.ts — 19 MCP-инструментов (фаза 7). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
+// mcp.ts — 21 MCP-инструмент (фаза 7 + act.hover/page.console). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
 // Здесь же общее состояние моста: реестр вкладок, кэш снапшотов (для классификатора
 // и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу.
 // Фаза 9 (D5, D6): мультиклиентность — реестры по ключу `clientId:tabId`,
@@ -38,9 +38,9 @@ interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash
 const REGISTRY_TTL_MS = 30 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
 
-const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for']);
+const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for', 'page.console']);
 // page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
-const ACT_TOOLS = new Set(['act.click', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
+const ACT_TOOLS = new Set(['act.click', 'act.hover', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
 
 function shortHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -427,11 +427,13 @@ export class BridgeCore {
 
   /** Категория одного act-действия (используется и для шагов act.batch). */
   private classifyAct(name: string, args: Record<string, unknown>, tabId: number, clientId: string): GatedCategory | null {
-    // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
-    if (name === 'act.click' && !args['ref'] && args['text']) {
+    // click/hover-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
+    // hover сам не сабмитит, но правило проекта едино: act-инструменты проходят
+    // classifyElement по той же схеме, что и click (без ослаблений).
+    if ((name === 'act.click' || name === 'act.hover') && !args['ref'] && args['text']) {
       return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
     }
-    if (name === 'act.click' || name === 'act.type' || name === 'act.select') {
+    if (name === 'act.click' || name === 'act.hover' || name === 'act.type' || name === 'act.select') {
       const ref = String(args['ref'] ?? '');
       const snap = this.snapshots.get(this.tabKey(clientId, tabId));
       return classifyElement(snap?.refs.get(ref));
@@ -638,9 +640,17 @@ export class BridgeCore {
         return this.pageCommand('screenshot', tabId, clientId!, {});
       case 'net.list':
         return this.transport.request(clientId!, 'netList', { tabId });
+      case 'page.console':
+        // Буфер живёт в content script (питается от MAIN-world хука) — команда
+        // идёт во вкладку, а не в background, в отличие от netList.
+        return this.pageCommand('consoleLog', tabId, clientId!, { limit: args['limit'] });
       case 'act.click': {
         if (!args['ref'] && !args['text']) throw new Error('act.click: нужен ref или text');
         return this.pageCommand('click', tabId, clientId!, { ref: args['ref'], text: args['text'] });
+      }
+      case 'act.hover': {
+        if (!args['ref'] && !args['text']) throw new Error('act.hover: нужен ref или text');
+        return this.pageCommand('hover', tabId, clientId!, { ref: args['ref'], text: args['text'] });
       }
       case 'act.type':
         return this.pageCommand('type', tabId, clientId!, { ref: args['ref'], text: args['text'], clear: args['clear'] });
@@ -754,8 +764,10 @@ export function buildMcpServer(core: BridgeCore): McpServer {
     ['page.wait_for', 'Событийное ожидание условия (без polling снапшотами): текст/ref/url появился или исчез. Таймаут — не ошибка: {condition_met:false}. Один активный wait на вкладку', { tabId, condition: z.object({ text: z.string().optional(), ref: z.string().optional(), url_contains: z.string().optional() }).describe('условие: text ИЛИ ref ИЛИ url_contains'), state: z.enum(['appear', 'disappear', 'stale']).optional(), timeout_ms: z.number().max(30000).optional(), browser }],
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
+    ['page.console', 'Кольцевой буфер console.*/onerror страницы (≤100 записей {ts,level,text}, text ≤500 символов) — диагностика «почему клик не сработал». MAIN-world хук; жёсткий CSP страницы может его запретить → честный маркер console_unavailable, а не молчаливый пустой буфер', { tabId, limit: z.number().max(100).optional(), browser }],
     ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
+    ['act.hover', 'Наведение на элемент без клика (ref из снапшота ИЛИ text): раскрыть hover-меню/тултип/подсказку. Gated-классификация — как у act.click', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
     ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional(), browser }],
     ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string(), browser }],
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],

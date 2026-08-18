@@ -1031,6 +1031,7 @@ const CONTENT_METHODS = new Set([
   "extractMarkdown",
   "findText",
   "getStateHash",
+  "consoleLog",
 ]);
 
 /**

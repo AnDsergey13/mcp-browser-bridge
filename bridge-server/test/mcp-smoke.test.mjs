@@ -17,7 +17,7 @@ function rpc(client, method, params, id) {
   return client.request({ jsonrpc: '2.0', id, method, params });
 }
 
-test('MCP stdio: initialize, tools/list (19 инструментов), tools/call policy.status', async (t) => {
+test('MCP stdio: initialize, tools/list (21 инструмент), tools/call policy.status', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-smoke-'));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(dir, 'memory'), { recursive: true });
@@ -80,10 +80,11 @@ test('MCP stdio: initialize, tools/list (19 инструментов), tools/cal
 
   const list = await rpc(client, 'tools/list', {}, 2);
   const names = list.result.tools.map((tool) => tool.name).sort();
-  assert.equal(names.length, 19, 'ровно 19 инструментов: ' + names.join(','));
+  assert.equal(names.length, 21, 'ровно 21 инструмент: ' + names.join(','));
   for (const expected of [
     'tab.list', 'tab.open', 'tab.close', 'page.snapshot', 'page.extract', 'page.find',
-    'page.screenshot', 'page.wait_for', 'page.scan', 'act.click', 'act.type', 'act.select', 'act.scroll', 'act.key',
+    'page.screenshot', 'page.wait_for', 'page.scan', 'page.console', 'act.click', 'act.hover',
+    'act.type', 'act.select', 'act.scroll', 'act.key',
     'act.batch', 'file.download', 'net.list', 'policy.status', 'policy.request_preset',
   ]) {
     assert.ok(names.includes(expected), `инструмент ${expected}`);

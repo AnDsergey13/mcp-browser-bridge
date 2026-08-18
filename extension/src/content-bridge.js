@@ -547,6 +547,59 @@
     return Object.assign(pageState(), { condition_met: met, waited_state: state });
   }
 
+  // ---------- page.console: кольцевой буфер записей MAIN-world хука ----------
+  // Content script в isolated world НЕ видит console.*/onerror страницы —
+  // записи присылает console-hook.js (MAIN world, web_accessible_resources)
+  // через window.postMessage с маркером __bridge_console. Модель «боковой
+  // линии» (как net.list): пассивный сбор, чтение по команде consoleLog.
+  // Буфер живёт в контексте документа → при полной навигации очищается сам.
+  const CONSOLE_CAP = 100; // кольцевой буфер, записей на вкладку
+  const CONSOLE_TEXT_MAX = 500; // обрезка text записи
+  const consoleEntries = [];
+  let consoleHookState = "pending"; // pending | ok | failed
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const d = event.data;
+    if (!d || d.__bridge_console !== true) return;
+    const level = ["log", "info", "warn", "error", "debug"].includes(d.level) ? d.level : "log";
+    const text = String(d.text == null ? "" : d.text).slice(0, CONSOLE_TEXT_MAX);
+    // Дедуп подряд идущих одинаковых — складываем в count (спам-защита поверх
+    // rate-limit хука: маркер может подделать сама страница, untrusted by design).
+    const last = consoleEntries[consoleEntries.length - 1];
+    if (last && last.level === level && last.text === text) {
+      last.count = (last.count || 1) + 1;
+      last.ts = Number(d.ts) || Date.now();
+      return;
+    }
+    consoleEntries.push({ ts: Number(d.ts) || Date.now(), level, text });
+    if (consoleEntries.length > CONSOLE_CAP) {
+      consoleEntries.splice(0, consoleEntries.length - CONSOLE_CAP);
+    }
+  });
+
+  // Инъекция хука — сразу при загрузке content script (document_idle): записи
+  // до инъекции теряются (честное ограничение, задокументировано в PROTOCOL.md).
+  // Страница с жёстким CSP может запретить загрузку расширенческого скрипта —
+  // тогда onerror и consoleLog отвечает маркером console_unavailable.
+  (function injectConsoleHook() {
+    try {
+      const s = document.createElement("script");
+      s.src = browser.runtime.getURL("src/console-hook.js");
+      s.onload = () => {
+        consoleHookState = "ok";
+        s.remove();
+      };
+      s.onerror = () => {
+        consoleHookState = "failed";
+        s.remove();
+      };
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {
+      consoleHookState = "failed";
+    }
+  })();
+
   // ---------- обработчики команд ----------
   const handlers = {
     // Опрос после навигации, инициированной background'ом или полной перезагрузкой.
@@ -674,12 +727,13 @@
     },
 
     async hover(params) {
-      const el = mustResolve(params.ref);
+      const el = resolveClickTarget(params); // ref или атомарный поиск по тексту (как click)
       el.scrollIntoView({ block: "center" });
       dispatchPointer(el, "pointerover");
       dispatchMouse(el, "mouseover");
       dispatchMouse(el, "mousemove");
-      return withAfter(pageState(), false);
+      await sleep(150); // дать JS-хендлерам hover раскрыть меню/тултип до after
+      return withAfter(pageState(), false, el);
     },
 
     async snapshot(params) {
@@ -715,6 +769,17 @@
     async scan(params) {
       const r = await B.snapshot.scan(params || {});
       return Object.assign(pageState(), r);
+    },
+
+    async consoleLog(params) {
+      const limit = Math.min(Math.max(Number(params && params.limit) || CONSOLE_CAP, 1), CONSOLE_CAP);
+      const out = Object.assign(pageState(), { entries: consoleEntries.slice(-limit) });
+      // CSP запретил MAIN-world хук — честный маркер деградации (как
+      // netlog_unavailable), а не молчаливый пустой буфер.
+      if (consoleHookState === "failed") {
+        out.console_unavailable = "MAIN-world хук не загрузился (CSP страницы?) — буфер не пишется";
+      }
+      return out;
     },
 
     async fetchFile(params) {
