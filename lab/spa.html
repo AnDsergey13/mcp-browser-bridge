@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: SPA-мутации и лента</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  button { margin: 0 .4em .4em 0; }
+  #status { padding: .6em; background: #ffe; min-height: 1.4em; }
+  #dyn-list li { margin: .2em 0; }
+  #feed { border: 1px solid #ccc; padding: .5em; }
+  #feed .item { padding: .5em; border-bottom: 1px solid #eee; }
+  #feed-loading { text-align: center; color: #888; padding: .5em; display: none; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>SPA: отложенные мутации + бесконечная лента</h1>
+<p><a href="index.html">← к полигону</a></p>
+
+<h2>Отложенные мутации (page.wait_for, STALE_REF, тихое окно)</h2>
+<div>
+  <!-- Контент появляется через 1.5 с: проверка page.wait_for(text) -->
+  <button id="btn-delayed" type="button">Показать статус через 1.5 с</button>
+  <!-- Элементы списка заменяются новыми узлами: старые ref → STALE_REF -->
+  <button id="btn-rerender" type="button">Перерисовать список</button>
+  <!-- Мутации каждые 300 мс в течение 10 с: DOM не «тихий» -->
+  <button id="btn-noisy" type="button">Шуметь 10 с</button>
+</div>
+<div id="status">Статус: ожидание.</div>
+<ul id="dyn-list">
+  <li><button type="button" class="dyn-item">Элемент 1</button></li>
+  <li><button type="button" class="dyn-item">Элемент 2</button></li>
+  <li><button type="button" class="dyn-item">Элемент 3</button></li>
+</ul>
+
+<h2>Бесконечная лента (page.scan)</h2>
+<div id="feed"></div>
+<div id="feed-loading">Загрузка…</div>
+
+<script>
+  var statusEl = document.getElementById('status');
+
+  document.getElementById('btn-delayed').addEventListener('click', function () {
+    statusEl.textContent = 'Статус: загружается…';
+    setTimeout(function () {
+      statusEl.textContent = 'Статус: данные получены (отложенная мутация).';
+    }, 1500);
+  });
+
+  var renderGen = 1;
+  document.getElementById('btn-rerender').addEventListener('click', function () {
+    renderGen++;
+    var ul = document.getElementById('dyn-list');
+    ul.innerHTML = '';
+    for (var i = 1; i <= 3; i++) {
+      var li = document.createElement('li');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'dyn-item';
+      b.textContent = 'Элемент ' + i + ' (генерация ' + renderGen + ')';
+      li.appendChild(b);
+      ul.appendChild(li);
+    }
+  });
+
+  var noisyTimer = null;
+  document.getElementById('btn-noisy').addEventListener('click', function () {
+    if (noisyTimer) return;
+    var ticks = 0;
+    noisyTimer = setInterval(function () {
+      ticks++;
+      statusEl.textContent = 'Шум: тик ' + ticks + ' / 33';
+      if (ticks >= 33) {
+        clearInterval(noisyTimer);
+        noisyTimer = null;
+        statusEl.textContent = 'Шум закончился, DOM тихий.';
+      }
+    }, 300);
+  });
+
+  // Бесконечная лента: подгрузка порции при приближении к низу страницы.
+  var feedEl = document.getElementById('feed');
+  var loadingEl = document.getElementById('feed-loading');
+  var feedCount = 0;
+  var feedBusy = false;
+
+  function feedAppend(batch) {
+    for (var i = 0; i < batch; i++) {
+      feedCount++;
+      var d = document.createElement('div');
+      d.className = 'item';
+      d.textContent = 'Запись ленты №' + feedCount;
+      feedEl.appendChild(d);
+    }
+  }
+
+  function feedMaybeLoad() {
+    if (feedBusy) return;
+    if (window.innerHeight + window.scrollY < document.body.offsetHeight - 300) return;
+    feedBusy = true;
+    loadingEl.style.display = 'block';
+    setTimeout(function () {
+      feedAppend(20);
+      loadingEl.style.display = 'none';
+      feedBusy = false;
+    }, 400);
+  }
+
+  feedAppend(20);
+  window.addEventListener('scroll', feedMaybeLoad);
+</script>
+</body>
+</html>

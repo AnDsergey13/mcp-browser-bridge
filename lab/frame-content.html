@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: содержимое фрейма</title>
+<style>body { font-family: sans-serif; padding: 1em; background: #f4f8ff; }</style>
+</head>
+<body>
+<h2>Я — содержимое iframe</h2>
+<p>Этот документ загружен внутрь frames.html (same-origin).</p>
+<button id="frame-btn" type="button"
+  onclick="document.getElementById('frame-msg').textContent = 'Кнопка фрейма нажата'">
+  Кнопка внутри iframe</button>
+<input id="frame-input" type="text" placeholder="Поле внутри iframe">
+<p id="frame-msg"></p>
+</body>
+</html>

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: API (fetch/XHR)</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  pre { background: #f4f4f4; padding: .8em; overflow: auto; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>fetch / XHR к локальному JSON</h1>
+<p><a href="index.html">← к полигону</a></p>
+<p>Запросы к <code>data.json</code> должны появляться в <code>net.list</code>.</p>
+
+<button id="btn-fetch" type="button">fetch data.json</button>
+<button id="btn-xhr" type="button">XHR data.json</button>
+<pre id="api-out">Запросов ещё не было.</pre>
+
+<script>
+  var out = document.getElementById('api-out');
+
+  document.getElementById('btn-fetch').addEventListener('click', function () {
+    out.textContent = 'fetch: загрузка…';
+    fetch('data.json')
+      .then(function (r) { return r.json(); })
+      .then(function (j) { out.textContent = 'fetch OK:\n' + JSON.stringify(j, null, 2); })
+      .catch(function (e) { out.textContent = 'fetch ошибка: ' + e; });
+  });
+
+  document.getElementById('btn-xhr').addEventListener('click', function () {
+    out.textContent = 'XHR: загрузка…';
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'data.json');
+    xhr.onload = function () {
+      out.textContent = 'XHR OK (' + xhr.status + '):\n' +
+        JSON.stringify(JSON.parse(xhr.responseText), null, 2);
+    };
+    xhr.onerror = function () { out.textContent = 'XHR ошибка'; };
+    xhr.send();
+  });
+</script>
+</body>
+</html>
