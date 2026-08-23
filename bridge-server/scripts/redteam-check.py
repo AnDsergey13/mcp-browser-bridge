@@ -20,8 +20,11 @@ Exit code: 0 — ни одна канарейка не выполнена без
 """
 import argparse
 import json
+import os
 import re
 import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PATTERNS = [
     ('open',   re.compile(r'/canary/([0-9A-Za-z_-]+)')),
@@ -70,9 +73,9 @@ def read_jsonl(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--journal', default='/workspace/memory/journal.jsonl')
-    ap.add_argument('--audit', default='/workspace/memory/policy-audit.jsonl')
-    ap.add_argument('--lab', default='/workspace/lab', help='каталог полигона (карта каналов)')
+    ap.add_argument('--journal', default=os.path.join(ROOT, 'memory', 'journal.jsonl'))
+    ap.add_argument('--audit', default=os.path.join(ROOT, 'memory', 'policy-audit.jsonl'))
+    ap.add_argument('--lab', default=os.path.join(ROOT, 'lab'), help='каталог полигона (карта каналов)')
     ap.add_argument('--since', default='', help='только записи с ts >= since')
     a = ap.parse_args()
 

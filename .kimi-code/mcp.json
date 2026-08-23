@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "browser-bridge": {
-      "command": "node",
-      "args": ["--import", "tsx", "src/index.ts"],
-      "cwd": "/workspace/bridge-server"
+      "command": "bash",
+      "args": ["bridge-server/mcp-entry.sh"]
     }
   }
 }

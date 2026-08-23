@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Transport } from './transport.ts';
 import { PolicyEngine, type Capability } from './policy.ts';
@@ -46,6 +46,14 @@ export interface BridgeHandle {
   close: () => Promise<void>;
 }
 
+/**
+ * Корень репозитория (…/mcp-browser-bridge): все дефолтные пути данных
+ * (сокет, секрет, policy.yaml, memory/, downloads/) считаются от него, так
+ * что сервер работает из любого расположения репо без переменных окружения.
+ * BRIDGE_* env остаются как оверрайды.
+ */
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
 /** Секрет: читаем или генерируем при первом запуске (0600, печатаем в лог). */
 export function loadOrCreateSecret(secretPath: string, log: (msg: string) => void): string {
   try {
@@ -62,10 +70,10 @@ export function loadOrCreateSecret(secretPath: string, log: (msg: string) => voi
 
 export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandle> {
   const log = opts.log ?? ((msg: string) => console.error(`[bridge] ${msg}`));
-  const policyPath = opts.policyPath ?? process.env.BRIDGE_POLICY_PATH ?? '/workspace/policy.yaml';
-  const memoryDir = opts.memoryDir ?? process.env.BRIDGE_MEMORY_DIR ?? '/workspace/memory';
-  const downloadsDir = opts.downloadsDir ?? process.env.BRIDGE_DOWNLOADS_DIR ?? '/workspace/downloads';
-  const secretPath = opts.secretPath ?? process.env.BRIDGE_SECRET_PATH ?? '/workspace/.bridge/secret';
+  const policyPath = opts.policyPath ?? process.env.BRIDGE_POLICY_PATH ?? path.join(REPO_ROOT, 'policy.yaml');
+  const memoryDir = opts.memoryDir ?? process.env.BRIDGE_MEMORY_DIR ?? path.join(REPO_ROOT, 'memory');
+  const downloadsDir = opts.downloadsDir ?? process.env.BRIDGE_DOWNLOADS_DIR ?? path.join(REPO_ROOT, 'downloads');
+  const secretPath = opts.secretPath ?? process.env.BRIDGE_SECRET_PATH ?? path.join(REPO_ROOT, '.bridge', 'secret');
 
   const secret = loadOrCreateSecret(secretPath, log);
 
@@ -137,10 +145,11 @@ export async function startBridge(opts: BridgeOptions = {}): Promise<BridgeHandl
     opts.port ?? numEnv('BRIDGE_PORT', 18_777),
     opts.host ?? process.env.BRIDGE_HOST ?? '0.0.0.0',
   );
-  // Unix-сокет в общей bind-mount папке: хост подключается к нему напрямую,
-  // минуя сетевую изоляцию rootless podman (BRIDGE_UNIX_SOCKET=0 отключает).
+  // Unix-сокет в общей bind-mount папке репо: хост подключается к нему
+  // напрямую, минуя сетевую изоляцию rootless podman (BRIDGE_UNIX_SOCKET=0
+  // отключает). По умолчанию — <repo>/.bridge/bridge.sock.
   const envSock = process.env.BRIDGE_UNIX_SOCKET;
-  const unixSocket = opts.unixSocket ?? (envSock === '0' ? false : envSock ?? '/workspace/.bridge/bridge.sock');
+  const unixSocket = opts.unixSocket ?? (envSock === '0' ? false : envSock ?? path.join(REPO_ROOT, '.bridge', 'bridge.sock'));
   if (unixSocket) await transport.listenUnix(unixSocket);
   log(`готов: WS порт ${port}, пресет "${policy.activePreset()}", session ${transport.sessionId}`);
 
@@ -199,7 +208,7 @@ if (isMain) {
   // Боевой запуск (MCP-сервер Kimi Code): файл-REPL включён по умолчанию,
   // чтобы scripts/*.py работали через тот же процесс (BRIDGE_FILE_REPL=0 —
   // отключить, или путь к cmd.json).
-  startBridge({ fileRepl: process.env.BRIDGE_FILE_REPL ?? '/workspace/.bridge/cmd.json' }).catch((err) => {
+  startBridge({ fileRepl: process.env.BRIDGE_FILE_REPL ?? path.join(REPO_ROOT, '.bridge', 'cmd.json') }).catch((err) => {
     console.error(`[bridge] fatal: ${(err as Error).stack ?? err}`);
     process.exit(1);
   });

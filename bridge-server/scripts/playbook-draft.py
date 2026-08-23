@@ -13,8 +13,11 @@ memory/domains/<domain>.md попадает после проверки, не а
 import argparse
 import collections
 import json
+import os
 import sys
 import urllib.parse
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SKIP_TOOLS = {'policy.status'}  # служебные вызовы в плейбуке не нужны
 
@@ -32,7 +35,7 @@ def fmt_args(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('journal', nargs='?', default='/workspace/memory/journal.jsonl')
+    ap.add_argument('journal', nargs='?', default=os.path.join(ROOT, 'memory', 'journal.jsonl'))
     ap.add_argument('--domain', help='только этот домен (host из url записи)')
     ap.add_argument('--last', type=int, default=50, help='последние N успешных вызовов на домен')
     a = ap.parse_args()

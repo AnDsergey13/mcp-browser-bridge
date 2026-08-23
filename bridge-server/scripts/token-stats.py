@@ -7,17 +7,20 @@ journal пишет bytes аргументов/результатов каждо�
 Использование:
   token-stats.py [journal.jsonl] [--since 2026-08-15] [--top N]
 
-По умолчанию читает /workspace/memory/journal.jsonl.
+По умолчанию читает <repo>/memory/journal.jsonl.
 """
 import argparse
 import collections
 import json
+import os
 import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('journal', nargs='?', default='/workspace/memory/journal.jsonl')
+    ap.add_argument('journal', nargs='?', default=os.path.join(ROOT, 'memory', 'journal.jsonl'))
     ap.add_argument('--since', help='ISO-дата/время: только записи новее (ts >= since)')
     ap.add_argument('--top', type=int, default=0, help='показать только топ-N инструментов по bytes')
     a = ap.parse_args()

@@ -1,8 +1,9 @@
 #!/bin/bash
 # Вызов инструмента моста через файл-REPL. Аргументы: JSON команды, таймаут ожидания (с).
 set -e
-CMD=/workspace/.bridge/cmd.json
-RES=/workspace/.bridge/result.json
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+CMD="$ROOT/.bridge/cmd.json"
+RES="$ROOT/.bridge/result.json"
 WAIT="${2:-6}"
 before=$(stat -c '%Y' "$RES" 2>/dev/null || echo 0)
 echo "$1" > "$CMD"

@@ -2,8 +2,9 @@
 """bisect-extract.py — бисекция page.extract по прямым детям <main> (поиск «ядовитого» узла)."""
 import json, os, time, sys
 
-CMD = '/workspace/.bridge/cmd.json'
-RES = '/workspace/.bridge/result.json'
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CMD = os.path.join(ROOT, '.bridge', 'cmd.json')
+RES = os.path.join(ROOT, '.bridge', 'result.json')
 
 def bridge(tool, args, wait=60):
     before = os.path.getmtime(RES) if os.path.exists(RES) else 0
