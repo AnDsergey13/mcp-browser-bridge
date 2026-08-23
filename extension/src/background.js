@@ -1,4 +1,4 @@
-/* global browser, WebSocket, BridgeInjector, BridgeOwners, BridgeConfig, BridgeKeepalive */
+/* global browser, WebSocket, BridgeInjector, BridgeOwners, BridgeConfig, BridgeKeepalive, BridgeFileRelay */
 "use strict";
 
 /**
@@ -25,10 +25,9 @@
 const REQ_TIMEOUT_MS = 30000; // таймаут res на req (§1)
 const NAV_TIMEOUT_MS = 10000; // ожидание загрузки вкладки
 const POST_NAV_TIMEOUT_MS = 15000; // ожидание «тихого окна» в content script (+ запас)
-const FETCHFILE_TIMEOUT_MS = 10 * 60 * 1000; // релей большого файла
 const CLICK_CMD_TIMEOUT_MS = 20000; // 2 c nav-watch + тихое окно + after в контенте
 const CLICK_RECOVERY_TIMEOUT_MS = 12000; // сторожевой таймаут восстановления после смерти контекста
-const ACK_BG_TIMEOUT_MS = 20000; // страховка поверх контентных 15 с на file.ack
+const ACK_BG_TIMEOUT_MS = 20000; // таймаут file.ack на чанк файлового релея (§8)
 const JOURNAL_LIMIT = 20;
 const NOTIF_PREFIX = "bridge-session-"; // id уведомления = NOTIF_PREFIX + label
 
@@ -375,40 +374,25 @@ function createServerConnection(cfg) {
     browser.notifications.clear(notifId).catch(() => {});
   }
 
-  // ---------- файловый релей (content script → сервер) ----------
-  function handleFileRelay(msg) {
-    const data = msg.data || {};
-    if (msg.sub === "start") {
-      sendEvt("file.start", data);
-      return Promise.resolve({ ok: true });
-    }
-    if (msg.sub === "end") {
-      sendEvt("file.end", data);
-      return Promise.resolve({ ok: true });
-    }
-    if (msg.sub === "abort") {
-      sendEvt("file.abort", data);
-      return Promise.resolve({ ok: true });
-    }
-    if (msg.sub === "chunk") {
-      // Держим ответ content script'у до file.ack от сервера (backpressure, §8).
-      return new Promise((resolve) => {
-        const key = data.transferId + ":" + data.seq;
-        const timer = setTimeout(() => {
-          ackWaiters.delete(key);
-          resolve({ ok: false, error: "ACK_TIMEOUT" });
-        }, ACK_BG_TIMEOUT_MS);
-        ackWaiters.set(key, { resolve, timer });
-        try {
-          rawSend({ type: "evt", event: "file.chunk", data });
-        } catch (e) {
-          ackWaiters.delete(key);
-          clearTimeout(timer);
-          resolve({ ok: false, error: e.code || "BROWSER_OFFLINE" });
-        }
-      });
-    }
-    return Promise.resolve({ ok: false, error: "unknown sub" });
+  // ---------- файловый релей: file.chunk с backpressure (§8) ----------
+  // fetch и стриминг — в background (file-relay.js); сюда попадает только
+  // отправка чанка с ожиданием file.ack от сервера.
+  function sendFileChunk(data) {
+    return new Promise((resolve) => {
+      const key = data.transferId + ":" + data.seq;
+      const timer = setTimeout(() => {
+        ackWaiters.delete(key);
+        resolve({ ok: false, error: "ACK_TIMEOUT" });
+      }, ACK_BG_TIMEOUT_MS);
+      ackWaiters.set(key, { resolve, timer });
+      try {
+        rawSend({ type: "evt", event: "file.chunk", data });
+      } catch (e) {
+        ackWaiters.delete(key);
+        clearTimeout(timer);
+        resolve({ ok: false, error: e.code || "BROWSER_OFFLINE" });
+      }
+    });
   }
 
   // ---------- роутер серверных req (с проверкой владения вкладками, D11) ----------
@@ -630,7 +614,7 @@ function createServerConnection(cfg) {
     denySession,
     sendReq,
     sendEvt,
-    handleFileRelay,
+    sendFileChunk,
   };
   return conn;
 }
@@ -665,7 +649,10 @@ function matchPatternToRegExp(pattern) {
     hostRe = host.split("*").map(escapeRe).join("[^/]*");
   }
   const pathRe = m[3].split("*").map(escapeRe).join(".*");
-  return new RegExp("^" + scheme + "://" + hostRe + pathRe + "$");
+  // В проверяемом URL может быть явный порт (match patterns его не несут —
+  // MDN), поэтому порт допускаем опционально, иначе "*://127.0.0.1/*"
+  // не матчит "http://127.0.0.1:8077/".
+  return new RegExp("^" + scheme + "://" + hostRe + "(?::\\d+)?" + pathRe + "$");
 }
 
 function urlMatchesPolicy(patterns, url) {
@@ -991,16 +978,25 @@ async function screenshotCommand(params) {
   return { data_jpeg_base64: base64 };
 }
 
+// fetchFile: fetch и стриминг — в BACKGROUND (не в content script): background
+// с host-правами <all_urls> не связан CORS страницы — cross-origin редиректы
+// на CDN (xet/LFS) проходят (живой кейс HF, 2026-08). tabId по-прежнему нужен:
+// assertTabDomain + Referer/Origin из URL вкладки (file-relay.js). res уходит
+// СРАЗУ после HTTP-заголовков — серверный transport-timeout 120 c покрывает
+// только старт; дальше трансфер живёт на file.chunk/file.ack → file.end.
 async function fetchFileCommand(conn, params) {
   await assertTabDomain(conn.policyPatterns, params.tabId);
+  const tab = await getTab(params.tabId);
   const transferId = conn.nextTransferId();
-  const st = await sendCmdToTab(
-    params.tabId,
-    "fetchFile",
-    { url: params.url, name: params.name, transferId },
-    FETCHFILE_TIMEOUT_MS
+  return BridgeFileRelay.start(
+    { url: params.url, name: params.name, transferId, referer: tab.url || "" },
+    {
+      sendStart: (d) => conn.sendEvt("file.start", d),
+      sendChunk: (d) => conn.sendFileChunk(d), // Promise file.ack — backpressure
+      sendEnd: (d) => conn.sendEvt("file.end", d),
+      sendAbort: (d) => conn.sendEvt("file.abort", d),
+    }
   );
-  return { transferId, size: st.size, sha256: st.sha256 };
 }
 
 // consent.ask: баннер рисует content script; нет скрипта (challenge-страница) → deny.
@@ -1031,6 +1027,7 @@ const CONTENT_METHODS = new Set([
   "extractMarkdown",
   "findText",
   "getStateHash",
+  "consoleLog",
 ]);
 
 /**
@@ -1248,20 +1245,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       syncAutoPaused();
     }
     return undefined;
-  }
-
-  if (msg.kind === "file") {
-    // Файловый релей — через подключение-владелец вкладки (D11). При одиночном
-    // подключении владельца может ещё не быть — берём единственное.
-    const tabId = sender.tab ? sender.tab.id : 0;
-    const owner = tabId ? BridgeOwners.ownerOf(tabId) : null;
-    const c = owner
-      ? findConn(owner)
-      : connections.length === 1
-        ? connections[0]
-        : null;
-    if (!c) return Promise.resolve({ ok: false, error: "TAB_NOT_OWNED" });
-    return c.handleFileRelay(msg); // Promise → ответ content script'у
   }
 
   if (msg.kind === "popup") {

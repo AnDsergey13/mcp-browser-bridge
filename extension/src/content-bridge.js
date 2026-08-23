@@ -5,7 +5,9 @@
  * content-bridge.js — исполнитель команд страницы.
  * Получает от background сообщения {kind:"cmd", method, params},
  * отвечает {ok:true, result} | {ok:false, error:{code,message}}.
- * События (pause.auto, file.*) шлёт в background через runtime.sendMessage.
+ * События (pause.auto) шлёт в background через runtime.sendMessage.
+ * Файлового релея здесь больше нет: fetchFile исполняется в background
+ * (file-relay.js) — CORS-редиректы на CDN и потребление памяти вкладкой.
  * Общие модули: window.__BRIDGE__.snapshot / .refs (snapshot.js),
  * window.__BRIDGE__.showConsent (consent-banner.js).
  */
@@ -16,8 +18,6 @@
 
   const QUIET_MS = 500; // «тихое окно»: столько без DOM-мутаций (N9)
   const QUIET_TIMEOUT_MS = 10000; // общий таймаут тихого окна
-  const CHUNK_SIZE = 256 * 1024; // чанк файлового релея (§8)
-  const ACK_TIMEOUT_MS = 15000; // таймаут file.ack на чанк
   const CONSENT_HOST_ID = "__bridge-consent-host";
 
   // ---------- ошибки с кодом протокола ----------
@@ -328,7 +328,7 @@
     else el.value = value;
   }
 
-  // ---------- sha256 ----------
+  // ---------- sha256 (dom_hash) ----------
   async function sha256Hex(bytes) {
     if (typeof crypto !== "undefined" && crypto.subtle) {
       const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -343,110 +343,6 @@
   async function sha256Short(str) {
     const hex = await sha256Hex(new TextEncoder().encode(str));
     return hex.slice(0, 16);
-  }
-
-  // ---------- файловый релей (§8) ----------
-  function u8ToBase64(bytes) {
-    let bin = "";
-    const SLICE = 0x8000; // fromCharCode.apply не переживает большие spread'ы
-    for (let i = 0; i < bytes.length; i += SLICE) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + SLICE));
-    }
-    return btoa(bin);
-  }
-
-  function sendFileMsg(sub, data) {
-    return browser.runtime.sendMessage({ kind: "file", sub, data });
-  }
-
-  async function fetchFileRelay(params) {
-    const transferId = params.transferId;
-    let resp;
-    try {
-      resp = await fetch(params.url, { credentials: "include" });
-    } catch (e) {
-      await sendFileMsg("abort", { transferId, reason: "network: " + e.message }).catch(() => {});
-      throw cerr("FETCH_FAILED", "fetch failed: " + e.message);
-    }
-    if (!resp.ok || !resp.body) {
-      await sendFileMsg("abort", { transferId, reason: "http_" + resp.status }).catch(() => {});
-      throw cerr("FETCH_FAILED", "HTTP " + resp.status);
-    }
-
-    const mime = resp.headers.get("content-type") || "application/octet-stream";
-    const sizeHdr = Number(resp.headers.get("content-length")) || 0;
-    const fname =
-      params.name ||
-      decodeURIComponent((params.url.split("/").pop() || "file").split("?")[0]) ||
-      "file";
-    await sendFileMsg("start", {
-      transferId,
-      name: fname,
-      size: sizeHdr || undefined,
-      mime,
-    });
-
-    const reader = resp.body.getReader();
-    const parts = [];
-    let total = 0;
-    let seq = 0;
-    let buf = new Uint8Array(0);
-
-    async function emitChunk(bytes) {
-      const ack = await Promise.race([
-        sendFileMsg("chunk", { transferId, seq, data_base64: u8ToBase64(bytes) }),
-        sleep(ACK_TIMEOUT_MS).then(() => ({ ok: false, error: "ACK_TIMEOUT" })),
-      ]);
-      if (!ack || !ack.ok) {
-        throw cerr("FETCH_FAILED", "file.ack не получен: " + ((ack && ack.error) || "нет ответа"));
-      }
-      seq++;
-    }
-
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (value && value.length) {
-          const merged = new Uint8Array(buf.length + value.length);
-          merged.set(buf, 0);
-          merged.set(value, buf.length);
-          buf = merged;
-          while (buf.length >= CHUNK_SIZE) {
-            const chunkBytes = buf.slice(0, CHUNK_SIZE);
-            buf = buf.slice(CHUNK_SIZE);
-            parts.push(chunkBytes);
-            total += chunkBytes.length;
-            await emitChunk(chunkBytes); // backpressure: ждём file.ack (§8)
-          }
-        }
-        if (done) break;
-      }
-      if (buf.length) {
-        parts.push(buf);
-        total += buf.length;
-        await emitChunk(buf);
-      }
-    } catch (e) {
-      try {
-        await reader.cancel();
-      } catch (_) {}
-      await sendFileMsg("abort", { transferId, reason: String((e && e.message) || e) }).catch(
-        () => {}
-      );
-      if (e && e.code) throw e;
-      throw cerr("FETCH_FAILED", String((e && e.message) || e));
-    }
-
-    // Склейка в память для sha256 — ограничение MVP (очень большие файлы).
-    const whole = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      whole.set(p, off);
-      off += p.length;
-    }
-    const sha256 = await sha256Hex(whole);
-    await sendFileMsg("end", { transferId, sha256 });
-    return { size: total, sha256 };
   }
 
   // ---------- pressKey ----------
@@ -546,6 +442,59 @@
     const met = await wait;
     return Object.assign(pageState(), { condition_met: met, waited_state: state });
   }
+
+  // ---------- page.console: кольцевой буфер записей MAIN-world хука ----------
+  // Content script в isolated world НЕ видит console.*/onerror страницы —
+  // записи присылает console-hook.js (MAIN world, web_accessible_resources)
+  // через window.postMessage с маркером __bridge_console. Модель «боковой
+  // линии» (как net.list): пассивный сбор, чтение по команде consoleLog.
+  // Буфер живёт в контексте документа → при полной навигации очищается сам.
+  const CONSOLE_CAP = 100; // кольцевой буфер, записей на вкладку
+  const CONSOLE_TEXT_MAX = 500; // обрезка text записи
+  const consoleEntries = [];
+  let consoleHookState = "pending"; // pending | ok | failed
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const d = event.data;
+    if (!d || d.__bridge_console !== true) return;
+    const level = ["log", "info", "warn", "error", "debug"].includes(d.level) ? d.level : "log";
+    const text = String(d.text == null ? "" : d.text).slice(0, CONSOLE_TEXT_MAX);
+    // Дедуп подряд идущих одинаковых — складываем в count (спам-защита поверх
+    // rate-limit хука: маркер может подделать сама страница, untrusted by design).
+    const last = consoleEntries[consoleEntries.length - 1];
+    if (last && last.level === level && last.text === text) {
+      last.count = (last.count || 1) + 1;
+      last.ts = Number(d.ts) || Date.now();
+      return;
+    }
+    consoleEntries.push({ ts: Number(d.ts) || Date.now(), level, text });
+    if (consoleEntries.length > CONSOLE_CAP) {
+      consoleEntries.splice(0, consoleEntries.length - CONSOLE_CAP);
+    }
+  });
+
+  // Инъекция хука — сразу при загрузке content script (document_idle): записи
+  // до инъекции теряются (честное ограничение, задокументировано в PROTOCOL.md).
+  // Страница с жёстким CSP может запретить загрузку расширенческого скрипта —
+  // тогда onerror и consoleLog отвечает маркером console_unavailable.
+  (function injectConsoleHook() {
+    try {
+      const s = document.createElement("script");
+      s.src = browser.runtime.getURL("src/console-hook.js");
+      s.onload = () => {
+        consoleHookState = "ok";
+        s.remove();
+      };
+      s.onerror = () => {
+        consoleHookState = "failed";
+        s.remove();
+      };
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {
+      consoleHookState = "failed";
+    }
+  })();
 
   // ---------- обработчики команд ----------
   const handlers = {
@@ -674,12 +623,13 @@
     },
 
     async hover(params) {
-      const el = mustResolve(params.ref);
+      const el = resolveClickTarget(params); // ref или атомарный поиск по тексту (как click)
       el.scrollIntoView({ block: "center" });
       dispatchPointer(el, "pointerover");
       dispatchMouse(el, "mouseover");
       dispatchMouse(el, "mousemove");
-      return withAfter(pageState(), false);
+      await sleep(150); // дать JS-хендлерам hover раскрыть меню/тултип до after
+      return withAfter(pageState(), false, el);
     },
 
     async snapshot(params) {
@@ -717,8 +667,15 @@
       return Object.assign(pageState(), r);
     },
 
-    async fetchFile(params) {
-      return fetchFileRelay(params);
+    async consoleLog(params) {
+      const limit = Math.min(Math.max(Number(params && params.limit) || CONSOLE_CAP, 1), CONSOLE_CAP);
+      const out = Object.assign(pageState(), { entries: consoleEntries.slice(-limit) });
+      // CSP запретил MAIN-world хук — честный маркер деградации (как
+      // netlog_unavailable), а не молчаливый пустой буфер.
+      if (consoleHookState === "failed") {
+        out.console_unavailable = "MAIN-world хук не загрузился (CSP страницы?) — буфер не пишется";
+      }
+      return out;
     },
   };
 

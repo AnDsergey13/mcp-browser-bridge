@@ -2,7 +2,8 @@
  * importScripts'ом (без "type":"module" — так проще и поддерживается MV3).
  * Порядок важен: compat-browser.js первым (шим глобала `browser` поверх
  * chrome.*), далее чистые модули (config/owners/keepalive), injector,
- * background — последним (регистрирует слушатели синхронно, top-level). */
+ * sha256 + file-relay (файловый релей в background), background — последним
+ * (регистрирует слушатели синхронно, top-level). */
 "use strict";
 
 importScripts(
@@ -11,5 +12,7 @@ importScripts(
   "src/owners.js",
   "src/keepalive.js",
   "src/injector.js",
+  "src/sha256.js",
+  "src/file-relay.js",
   "src/background.js"
 );

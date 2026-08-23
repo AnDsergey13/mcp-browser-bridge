@@ -17,9 +17,10 @@ page.extract → markdown с инлайн-картинками ![alt](url) и м
 """
 import argparse, json, os, re, time, urllib.parse
 
-CMD = '/workspace/.bridge/cmd.json'
-RES = '/workspace/.bridge/result.json'
-DL = '/workspace/downloads'
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CMD = os.path.join(ROOT, '.bridge', 'cmd.json')
+RES = os.path.join(ROOT, '.bridge', 'result.json')
+DL = os.path.join(ROOT, 'downloads')
 
 
 def bridge(tool, args, wait=60):

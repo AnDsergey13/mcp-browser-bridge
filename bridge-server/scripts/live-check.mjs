@@ -1,6 +1,6 @@
 // live-check.mjs — живая проверка моста: поднимает сервер in-process,
 // ждёт подтверждения сессии расширением и прогоняет реальные инструменты
-// (tab.list, page.snapshot на localhost:8080, если открыт).
+// (tab.list, page.snapshot на localhost:18547, если открыт).
 // После проверки продолжает работать как обычный сервер.
 // Запуск: node --import tsx scripts/live-check.mjs
 import { startBridge } from '../src/index.ts';
@@ -38,12 +38,12 @@ const show = (name, payload) => {
 const tabs = await handle.core.callTool('tab.list', {});
 show('tab.list', tabs);
 
-const tab8080 = tabs.ok && tabs.data.tabs.find((t) => (t.url || '').includes('localhost:8080'));
-if (tab8080) {
-  const snap = await handle.core.callTool('page.snapshot', { tabId: tab8080.tabId });
-  show(`page.snapshot tabId=${tab8080.tabId}`, snap);
+const tab18547 = tabs.ok && tabs.data.tabs.find((t) => (t.url || '').includes('localhost:18547'));
+if (tab18547) {
+  const snap = await handle.core.callTool('page.snapshot', { tabId: tab18547.tabId });
+  show(`page.snapshot tabId=${tab18547.tabId}`, snap);
 } else {
-  log('вкладки localhost:8080 не нашёл — snapshot не прогонял');
+  log('вкладки localhost:18547 не нашёл — snapshot не прогонял');
 }
 
 log('проверка завершена, сервер продолжает работать');

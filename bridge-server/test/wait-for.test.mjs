@@ -51,7 +51,7 @@ test('wait_for: ref disappear (невалидный ref) → condition_met:true'
 
 test('wait_for: url_contains', async () => {
   const res = await handle.core.callTool('page.wait_for', {
-    tabId: 1, condition: { url_contains: 'localhost:8080' }, timeout_ms: 2000,
+    tabId: 1, condition: { url_contains: 'localhost:18547' }, timeout_ms: 2000,
   });
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.data.condition_met, true);

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: WebSocket</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  #ws-log { background: #f4f4f4; padding: .8em; min-height: 4em; white-space: pre-wrap; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>WebSocket к локальному echo</h1>
+<p><a href="index.html">← к полигону</a></p>
+<p>Подключается к <code>ws://localhost:18547/ws-echo</code>. Такого endpoint'а
+у <code>http.server</code> нет — страница обязана деградировать аккуратно:
+одна строка статуса, без спама в консоль.</p>
+
+<div>
+  <input id="ws-text" type="text" placeholder="Сообщение для echo">
+  <button id="ws-send" type="button">Отправить</button>
+</div>
+<h2>Лог</h2>
+<div id="ws-log"></div>
+
+<script>
+  var log = document.getElementById('ws-log');
+  var failed = false;
+
+  function logLine(s) {
+    log.textContent += s + '\n';
+  }
+
+  var ws;
+  try {
+    ws = new WebSocket('ws://localhost:18547/ws-echo');
+  } catch (e) {
+    failed = true;
+    logLine('WebSocket недоступен: ' + e.message);
+  }
+
+  if (!failed) {
+    ws.onopen = function () { logLine('Соединение открыто.'); };
+    ws.onmessage = function (ev) { logLine('echo: ' + ev.data); };
+    // onerror молчим в консоль — статус отразит onclose.
+    ws.onerror = function () {};
+    ws.onclose = function (ev) {
+      failed = true;
+      logLine('Соединение закрыто (code ' + ev.code + '). ' +
+        'Echo-endpoint на этом сервере отсутствует — ожидаемо для полигона.');
+    };
+  }
+
+  document.getElementById('ws-send').addEventListener('click', function () {
+    var text = document.getElementById('ws-text').value;
+    if (failed || !ws || ws.readyState !== WebSocket.OPEN) {
+      logLine('Не отправлено (нет соединения): ' + text);
+      return;
+    }
+    ws.send(text);
+    logLine('→ ' + text);
+  });
+</script>
+</body>
+</html>

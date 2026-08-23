@@ -1,4 +1,4 @@
-// mcp.ts — 19 MCP-инструментов (фаза 7). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
+// mcp.ts — 21 MCP-инструмент (фаза 7 + act.hover/page.console). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
 // Здесь же общее состояние моста: реестр вкладок, кэш снапшотов (для классификатора
 // и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу.
 // Фаза 9 (D5, D6): мультиклиентность — реестры по ключу `clientId:tabId`,
@@ -13,7 +13,7 @@ import { classifyUrl, classifyElement, parseSnapshotRefs, type ElementMeta } fro
 import { Pacing, PacingLimitError } from './pacing.ts';
 import { capResponse } from './compress.ts';
 import { MemoryStore } from './memory.ts';
-import { DownloadRelay } from './downloads.ts';
+import { DownloadRelay, type TransferProgress } from './downloads.ts';
 
 export interface ToolPayload {
   ok: boolean;
@@ -24,15 +24,23 @@ export interface ToolPayload {
 }
 
 // Запись реестра вкладок: tabId — число браузера (как в wire), clientId — владелец (D5).
-interface TabInfo { tabId: number; url: string; title: string; clientId: string }
+// ts — последнее обновление записи; нужен TTL-вытеснению (фаза 8).
+interface TabInfo { tabId: number; url: string; title: string; clientId: string; ts: number }
 // П0-3: scopeKey = scope|selector — без него снапшот scope:"full" после
 // scope:"viewport" при совпадающем dom_hash дал бы ложный unchanged.
-interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string }
+interface CachedSnapshot { text: string; dom_hash: string; refs: Map<string, ElementMeta>; url: string; scopeKey: string; ts: number }
 interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash: string | null } }
 
-const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for']);
+// Фаза 8 (REPO-ANALYSIS §4.5): события tab.closed от расширения в протоколе нет,
+// поэтому записи о вкладках, закрытых в браузере вручную, вытесняются двумя
+// механизмами: reconcile в tab.list (см. execute) + TTL-зачистка старых записей
+// (страховка на случай, если tab.list больше не зовут — напр. браузер офлайн).
+const REGISTRY_TTL_MS = 30 * 60_000;
+const SWEEP_INTERVAL_MS = 60_000;
+
+const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for', 'page.console']);
 // page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
-const ACT_TOOLS = new Set(['act.click', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
+const ACT_TOOLS = new Set(['act.click', 'act.hover', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
 
 function shortHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -58,6 +66,7 @@ export class BridgeCore {
   // П0-1: состояние версионирования policy_reminder.
   private reminderCounter = 0;
   private lastReminderHash: string | null = null;
+  private sweepTimer: NodeJS.Timeout;
 
   constructor(deps: {
     transport: Transport;
@@ -75,6 +84,23 @@ export class BridgeCore {
     this.downloads = deps.downloads;
     this.consentTimeoutMs = deps.consentTimeoutMs ?? 120_000;
     this.log = deps.log ?? (() => {});
+    // TTL-зачистка реестров (фаза 8). unref — таймер не держит процесс.
+    this.sweepTimer = setInterval(() => this.sweepExpired(), SWEEP_INTERVAL_MS);
+    this.sweepTimer.unref();
+  }
+
+  /**
+   * Вытеснение записей старше REGISTRY_TTL_MS из реестра вкладок и кэша
+   * снапшотов (вкладки, закрытые в браузере вручную/на офлайн-клиенте).
+   * Публичный метод: тесты вызывают его с «будущим» now, не дожидаясь TTL.
+   */
+  sweepExpired(now: number = Date.now()): void {
+    for (const [key, t] of this.tabs) if (now - t.ts > REGISTRY_TTL_MS) this.tabs.delete(key);
+    for (const [key, s] of this.snapshots) if (now - s.ts > REGISTRY_TTL_MS) this.snapshots.delete(key);
+  }
+
+  close(): void {
+    clearInterval(this.sweepTimer);
   }
 
   private tabKey(clientId: string, tabId: number): string {
@@ -221,8 +247,8 @@ export class BridgeCore {
     return { preset: full['preset'], domain: domain?.['key'] ?? null, reminder_version: hash };
   }
 
-  /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. */
-  async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean }): Promise<ToolPayload> {
+  /** Главный конвейер исполнения инструмента. opts.uncap — файл-REPL (скрипты): ответ идёт на диск, мимо модели, резка N7 бессмысленна. opts.onProgress — прогресс file.download (П.5: MCP notifications/progress). */
+  async callTool(name: string, args: Record<string, unknown>, opts?: { uncap?: boolean; onProgress?: TransferProgress }): Promise<ToolPayload> {
     const tabId = typeof args['tabId'] === 'number' ? (args['tabId'] as number) : null;
     const browserArg = typeof args['browser'] === 'string' && args['browser'] !== '' ? args['browser'] as string : undefined;
     // Целевой клиент после резолва (шаг 1) — нужен finish для маскировки паролей в журнале.
@@ -331,7 +357,7 @@ export class BridgeCore {
       // 9. Исполнение (с одноразовым авто-retry после STALE_REF — П1-3).
       let data: unknown;
       try {
-        data = await this.execute(name, args, tabId, clientId);
+        data = await this.execute(name, args, tabId, clientId, opts?.onProgress);
       } catch (err) {
         data = await this.retryAfterStaleRef(name, args, tabId, clientId, err);
       }
@@ -401,11 +427,13 @@ export class BridgeCore {
 
   /** Категория одного act-действия (используется и для шагов act.batch). */
   private classifyAct(name: string, args: Record<string, unknown>, tabId: number, clientId: string): GatedCategory | null {
-    // click-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
-    if (name === 'act.click' && !args['ref'] && args['text']) {
+    // click/hover-by-text: элемента в снапшоте нет — классифицируем по самому тексту запроса.
+    // hover сам не сабмитит, но правило проекта едино: act-инструменты проходят
+    // classifyElement по той же схеме, что и click (без ослаблений).
+    if ((name === 'act.click' || name === 'act.hover') && !args['ref'] && args['text']) {
       return classifyElement({ ref: '', role: 'button', text: String(args['text']), href: null, attrs: {} });
     }
-    if (name === 'act.click' || name === 'act.type' || name === 'act.select') {
+    if (name === 'act.click' || name === 'act.hover' || name === 'act.type' || name === 'act.select') {
       const ref = String(args['ref'] ?? '');
       const snap = this.snapshots.get(this.tabKey(clientId, tabId));
       return classifyElement(snap?.refs.get(ref));
@@ -505,7 +533,7 @@ export class BridgeCore {
     if (typeof res.snapshot !== 'string') throw err;
     const refs = parseSnapshotRefs(res.snapshot);
     this.snapshots.set(key, {
-      text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|',
+      text: res.snapshot, dom_hash: shortHash(res.snapshot), refs, url: res.url ?? '', scopeKey: '|', ts: Date.now(),
     });
 
     let candidates = [...refs.values()].filter((m) => m.text === meta.text);
@@ -532,21 +560,32 @@ export class BridgeCore {
     return data;
   }
 
-  private async execute(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null): Promise<unknown> {
+  private async execute(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, onProgress?: TransferProgress): Promise<unknown> {
     switch (name) {
       case 'tab.list': {
         // Опрос всех active-клиентов (D5): вкладки объединяются, каждая
         // тегируется browser. hidden_tabs — по политике браузера-владельца.
         const visible: Record<string, unknown>[] = [];
         let hidden = 0;
+        const now = Date.now();
         for (const c of this.transport.listClients()) {
           if (c.state !== 'active') continue;
           const res = await this.transport.request(c.id, 'tab.list', {}) as { tabs?: { tabId: number; url: string; title: string; active?: boolean }[] };
+          // Reconcile (фаза 8): записи вкладок ЭТОГО браузера, которые он
+          // больше не сообщает (закрыты вручную), удаляем вместе с кэшем
+          // снапшотов — иначе реестры растут до перезапуска (§4.5).
+          const alive = new Set((res.tabs ?? []).map((t) => this.tabKey(c.id, t.tabId)));
+          for (const [key, info] of this.tabs) {
+            if (info.clientId === c.id && !alive.has(key)) {
+              this.tabs.delete(key);
+              this.snapshots.delete(key);
+            }
+          }
           for (const t of res.tabs ?? []) {
             // N15/default-deny: агенту видны только вкладки с грантованных доменов;
             // чужие вкладки не раскрываем (ни URL, ни title) — только их количество.
             if (this.policy.check(t.url, 'read', null, c.id).decision === 'allow') {
-              this.tabs.set(this.tabKey(c.id, t.tabId), { tabId: t.tabId, url: t.url, title: t.title, clientId: c.id });
+              this.tabs.set(this.tabKey(c.id, t.tabId), { tabId: t.tabId, url: t.url, title: t.title, clientId: c.id, ts: now });
               visible.push({ ...t, browser: c.id });
             } else {
               hidden++;
@@ -559,11 +598,11 @@ export class BridgeCore {
         // С tabId — навигация существующей вкладки (без новой); без — tabs.create.
         if (tabId !== null) {
           const res = await this.transport.request(clientId!, 'navigate', { tabId, url: args['url'] }) as { url?: string; title?: string };
-          if (res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
+          if (res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId!, ts: Date.now() });
           return { tabId, ...res };
         }
         const res = await this.transport.request(clientId!, 'tab.open', { url: args['url'], active: args['active'] }) as { tabId: number; url: string; title: string };
-        this.tabs.set(this.tabKey(clientId!, res.tabId), { tabId: res.tabId, url: res.url, title: res.title, clientId: clientId! });
+        this.tabs.set(this.tabKey(clientId!, res.tabId), { tabId: res.tabId, url: res.url, title: res.title, clientId: clientId!, ts: Date.now() });
         return res;
       }
       case 'tab.close': {
@@ -585,11 +624,12 @@ export class BridgeCore {
           // П0-3: страница не изменилась — компактный ответ вместо полного текста.
           // Кэш НЕ затираем: refs из него остаются валидными для act.*.
           if (cached && cached.dom_hash === domHash && cached.scopeKey === scopeKey) {
+            cached.ts = Date.now(); // живое использование — TTL-зачистка не трогает
             return { unchanged: true, dom_hash: domHash, url: res.url ?? cached.url };
           }
-          this.snapshots.set(key, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey });
+          this.snapshots.set(key, { text: res.snapshot, dom_hash: domHash, refs: parseSnapshotRefs(res.snapshot), url: res.url ?? '', scopeKey, ts: Date.now() });
         }
-        if (tabId !== null && res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId! });
+        if (tabId !== null && res.url) this.tabs.set(this.tabKey(clientId!, tabId), { tabId, url: res.url, title: res.title ?? '', clientId: clientId!, ts: Date.now() });
         return res;
       }
       case 'page.extract':
@@ -600,9 +640,17 @@ export class BridgeCore {
         return this.pageCommand('screenshot', tabId, clientId!, {});
       case 'net.list':
         return this.transport.request(clientId!, 'netList', { tabId });
+      case 'page.console':
+        // Буфер живёт в content script (питается от MAIN-world хука) — команда
+        // идёт во вкладку, а не в background, в отличие от netList.
+        return this.pageCommand('consoleLog', tabId, clientId!, { limit: args['limit'] });
       case 'act.click': {
         if (!args['ref'] && !args['text']) throw new Error('act.click: нужен ref или text');
         return this.pageCommand('click', tabId, clientId!, { ref: args['ref'], text: args['text'] });
+      }
+      case 'act.hover': {
+        if (!args['ref'] && !args['text']) throw new Error('act.hover: нужен ref или text');
+        return this.pageCommand('hover', tabId, clientId!, { ref: args['ref'], text: args['text'] });
       }
       case 'act.type':
         return this.pageCommand('type', tabId, clientId!, { ref: args['ref'], text: args['text'], clear: args['clear'] });
@@ -627,7 +675,7 @@ export class BridgeCore {
         // П2-3: контентный дедлайн 45 с — транспортный таймаут больше.
         return this.pageCommand('scan', tabId, clientId!, { max_screens: args['max_screens'] }, 55000);
       case 'file.download':
-        return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined);
+        return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined, onProgress);
       default:
         throw new BridgeError('INTERNAL', `неизвестный инструмент: ${name}`);
     }
@@ -682,25 +730,60 @@ export class BridgeCore {
   private async pageCommand(method: string, tabId: number | null, clientId: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
     const res = await this.transport.request(clientId, method, { tabId, ...params }, timeoutMs) as Record<string, unknown> & { url?: string; title?: string };
     if (tabId !== null && typeof res?.url === 'string') {
-      this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId });
+      this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId, ts: Date.now() });
     }
     return res;
   }
 
-  private async executeDownload(tabId: number | null, clientId: string, url: string, name?: string): Promise<unknown> {
+  private async executeDownload(tabId: number | null, clientId: string, url: string, name?: string, onProgress?: TransferProgress): Promise<unknown> {
     // D7: ожидание привязано к клиенту — параллельные трансферы разных
     // браузеров (или одного) не пересекаются, ack уходит владельцу.
-    const transferPromise = this.downloads.expectTransfer(url, clientId);
+    // onProgress (П.5) — только наблюдатель: ack/backpressure не зависят от него.
+    const transferPromise = this.downloads.expectTransfer(url, clientId, onProgress);
     transferPromise.catch(() => {}); // страховка от unhandled rejection
-    const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
-    const [completed, res] = await Promise.all([transferPromise, resPromise]);
-    return { ...(res as Record<string, unknown>), file: completed.name, size: completed.size, sha256: completed.sha256 };
+    try {
+      const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
+      const [completed, res] = await Promise.all([transferPromise, resPromise]);
+      return { ...(res as Record<string, unknown>), file: completed.name, size: completed.size, sha256: completed.sha256 };
+    } catch (err) {
+      // fetchFile упал/оттаймаутился до file.start → ожидание в релее осталось
+      // непотреблённым; снимаем, иначе оно приклеится к чужому трансферу (FIFO).
+      this.downloads.cancelExpect(clientId, url);
+      throw err;
+    }
   }
 }
 
 // ---- регистрация в MCP SDK ----
 
-export function buildMcpServer(core: BridgeCore): McpServer {
+/**
+ * П.5: троттлим прогресс-колбэк релея в MCP notifications/progress. Первое
+ * событие шлём сразу (клиентский таймаут сбрасывается как можно раньше),
+ * дальше — не чаще minIntervalMs. Ошибки отправки гасим: прогресс — best
+ * effort, трансфер от него зависеть не должен. Экспорт — для юнит-теста.
+ */
+export function makeProgressReporter(
+  send: (notification: {
+    method: 'notifications/progress';
+    params: { progressToken: string | number; progress: number; total?: number };
+  }) => Promise<unknown>,
+  progressToken: string | number,
+  minIntervalMs = 1000,
+  now: () => number = Date.now,
+): TransferProgress {
+  let lastSent = -Infinity;
+  return (progress, total) => {
+    const t = now();
+    if (t - lastSent < minIntervalMs) return;
+    lastSent = t;
+    void send({
+      method: 'notifications/progress',
+      params: { progressToken, progress, ...(total !== null ? { total } : {}) },
+    }).catch(() => {});
+  };
+}
+
+export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?: number }): McpServer {
   const server = new McpServer({ name: 'bridge-server', version: '0.1.0' });
   const tabId = z.number().describe('ID вкладки из tab.list');
   const ref = z.string().describe('ref-метка элемента из page.snapshot (e1, e2, …)');
@@ -716,21 +799,36 @@ export function buildMcpServer(core: BridgeCore): McpServer {
     ['page.wait_for', 'Событийное ожидание условия (без polling снапшотами): текст/ref/url появился или исчез. Таймаут — не ошибка: {condition_met:false}. Один активный wait на вкладку', { tabId, condition: z.object({ text: z.string().optional(), ref: z.string().optional(), url_contains: z.string().optional() }).describe('условие: text ИЛИ ref ИЛИ url_contains'), state: z.enum(['appear', 'disappear', 'stale']).optional(), timeout_ms: z.number().max(30000).optional(), browser }],
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
+    ['page.console', 'Кольцевой буфер console.*/onerror страницы (≤100 записей {ts,level,text}, text ≤500 символов) — диагностика «почему клик не сработал». MAIN-world хук; жёсткий CSP страницы может его запретить → честный маркер console_unavailable, а не молчаливый пустой буфер', { tabId, limit: z.number().max(100).optional(), browser }],
     ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
+    ['act.hover', 'Наведение на элемент без клика (ref из снапшота ИЛИ text): раскрыть hover-меню/тултип/подсказку. Gated-классификация — как у act.click', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
     ['act.type', 'Ввод текста в элемент', { tabId, ref, text: z.string(), clear: z.boolean().optional(), browser }],
     ['act.select', 'Выбор значения в <select>', { tabId, ref, value: z.string(), browser }],
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],
     ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string(), browser }],
     ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10), browser }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию', { tabId, url: z.string(), name: z.string().optional(), browser }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];
 
   for (const [name, description, shape] of defs) {
-    server.registerTool(name, { description, inputSchema: shape }, async (args) => {
-      const payload = await core.callTool(name, args as Record<string, unknown>);
+    server.registerTool(name, { description, inputSchema: shape }, async (args, extra) => {
+      // П.5: file.download при наличии progressToken (клиент попросил прогресс
+      // через _meta) шлёт notifications/progress — SDK-клиенты с
+      // resetTimeoutOnProgress сбрасывают по ним таймаут запроса. Без токена
+      // поведение идентично прежнему (спека: нотификации без токена не шлём).
+      let onProgress: TransferProgress | undefined;
+      const progressToken = extra._meta?.progressToken;
+      if (name === 'file.download' && progressToken !== undefined) {
+        onProgress = makeProgressReporter(
+          (n) => extra.sendNotification(n),
+          progressToken,
+          opts?.progressMinIntervalMs ?? 1000,
+        );
+      }
+      const payload = await core.callTool(name, args as Record<string, unknown>, { onProgress });
       // П0-2: компактный JSON без indent — экономия токенов; формат снапшота
       // внутри data остаётся построчным текстом, читаемость не страдает.
       return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };

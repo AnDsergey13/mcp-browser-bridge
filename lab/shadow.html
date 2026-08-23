@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: shadow DOM</title>
+<style>
+  body { font-family: sans-serif; max-width: 600px; margin: 2em auto; padding: 0 1em; }
+  #light-status { margin-top: 1em; padding: .6em; background: #eef; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>Shadow DOM (open)</h1>
+<p><a href="index.html">← к полигону</a></p>
+
+<p>Ниже контейнер с open shadow root: внутри кнопка и поле ввода.
+Проверяем, видит ли snapshot элементы внутри shadow root.</p>
+
+<div id="shadow-host"></div>
+<div id="light-status">Событий из shadow пока не было.</div>
+
+<script>
+  var host = document.getElementById('shadow-host');
+  var root = host.attachShadow({ mode: 'open' });
+  root.innerHTML =
+    '<style>button { margin-right: .5em; }</style>' +
+    '<p><strong>Shadow-контент</strong> (внутри open shadow root)</p>' +
+    '<button id="sh-btn" type="button">Кнопка в shadow</button>' +
+    '<input id="sh-input" type="text" placeholder="Поле в shadow">';
+  root.getElementById('sh-btn').addEventListener('click', function () {
+    document.getElementById('light-status').textContent =
+      'Нажата кнопка внутри shadow root.';
+  });
+</script>
+</body>
+</html>

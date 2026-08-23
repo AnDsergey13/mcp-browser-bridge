@@ -47,7 +47,7 @@ test('(б) submit → consent deny → ACTION_DENIED', async () => {
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'ACTION_DENIED');
   assert.equal(mock.consentRequests.at(-1).category, 'submit');
-  assert.equal(mock.consentRequests.at(-1).domain, 'localhost:8080');
+  assert.equal(mock.consentRequests.at(-1).domain, 'localhost:18547');
 });
 
 test('(б2) submit → consent timeout → ACTION_DENIED', async () => {
@@ -57,7 +57,7 @@ test('(б2) submit → consent timeout → ACTION_DENIED', async () => {
   assert.equal(res.error_code, 'ACTION_DENIED');
 });
 
-test('(в) localhost:8080 login с override auto → без consent', async () => {
+test('(в) localhost:18547 login с override auto → без consent', async () => {
   const before = mock.consentRequests.length;
   const res = await handle.core.callTool('act.type', { tabId: 1, ref: 'e2', text: 's3cret' });
   assert.equal(res.ok, true, JSON.stringify(res));
@@ -67,7 +67,7 @@ test('(в) localhost:8080 login с override auto → без consent', async () =
 test('hard_floor: pay:auto без allow_unsafe зажат до confirm (N16)', async () => {
   // В resolved-виде для расширения pay зажат hard_floor'ом до confirm.
   const initial = mock.policyUpdates[0];
-  assert.equal(initial.domains['localhost:8080'].gated.pay, 'confirm');
+  assert.equal(initial.domains['localhost:18547'].gated.pay, 'confirm');
   // Клик по «Оплатить заказ» → обязан прийти consent.ask категории pay (не auto).
   mock.consent = 'allow';
   const before = mock.consentRequests.length;
@@ -135,7 +135,7 @@ test('разовый грант: add → домен в policy.update; remove →
 
 test('file.download: проверяется домен ФАЙЛА, а не вкладки', async () => {
   handle.policy.setActivePreset('test'); // предыдущие тесты оставили пресет "other"
-  await primeTab(); // tabId 1 = localhost:8080, у него есть capability download
+  await primeTab(); // tabId 1 = localhost:18547, у него есть capability download
   // Файл с негрантованного домена → DOMAIN_NOT_ALLOWED, хотя вкладка разрешена.
   const res1 = await handle.core.callTool('file.download', { tabId: 1, url: 'https://forbidden.example/x.bin' });
   assert.equal(res1.ok, false);
@@ -164,5 +164,5 @@ test('журнал (фаза 6 п.1): tool calls пишутся в journal.jsonl
   assert.ok(click, 'act.click в журнале');
   assert.ok(click.ts && click.args_digest?.sha256 && click.result_digest?.sha256);
   assert.equal(click.tabId, 1);
-  assert.match(click.url, /localhost:8080/);
+  assert.match(click.url, /localhost:18547/);
 });

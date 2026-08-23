@@ -84,3 +84,28 @@ test('file.download без capability download → CAPABILITY_DENIED', async () 
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'CAPABILITY_DENIED');
 });
+
+test('file.download: ошибка fetchFile не отравляет очередь ожиданий (чужой url не протекает в manifest)', async () => {
+  // Живой кейс 2026-08-19 (HF): fetch xet-файла падает (CORS при редиректе на
+  // CDN) ДО file.start; протухшее ожидание по FIFO съедал следующий трансфер
+  // и manifest записывал чужой url.
+  mock.fetchFails = true;
+  const bad = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'http://allowed.example/files/broken.bin', name: 'broken.bin',
+  });
+  assert.equal(bad.ok, false, JSON.stringify(bad));
+  assert.equal(bad.error_code, 'FETCH_FAILED');
+  mock.fetchFails = false;
+
+  const content = crypto.randomBytes(700);
+  mock.fileToServe = { name: 'after-fail.bin', content, chunkSize: 400 };
+  const res = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'http://allowed.example/files/after-fail.bin', name: 'after-fail.bin',
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const manifest = fs.readFileSync(path.join(env.downloadsDir, 'manifest.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const entry = manifest.find((l) => l.name === res.data.file);
+  assert.ok(entry, 'строка в manifest.jsonl');
+  assert.match(entry.url, /after-fail\.bin/, 'url обязан быть своим, а не протухшим broken.bin');
+  mock.fileToServe = { name: 'lesson.pdf', content: FILE_CONTENT, chunkSize: 400 };
+});

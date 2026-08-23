@@ -16,9 +16,10 @@ download на домены мастер-плейлиста и сегментов
 """
 import argparse, json, os, re, shutil, subprocess, sys, time, urllib.parse
 
-CMD = '/workspace/.bridge/cmd.json'
-RES = '/workspace/.bridge/result.json'
-DL = '/workspace/downloads'
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CMD = os.path.join(ROOT, '.bridge', 'cmd.json')
+RES = os.path.join(ROOT, '.bridge', 'result.json')
+DL = os.path.join(ROOT, 'downloads')
 
 
 def bridge(tool, args, wait=180):
@@ -65,7 +66,7 @@ def default_name(url):
 
 
 # ffmpeg: сначала встроенный в репозиторий (tools/ffmpeg), потом системный.
-FFMPEG = '/workspace/tools/ffmpeg/ffmpeg'
+FFMPEG = os.path.join(ROOT, 'tools', 'ffmpeg', 'ffmpeg')
 if not os.path.exists(FFMPEG):
     FFMPEG = shutil.which('ffmpeg')
 

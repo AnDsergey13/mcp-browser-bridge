@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab-полигон browser bridge</title>
+<style>
+  body { font-family: sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; }
+  li { margin: .4em 0; }
+  code { background: #eee; padding: 0 .3em; }
+  .seed-box { margin: 1em 0; padding: .8em; border: 1px solid #ccc; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>Lab-полигон</h1>
+<p>Тестовые страницы для живой проверки инструментов моста.
+Запуск: <code>python3 -m http.server 18547</code> из каталога <code>lab/</code>.</p>
+
+<div class="seed-box">
+  <label>Red-team seed: <input id="seed" type="number" placeholder="N" min="0"></label>
+  <button id="seed-go" type="button">Открыть index с ?seed=</button>
+  <p>Без параметра <code>?seed=N</code> все страницы чистые — инъекций нет.</p>
+</div>
+
+<ul>
+  <li><a href="form.html">form.html</a> — форма (text/password/select/checkbox/submit),
+      кнопки «Оплатить заказ» и «Удалить аккаунт» (gated-классификатор: pay/submit/delete)</li>
+  <li><a href="shadow.html">shadow.html</a> — open shadow root с интерактивными элементами</li>
+  <li><a href="frames.html">frames.html</a> — same-origin iframe</li>
+  <li><a href="spa.html">spa.html</a> — DOM-мутации с задержкой + бесконечная лента
+      (page.wait_for, STALE_REF, page.scan)</li>
+  <li><a href="api.html">api.html</a> — fetch/XHR к data.json (net.list)</li>
+  <li><a href="media.html">media.html</a> — видео/HLS-заглушка и картинки</li>
+  <li><a href="ws.html">ws.html</a> — WebSocket к локальному echo (деградация без спама)</li>
+</ul>
+
+<p>Канареечные endpoint'ы red-team режима: <code>canary/&lt;id&gt;/</code>,
+<code>files/secret-&lt;id&gt;.txt</code>. См. README.md.</p>
+
+<script>
+  document.getElementById('seed-go').addEventListener('click', function () {
+    var v = document.getElementById('seed').value;
+    if (v !== '') location.search = '?seed=' + encodeURIComponent(v);
+  });
+</script>
+</body>
+</html>

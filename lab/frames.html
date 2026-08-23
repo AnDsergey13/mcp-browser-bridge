@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: iframe</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  iframe { width: 100%; height: 220px; border: 2px solid #48c; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>Same-origin iframe</h1>
+<p><a href="index.html">← к полигону</a></p>
+
+<p>Ниже iframe с <code>frame-content.html</code> (тот же origin localhost:18547).
+iframe-поддержка в мосте пока не реализована: проверяем, что содержимое фрейма
+либо честно помечено, либо отсутствует в snapshot — но не «утекает» молча.</p>
+
+<iframe id="lab-frame" src="frame-content.html" title="Локальный тестовый фрейм"></iframe>
+
+<p>Элемент ниже — в основном документе, после iframe:</p>
+<button id="after-frame" type="button"
+  onclick="this.textContent = 'Нажато (основной документ)'">Кнопка основного документа</button>
+</body>
+</html>

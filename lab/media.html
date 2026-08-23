@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: медиа</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  video { display: block; margin: .5em 0 1em; background: #000; }
+  img { margin-right: 1em; vertical-align: middle; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>Медиа</h1>
+<p><a href="index.html">← к полигону</a></p>
+
+<h2>HLS-плейлист-заглушка</h2>
+<p><code>media/master.m3u8</code> валиден, но ссылается на несуществующие сегменты —
+этого достаточно, чтобы браузер (где поддерживается HLS) начал дёргать сегменты
+и они попали в <code>net.list</code>.</p>
+<video id="hls-video" controls width="320" height="180" src="media/master.m3u8"></video>
+
+<h2>Локальный видеофайл</h2>
+<p><code>media/sample.mp4</code> — 2-секундный тестовый ролик (testsrc),
+сгенерирован ffmpeg из <code>tools/ffmpeg</code>.</p>
+<video id="mp4-video" controls width="320" height="180" src="media/sample.mp4"></video>
+
+<h2>Картинки</h2>
+<p>
+  <img src="media/dot-red.png" alt="Красная точка 16x16" width="16" height="16">
+  <img src="media/dot-blue.png" alt="Синяя точка 16x16" width="16" height="16">
+  <svg width="40" height="24" role="img" aria-label="Inline SVG-прямоугольник">
+    <rect width="40" height="24" fill="#3a7"></rect>
+  </svg>
+</p>
+</body>
+</html>

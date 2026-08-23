@@ -10,7 +10,7 @@
  * extension/src): storage.local.get/set/remove + onChanged, tabs.get/query/
  * create/update/remove/goBack/reload/sendMessage/executeScript/
  * captureVisibleTab + onUpdated/onRemoved, permissions.contains/request,
- * notifications.create/clear + onButtonClicked, runtime.getManifest/
+ * notifications.create/clear + onButtonClicked, runtime.getManifest/getURL/
  * sendMessage/onMessage, webRequest.onBeforeRequest, alarms.create + onAlarm.
  *
  * Правила:
@@ -138,6 +138,8 @@
   const shim = {
     runtime: {
       getManifest: () => chrome.runtime.getManifest(),
+      // getURL — для <script src=...> MAIN-world хука консоли из content script.
+      getURL: (p) => chrome.runtime.getURL(p),
       sendMessage: promisify(chrome.runtime.sendMessage, chrome.runtime),
       onMessage: wrapOnMessage(chrome.runtime.onMessage),
     },

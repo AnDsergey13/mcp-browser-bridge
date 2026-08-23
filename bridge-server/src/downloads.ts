@@ -15,6 +15,9 @@ export class RelayError extends Error {
   }
 }
 
+/** Колбэк прогресса трансфера: получено байт, ожидаемый размер (null — неизвестен). */
+export type TransferProgress = (received: number, total: number | null) => void;
+
 interface Transfer {
   transferId: string;
   clientId: string; // браузер-владелец трансфера (ack — только ему)
@@ -27,6 +30,7 @@ interface Transfer {
   bytes: number;
   hash: crypto.Hash;
   url: string | null;
+  onProgress: TransferProgress | null; // MCP progress-нотификации (П.5), может отсутствовать
   done: (r: { name: string; size: number; sha256: string }) => void;
   fail: (err: RelayError) => void;
 }
@@ -35,6 +39,7 @@ interface Transfer {
 interface PendingExpect {
   url: string;
   clientId: string;
+  onProgress: TransferProgress | null;
   resolve: (r: CompletedTransfer) => void;
   reject: (err: RelayError) => void;
 }
@@ -64,9 +69,9 @@ export class DownloadRelay {
   }
 
   /** Ожидание трансфера этого клиента (вызывается перед req fetchFile). */
-  expectTransfer(url: string, clientId: string): Promise<CompletedTransfer> {
+  expectTransfer(url: string, clientId: string, onProgress?: TransferProgress): Promise<CompletedTransfer> {
     return new Promise((resolve, reject) => {
-      this.expects.push({ url, clientId, resolve, reject });
+      this.expects.push({ url, clientId, onProgress: onProgress ?? null, resolve, reject });
     });
   }
 
@@ -88,6 +93,17 @@ export class DownloadRelay {
     return this.expects.splice(idx, 1)[0];
   }
 
+  /**
+   * Снять ещё НЕ начавшееся ожидание (fetchFile упал или оттаймаутился до
+   * file.start): иначе протухшее ожидание по FIFO съест ЧУЖОЙ трансфер и
+   * manifest запишет неверный url (живой кейс HF, 2026-08-19).
+   */
+  cancelExpect(clientId: string, url: string): void {
+    const idx = this.expects.findIndex((e) => e.clientId === clientId && e.url === url);
+    if (idx < 0) return; // ожидание уже потреблено начавшимся трансфером — не трогаем
+    this.expects.splice(idx, 1)[0].reject(new RelayError('FETCH_FAILED', 'fetchFile завершился ошибкой до начала трансфера'));
+  }
+
   private onStart(data: Record<string, unknown>, clientId: string): void {
     const transferId = String(data['transferId'] ?? '');
     if (!transferId) return;
@@ -107,6 +123,7 @@ export class DownloadRelay {
       bytes: 0,
       hash: crypto.createHash('sha256'),
       url: expect?.url ?? null,
+      onProgress: expect?.onProgress ?? null,
       done: (r) => expect?.resolve({ transferId, ...r }),
       fail: (err) => expect?.reject(err),
     };
@@ -132,6 +149,12 @@ export class DownloadRelay {
     // ack — расширение ждёт его перед следующим чанком (backpressure);
     // уходит только клиенту-владельцу трансфера (D6/D7).
     this.sendAck(transferId, seq, t.clientId);
+    // П.5: прогресс ждущему file.download (MCP notifications/progress наверху,
+    // троттлинг — там же; сам релей отчитывается о каждом чанке). Ошибка
+    // колбэка не должна ронять трансфер.
+    if (t.onProgress) {
+      try { t.onProgress(t.bytes, t.size); } catch { /* прогресс — best effort */ }
+    }
   }
 
   private onEnd(data: Record<string, unknown>): void {
