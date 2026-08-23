@@ -2,7 +2,8 @@
   "mcpServers": {
     "browser-bridge": {
       "command": "bash",
-      "args": ["bridge-server/mcp-entry.sh"]
+      "args": ["bridge-server/mcp-entry.sh"],
+      "toolTimeoutMs": 3600000
     }
   }
 }
