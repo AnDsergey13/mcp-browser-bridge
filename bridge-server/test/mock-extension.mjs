@@ -39,6 +39,7 @@ export class MockExtension {
     this.pages = opts.pages ?? {};
     this.consent = opts.consent ?? 'allow';
     this.fileToServe = opts.fileToServe ?? null;
+    this.fetchFails = false; // true → fetchFile отвечает ошибкой до file.start
     this.policyUpdates = [];
     this.consentRequests = [];
     this.ws = null;
@@ -244,15 +245,22 @@ export class MockExtension {
         return { decision };
       }
       case 'fetchFile': {
+        // fetchFails — имитация падения fetch на стороне расширения (CORS и пр.):
+        // ошибка уходит ДО file.start (живой кейс: xet-редирект HF).
+        if (this.fetchFails) throw Object.assign(new Error('fetch failed (mock)'), { code: 'FETCH_FAILED' });
         this.serveFile(p).catch(() => {});
-        return undefined; // res уйдёт после file.end
+        return undefined; // res уйдёт из serveFile сразу после file.start (как background-релей)
       }
       default:
         throw Object.assign(new Error(`unknown method ${method}`), { code: 'INTERNAL' });
     }
   }
 
-  /** Файловый релей: file.start → chunk (ждём ack) → file.end → res на fetchFile. */
+  /**
+   * Файловый релей: file.start → res на fetchFile (СРАЗУ после заголовков,
+   * как background-релей: transport-timeout сервера покрывает только старт)
+   * → chunk (ждём ack) → file.end.
+   */
   async serveFile(p) {
     const file = this.fileToServe;
     if (!file) return;
@@ -260,6 +268,13 @@ export class MockExtension {
     const content = file.content;
     const sha256 = crypto.createHash('sha256').update(content).digest('hex');
     this.send({ type: 'evt', event: 'file.start', data: { transferId, name: p.name ?? file.name, size: content.length, mime: 'application/octet-stream' } });
+    // ранний res на req fetchFile — сервер всё равно ждёт завершения трансфера
+    // по file.end (expectTransfer), в res несём только метаданные старта
+    if (this.pendingFetchReq) {
+      const { id } = this.pendingFetchReq;
+      this.pendingFetchReq = null;
+      this.send({ type: 'res', id, result: { transferId, size: content.length, mime: 'application/octet-stream' } });
+    }
     const chunkSize = file.chunkSize ?? 400;
     const chunkDelayMs = file.chunkDelayMs ?? 0; // медленный трансфер (тесты progress)
     let seq = 0;
@@ -273,12 +288,6 @@ export class MockExtension {
       });
     }
     this.send({ type: 'evt', event: 'file.end', data: { transferId, sha256 } });
-    // финальный res на req fetchFile — ПОСЛЕ file.end: находим через lastFetchReq
-    if (this.pendingFetchReq) {
-      const { id } = this.pendingFetchReq;
-      this.pendingFetchReq = null;
-      this.send({ type: 'res', id, result: { transferId, size: content.length, sha256 } });
-    }
   }
 
   close() {

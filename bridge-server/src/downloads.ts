@@ -93,6 +93,17 @@ export class DownloadRelay {
     return this.expects.splice(idx, 1)[0];
   }
 
+  /**
+   * Снять ещё НЕ начавшееся ожидание (fetchFile упал или оттаймаутился до
+   * file.start): иначе протухшее ожидание по FIFO съест ЧУЖОЙ трансфер и
+   * manifest запишет неверный url (живой кейс HF, 2026-08-19).
+   */
+  cancelExpect(clientId: string, url: string): void {
+    const idx = this.expects.findIndex((e) => e.clientId === clientId && e.url === url);
+    if (idx < 0) return; // ожидание уже потреблено начавшимся трансфером — не трогаем
+    this.expects.splice(idx, 1)[0].reject(new RelayError('FETCH_FAILED', 'fetchFile завершился ошибкой до начала трансфера'));
+  }
+
   private onStart(data: Record<string, unknown>, clientId: string): void {
     const transferId = String(data['transferId'] ?? '');
     if (!transferId) return;

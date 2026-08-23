@@ -741,9 +741,16 @@ export class BridgeCore {
     // onProgress (П.5) — только наблюдатель: ack/backpressure не зависят от него.
     const transferPromise = this.downloads.expectTransfer(url, clientId, onProgress);
     transferPromise.catch(() => {}); // страховка от unhandled rejection
-    const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
-    const [completed, res] = await Promise.all([transferPromise, resPromise]);
-    return { ...(res as Record<string, unknown>), file: completed.name, size: completed.size, sha256: completed.sha256 };
+    try {
+      const resPromise = this.transport.request(clientId, 'fetchFile', { tabId, url, name }, 120_000);
+      const [completed, res] = await Promise.all([transferPromise, resPromise]);
+      return { ...(res as Record<string, unknown>), file: completed.name, size: completed.size, sha256: completed.sha256 };
+    } catch (err) {
+      // fetchFile упал/оттаймаутился до file.start → ожидание в релее осталось
+      // непотреблённым; снимаем, иначе оно приклеится к чужому трансферу (FIFO).
+      this.downloads.cancelExpect(clientId, url);
+      throw err;
+    }
   }
 }
 
