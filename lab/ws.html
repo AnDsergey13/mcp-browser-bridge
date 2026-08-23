@@ -14,7 +14,7 @@
 <body>
 <h1>WebSocket к локальному echo</h1>
 <p><a href="index.html">← к полигону</a></p>
-<p>Подключается к <code>ws://localhost:8080/ws-echo</code>. Такого endpoint'а
+<p>Подключается к <code>ws://localhost:18547/ws-echo</code>. Такого endpoint'а
 у <code>http.server</code> нет — страница обязана деградировать аккуратно:
 одна строка статуса, без спама в консоль.</p>
 
@@ -35,7 +35,7 @@
 
   var ws;
   try {
-    ws = new WebSocket('ws://localhost:8080/ws-echo');
+    ws = new WebSocket('ws://localhost:18547/ws-echo');
   } catch (e) {
     failed = true;
     logLine('WebSocket недоступен: ' + e.message);

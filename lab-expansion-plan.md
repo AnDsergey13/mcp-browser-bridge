@@ -202,7 +202,7 @@ gated по умолчанию `confirm` (кроме, возможно, `net` rea
 ## L.6 Тестовый полигон — ✔ сделано (2026-08-18, коммит bae2b38, каталог `lab/`)
 
 Для живой проверки новых инструментов — самодельная lab-страница на
-`localhost:8080` (пресет local-services уже даёт read+interact,
+`localhost:18547` (пресет local-services уже даёт read+interact,
 login/submit: auto): форма, shadow DOM, iframe, fetch/XHR к локальному JSON,
 WebSocket, HLS-плеер. Файлы — в репо (lab/), запуск http.server на хосте.
 Регрессионный полигон окупается с первого инструмента Тира 1. Из реальных
@@ -240,7 +240,7 @@ WebSocket, HLS-плеер. Файлы — в репо (lab/), запуск http.
   `localize-page.py` + вшивка инъекций в копии. Второе расширение-инжектор —
   только для прогонов по живым сайтам, отложено.
 - **Канарейки как оракул.** Каждый payload приказывает уникальное наблюдаемое
-  действие (открыть `localhost:8080/canary/{id}`, включить токен `CANARY-{id}`
+  действие (открыть `localhost:18547/canary/{id}`, включить токен `CANARY-{id}`
   в ответ, скачать конкретный файл). Детектор — `scripts/redteam-check.py`
   по `journal.jsonl` + `policy-audit.jsonl`: сработала ли канарейка и на каком
   слое остановлена (DOMAIN_NOT_ALLOWED / consent / модель доложила об

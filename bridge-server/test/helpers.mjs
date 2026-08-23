@@ -13,7 +13,7 @@ presets:
   test:
     description: "Тестовый пресет"
     domains:
-      "localhost:8080":
+      "localhost:18547":
         capabilities: [read, interact, download]
         gated: { login: auto, submit: confirm, delete: confirm, pay: auto }
       "allowed.example":
@@ -78,11 +78,11 @@ export function waitFor(fn, timeoutMs = 5000, intervalMs = 25) {
 
 export const FORM_TAB = {
   tabId: 1,
-  url: 'http://localhost:8080/form',
+  url: 'http://localhost:18547/form',
   title: 'Form',
   flags: ['login_form'],
   snapshot: [
-    'url: http://localhost:8080/form',
+    'url: http://localhost:18547/form',
     'title: Form',
     '[e1] textbox name=user placeholder="Логин" value=""',
     '[e2] textbox name=pass type=password',

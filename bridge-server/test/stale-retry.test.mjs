@@ -55,7 +55,7 @@ test('STALE_REF → авто-retry: элемент перенайден по т�
 test('STALE_REF → авто-retry: элемент исчез — честный STALE_REF', async () => {
   await primeSnapshot();
   const tab = mock.tabs.get(1);
-  tab.snapshot = 'url: http://localhost:8080/form\ntitle: Form\nПустая страница';
+  tab.snapshot = 'url: http://localhost:18547/form\ntitle: Form\nПустая страница';
   const res = await handle.core.callTool('act.type', { tabId: 1, ref: 'e1', text: 'x' });
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'STALE_REF');
@@ -65,7 +65,7 @@ test('STALE_REF → авто-retry: >1 кандидата по тексту — 
   await primeSnapshot();
   const tab = mock.tabs.get(1);
   tab.snapshot = [
-    'url: http://localhost:8080/form',
+    'url: http://localhost:18547/form',
     'title: Form',
     '[e21] textbox name=user placeholder="Логин" value=""',
     '[e22] textbox name=user2 placeholder="Логин" value=""',

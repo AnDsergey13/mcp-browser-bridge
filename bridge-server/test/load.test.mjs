@@ -20,10 +20,10 @@ const TIME_BUDGET_MS = 30_000; // потолок на рабочий цикл 50
 function makeTab(i) {
   return {
     tabId: i,
-    url: `http://localhost:8080/page-${i}`,
+    url: `http://localhost:18547/page-${i}`,
     title: `Page ${i}`,
     snapshot: [
-      `url: http://localhost:8080/page-${i}`,
+      `url: http://localhost:18547/page-${i}`,
       `title: Page ${i}`,
       '[e1] button "Показать детали"', // не-gated: ни pay/delete-маркеров, ни type=submit
       '[e2] link "Документация" → /docs',
@@ -119,7 +119,7 @@ test('50 вкладок: snapshot + act.* + extract каждой; реестры
 test('TTL-вытеснение: записи вкладок/снапшотов старше 30 минут удаляются и без tab.list', async () => {
   // Вкладка «открыта и забыта»: ни tab.close, ни tab.list больше не звали
   // (например, браузер офлайн — reconcile его не касается). TTL — страховка.
-  const open = await handle.core.callTool('tab.open', { url: 'http://localhost:8080/stale' });
+  const open = await handle.core.callTool('tab.open', { url: 'http://localhost:18547/stale' });
   assert.equal(open.ok, true, JSON.stringify(open));
   const tabId = open.data.tabId;
   const snap = await handle.core.callTool('page.snapshot', { tabId });
@@ -132,7 +132,7 @@ test('TTL-вытеснение: записи вкладок/снапшотов �
   assert.equal(registrySizes().snapshots, 0, 'TTL вытеснил кэш снапшотов');
 
   // Контроль: свежие записи TTL НЕ трогает (защита живых вкладок).
-  const open2 = await handle.core.callTool('tab.open', { url: 'http://localhost:8080/fresh' });
+  const open2 = await handle.core.callTool('tab.open', { url: 'http://localhost:18547/fresh' });
   assert.equal(open2.ok, true, JSON.stringify(open2));
   const snap2 = await handle.core.callTool('page.snapshot', { tabId: open2.data.tabId });
   assert.equal(snap2.ok, true, JSON.stringify(snap2));
