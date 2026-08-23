@@ -216,7 +216,7 @@ Content script делает `fetch(url, {credentials:"include"})`, читает
 Backpressure: расширение ждёт evt `file.ack {transferId, seq}` от сервера перед
 отправкой следующего чанка (таймаут ack 15 c → `file.abort`). Ошибка →
 evt `file.abort {transferId, reason}` и res ошибкой `FETCH_FAILED`.
-Сервер пишет в `/workspace/downloads/<uniquified name>` и строку в
+Сервер пишет в `<repo>/downloads/<uniquified name>` и строку в
 `downloads/manifest.jsonl` `{ts,url,name,size,sha256,status}`.
 
 MCP-прогресс (П.5): на каждый принятый чанк сервер (поверх релея, без влияния

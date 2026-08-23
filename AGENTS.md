@@ -29,11 +29,11 @@
   Параллельные загрузки в разных браузерах поддерживаются.
 - **Старт сессии**: если инструментов `mcp__browser-bridge__*` нет в наборе —
   MCP-сервер не поднялся. Не уходить молча в обходные пути: проверь
-  `.kimi-code/mcp.json` (должно быть `node --import tsx src/index.ts`,
-  cwd `/workspace/bridge-server`; голый `node … .ts` падает с
-  `ERR_UNKNOWN_FILE_EXTENSION`) и процесс (`ss -xlnp | grep bridge.sock`),
-  затем доклад пользователю. Чеклист рестарта контейнера — в SETUP.md
-  («Быстрый рестарт контейнера»).
+  `.kimi-code/mcp.json` (должно быть `bash bridge-server/mcp-entry.sh`;
+  скрипт сам cd'ится в свою папку, а пути данных сервер считает от корня
+  репо — `REPO_ROOT` в `src/index.ts`, поэтому перенос репо ничего не ломает)
+  и процесс (`ss -xlnp | grep bridge.sock`), затем доклад пользователю.
+  Чеклист рестарта контейнера — в SETUP.md («Быстрый рестарт контейнера»).
 - **Сокет один**: MCP-сервер и `scripts/live-repl.mjs` слушают один и тот же
   `.bridge/bridge.sock` — вместе не живут. Работаем по MCP; live-repl —
   только для сессии без MCP. Скрипты (hls-download.py, localize-page.py)

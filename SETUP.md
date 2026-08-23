@@ -6,10 +6,12 @@
 2. Хост: socat-релей жив? `curl 127.0.0.1:18777` → `426 Upgrade Required`.
    Нет — перезапустить (команда ниже в §1).
 3. В контейнере MCP-сервер поднимется сам из `.kimi-code/mcp.json`
-   (команда `/mcp` — статус; должен быть connected).
-   Если `ERR_UNKNOWN_FILE_EXTENSION ".ts"` — конфиг старый: должно быть
-   `node --import tsx src/index.ts` с cwd `/workspace/bridge-server`
-   (исправлено 2026-08-15; голый `node index.ts` .ts не загружает).
+   (команда `/mcp` — статус; должен быть connected). Конфиг вызывает
+   `bash bridge-server/mcp-entry.sh` — скрипт сам переходит в свою папку,
+   а все пути данных сервер считает от корня репо (`REPO_ROOT` в
+   `src/index.ts`), поэтому ни cwd, ни env в mcp.json не нужны и перенос
+   репо ничего не ломает. Диагностика процесса:
+   `ss -xlnp | grep bridge.sock`.
 4. Браузер: `about:debugging` → Load Temporary Add-on →
    `extension/manifest.json` (если браузер перезапускался). Открытые вкладки
    грантованных доменов переинжектируются автоматически при первом
@@ -30,13 +32,14 @@
 Rootless podman в ExitBox: сеть контейнера internal-only, хост до IP контейнера
 НЕ достучится (проверено), флага publish портов у `exitbox run` нет. Поэтому
 мост ходит через **unix-сокет в общей папке** (тот же приём, что docker.sock):
-сервер слушает `/workspace/.bridge/bridge.sock`, а это тот же файл, что
-`.bridge/bridge.sock` в папке проекта на хосте.
+сервер слушает `.bridge/bridge.sock` в корне репозитория (путь считается от
+расположения кода), а это тот же файл, что в папке проекта на хосте.
 
-На хосте, в папке проекта, запусти релей (одна команда, оставить работать):
+На хосте запусти релей (из любого каталога, оставить работать; сокета может
+ещё не быть — скрипт ждёт его до 120 с):
 
 ```fish
-socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock
+bash /путь/к/mcp-browser-bridge/start-relay.sh
 ```
 
 Проверка: `curl 127.0.0.1:18777` → ответ `426 Upgrade Required`. URL для
@@ -46,20 +49,20 @@ socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/b
 Сервер продолжает слушать и TCP `0.0.0.0:18777` — если когда-нибудь появится
 проброс портов, расширение можно переключить на `ws://<IP>:18777` напрямую.
 
-Общая папка (эта, `/workspace`) монтируется — в ней живут `policy.yaml`,
-`memory/`, `downloads/`, `.bridge/secret`, и всё это переживает пересоздание
-контейнера.
+Общая папка монтируется в контейнер (`/workspace`) — в корне репозитория
+живут `policy.yaml`, `memory/`, `downloads/`, `.bridge/secret`, и всё это
+переживает пересоздание контейнера и перенос репо (пути — от `REPO_ROOT`).
 
 Первый старт сервера:
 
 ```bash
-cd /workspace/bridge-server
+cd /workspace/mcp-browser-bridge/bridge-server
 npm install   # один раз
 npm start     # или его запустит Kimi Code CLI как MCP-сервер
 ```
 
-При первом запуске в логе печатается **секрет** (лежит в
-`/workspace/.bridge/secret`, права 0600). Он постоянный между контейнерами.
+При первом запуске в логе печатается **секрет** (лежит в `.bridge/secret`
+в корне репо, права 0600). Он постоянный между контейнерами.
 
 MCP уже настроен в `.kimi-code/mcp.json` — новые сессии Kimi Code CLI
 подключают сервер автоматически (`/mcp` — статус).

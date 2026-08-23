@@ -36,8 +36,8 @@
 | Компонент | Система | Команда / действие |
 |---|---|---|
 | контейнер ExitBox | хост (папка проекта) | `exitbox run kimi --no-resume -- --yolo` |
-| bridge-server | контейнер (`/workspace`) | `cd bridge-server && npm install && npm start` |
-| socat-релей | хост (Linux, папка проекта) | `socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock` |
+| bridge-server | контейнер | `cd <репо>/bridge-server && npm install && npm start` (пути данных — от корня репо, без env) |
+| socat-релей | хост (Linux, любой каталог) | `bash <репо>/start-relay.sh` (сам находит сокет, ждёт его до 120 с) |
 | расширение (Firefox / LibreWolf) | хост | `about:debugging` → Load Temporary Add-on → `extension/manifest.json` |
 | расширение (Chromium) | хост | `bash extension/build-chromium.sh` → `chrome://extensions` → Developer mode → Load unpacked → `dist/chromium/` |
 | Kimi Code CLI | контейнер | подхватывает сервер как MCP из `.kimi-code/mcp.json` автоматически |
@@ -57,17 +57,20 @@ exitbox run kimi --no-resume -- --yolo
 MCP-сервер (конфиг `.kimi-code/mcp.json`):
 
 ```bash
-cd /workspace/bridge-server && npm install   # один раз
+cd /workspace/mcp-browser-bridge/bridge-server && npm install   # один раз
 npm start   # только для запуска вручную, без Kimi Code CLI
 ```
 
-Сервер создаст `.bridge/bridge.sock` и `.bridge/secret` (0600). Секрет
-постоянный между пересозданиями контейнера — понадобится на шаге 3.
+Сервер создаст `.bridge/bridge.sock` и `.bridge/secret` (0600) в корне
+репозитория — все пути он считает от своего расположения (`REPO_ROOT` в
+`src/index.ts`), перенос репо ничего не ломает. Секрет постоянный между
+пересозданиями контейнера — понадобится на шаге 3.
 
-**2. Хост** — релей сокета в TCP (оставить работать):
+**2. Хост** — релей сокета в TCP (из любого каталога, оставить работать;
+сокет появится только когда поднимется сервер — скрипт его подождёт):
 
 ```bash
-socat TCP-LISTEN:18777,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:$PWD/.bridge/bridge.sock
+bash /путь/к/mcp-browser-bridge/start-relay.sh
 ```
 
 Проверка: `curl 127.0.0.1:18777` → `426 Upgrade Required` — значит живо.
