@@ -5,7 +5,9 @@
  * content-bridge.js — исполнитель команд страницы.
  * Получает от background сообщения {kind:"cmd", method, params},
  * отвечает {ok:true, result} | {ok:false, error:{code,message}}.
- * События (pause.auto, file.*) шлёт в background через runtime.sendMessage.
+ * События (pause.auto) шлёт в background через runtime.sendMessage.
+ * Файлового релея здесь больше нет: fetchFile исполняется в background
+ * (file-relay.js) — CORS-редиректы на CDN и потребление памяти вкладкой.
  * Общие модули: window.__BRIDGE__.snapshot / .refs (snapshot.js),
  * window.__BRIDGE__.showConsent (consent-banner.js).
  */
@@ -16,8 +18,6 @@
 
   const QUIET_MS = 500; // «тихое окно»: столько без DOM-мутаций (N9)
   const QUIET_TIMEOUT_MS = 10000; // общий таймаут тихого окна
-  const CHUNK_SIZE = 256 * 1024; // чанк файлового релея (§8)
-  const ACK_TIMEOUT_MS = 15000; // таймаут file.ack на чанк
   const CONSENT_HOST_ID = "__bridge-consent-host";
 
   // ---------- ошибки с кодом протокола ----------
@@ -328,7 +328,7 @@
     else el.value = value;
   }
 
-  // ---------- sha256 ----------
+  // ---------- sha256 (dom_hash) ----------
   async function sha256Hex(bytes) {
     if (typeof crypto !== "undefined" && crypto.subtle) {
       const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -343,110 +343,6 @@
   async function sha256Short(str) {
     const hex = await sha256Hex(new TextEncoder().encode(str));
     return hex.slice(0, 16);
-  }
-
-  // ---------- файловый релей (§8) ----------
-  function u8ToBase64(bytes) {
-    let bin = "";
-    const SLICE = 0x8000; // fromCharCode.apply не переживает большие spread'ы
-    for (let i = 0; i < bytes.length; i += SLICE) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + SLICE));
-    }
-    return btoa(bin);
-  }
-
-  function sendFileMsg(sub, data) {
-    return browser.runtime.sendMessage({ kind: "file", sub, data });
-  }
-
-  async function fetchFileRelay(params) {
-    const transferId = params.transferId;
-    let resp;
-    try {
-      resp = await fetch(params.url, { credentials: "include" });
-    } catch (e) {
-      await sendFileMsg("abort", { transferId, reason: "network: " + e.message }).catch(() => {});
-      throw cerr("FETCH_FAILED", "fetch failed: " + e.message);
-    }
-    if (!resp.ok || !resp.body) {
-      await sendFileMsg("abort", { transferId, reason: "http_" + resp.status }).catch(() => {});
-      throw cerr("FETCH_FAILED", "HTTP " + resp.status);
-    }
-
-    const mime = resp.headers.get("content-type") || "application/octet-stream";
-    const sizeHdr = Number(resp.headers.get("content-length")) || 0;
-    const fname =
-      params.name ||
-      decodeURIComponent((params.url.split("/").pop() || "file").split("?")[0]) ||
-      "file";
-    await sendFileMsg("start", {
-      transferId,
-      name: fname,
-      size: sizeHdr || undefined,
-      mime,
-    });
-
-    const reader = resp.body.getReader();
-    const parts = [];
-    let total = 0;
-    let seq = 0;
-    let buf = new Uint8Array(0);
-
-    async function emitChunk(bytes) {
-      const ack = await Promise.race([
-        sendFileMsg("chunk", { transferId, seq, data_base64: u8ToBase64(bytes) }),
-        sleep(ACK_TIMEOUT_MS).then(() => ({ ok: false, error: "ACK_TIMEOUT" })),
-      ]);
-      if (!ack || !ack.ok) {
-        throw cerr("FETCH_FAILED", "file.ack не получен: " + ((ack && ack.error) || "нет ответа"));
-      }
-      seq++;
-    }
-
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (value && value.length) {
-          const merged = new Uint8Array(buf.length + value.length);
-          merged.set(buf, 0);
-          merged.set(value, buf.length);
-          buf = merged;
-          while (buf.length >= CHUNK_SIZE) {
-            const chunkBytes = buf.slice(0, CHUNK_SIZE);
-            buf = buf.slice(CHUNK_SIZE);
-            parts.push(chunkBytes);
-            total += chunkBytes.length;
-            await emitChunk(chunkBytes); // backpressure: ждём file.ack (§8)
-          }
-        }
-        if (done) break;
-      }
-      if (buf.length) {
-        parts.push(buf);
-        total += buf.length;
-        await emitChunk(buf);
-      }
-    } catch (e) {
-      try {
-        await reader.cancel();
-      } catch (_) {}
-      await sendFileMsg("abort", { transferId, reason: String((e && e.message) || e) }).catch(
-        () => {}
-      );
-      if (e && e.code) throw e;
-      throw cerr("FETCH_FAILED", String((e && e.message) || e));
-    }
-
-    // Склейка в память для sha256 — ограничение MVP (очень большие файлы).
-    const whole = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      whole.set(p, off);
-      off += p.length;
-    }
-    const sha256 = await sha256Hex(whole);
-    await sendFileMsg("end", { transferId, sha256 });
-    return { size: total, sha256 };
   }
 
   // ---------- pressKey ----------
@@ -780,10 +676,6 @@
         out.console_unavailable = "MAIN-world хук не загрузился (CSP страницы?) — буфер не пишется";
       }
       return out;
-    },
-
-    async fetchFile(params) {
-      return fetchFileRelay(params);
     },
   };
 

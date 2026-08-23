@@ -130,8 +130,10 @@
   `act.hover`: capability `interact` + pacing, gated-классификация ref/text —
   как у `act.click`, авто-retry после STALE_REF общий (П1-3).
 - `getStateHash` `{tabId}` → `{url,dom_hash}` — для reconcile при resume
-- `fetchFile` `{tabId,url,name?}` → поток событий (§8); финальный res:
-  `{transferId,size,sha256}` — res приходит ПОСЛЕ evt `file.end`.
+- `fetchFile` `{tabId,url,name?}` → поток событий (§8); res:
+  `{transferId,size,mime}` — приходит СРАЗУ после HTTP-заголовков, ДО
+  окончания трансфера (завершение — evt `file.end`). Ошибки до `file.start`
+  (HTTP != 2xx, сетевой сбой) — res ошибкой `FETCH_FAILED`.
   Policy проверяет домен ФАЙЛА (`url`), а не вкладки: capability `download`
   должна быть выдана домену, с которого скачиваем.
 
@@ -204,8 +206,18 @@ interactive И 500 мс без DOM-мутаций (MutationObserver). Общий
 
 ## 8. Файловый релей (ext → server, всё через WS)
 
-Content script делает `fetch(url, {credentials:"include"})`, читает
-`response.body` чанками по 256 КБ:
+fetch выполняет BACKGROUND расширения (MV2 page / MV3 SW), НЕ content script
+(перенос 2026-08, живой кейс HuggingFace): background с host-правами
+`<all_urls>` не связан CORS страницы — cross-origin редиректы на CDN
+(xet/LFS → `cas-bridge.xethub.hf.co`) проходят. Куки — браузерная банка
+(`credentials:"include"`, та же сессия, что у вкладки). `tabId` в `fetchFile`
+по-прежнему обязателен: `assertTabDomain` + источник Referer/Origin (ниже).
+
+Читается `response.body.getReader()` потоково: накопление до 256 КБ →
+`file.chunk` → ожидание `file.ack` → следующий чанк. Файл целиком в память
+не собирается (устранено тройное буферирование: parts[] + склейка + base64);
+sha256 считается инкрементально (extension/src/sha256.js — чистый JS, без
+внешних зависимостей; `crypto.subtle` в background-контекстах не гарантирован).
 
 ```jsonc
 {"type":"evt","event":"file.start","data":{"transferId":"t_7","name":"lesson.pdf","size":123456,"mime":"application/pdf"}}
@@ -213,11 +225,44 @@ Content script делает `fetch(url, {credentials:"include"})`, читает
 {"type":"evt","event":"file.end","data":{"transferId":"t_7","sha256":"..."}}
 ```
 
+res на `fetchFile` — `{transferId,size,mime}` СРАЗУ после HTTP-заголовков
+(до стриминга): серверный transport-timeout 120 c покрывает только «старт»,
+а не весь трансфер; сервер дожидается завершения по `file.end`
+(`expectTransfer`, параллельно с res). Ошибки ДО `file.start` (HTTP != 2xx,
+сетевой сбой fetch) — res ошибкой `FETCH_FAILED`, ожидание в релее снимается
+(`cancelExpect`). Сбой ПОСРЕДИ стрима (в т.ч. отказ/таймаут ack) →
+evt `file.abort {transferId, reason}` — трансфер фейлится на сервере.
+
 Backpressure: расширение ждёт evt `file.ack {transferId, seq}` от сервера перед
-отправкой следующего чанка (таймаут ack 15 c → `file.abort`). Ошибка →
-evt `file.abort {transferId, reason}` и res ошибкой `FETCH_FAILED`.
+отправкой следующего чанка (таймаут ack 20 c → `file.abort`).
 Сервер пишет в `<repo>/downloads/<uniquified name>` и строку в
 `downloads/manifest.jsonl` `{ts,url,name,size,sha256,status}`.
+
+Referer/Origin: CDN редирект-целей проверяет их, а фоновый запрос расширения
+по умолчанию нёс бы `Origin: moz-extension://…`. На время трансфера background
+ставит точечный webRequest-rewriter (MV2, `onBeforeSendHeaders` + blocking,
+право `webRequestBlocking`): `Referer` = URL вкладки, `Origin` = её origin;
+правятся только запросы этого трансфера (первый хоп — фоновый запрос ровно на
+url из fetchFile, дальше — хопы редиректа по requestId), слушатель снимается
+по завершении. В MV3 service worker webRequest без bindings → rewriter не
+ставится, fetch идёт с заголовками по умолчанию (известная деградация
+Chromium-варианта).
+
+Нюанс trust-model: background-fetch следует cross-origin редиректам свободно;
+политика проверяет только НАЧАЛЬНЫЙ url (`fetchFile.url` + домен вкладки) —
+цель редиректа отдельно не проверяется (тот же trust-model, что навигация
+браузера по редиректу).
+
+MV3: трансфер минутами живёт в service worker — WS-трафик (file.chunk/ack)
+сбрасывает idle-таймер (Chrome 116+, подтверждено спайком G1); страховка —
+штатный alarms-keepalive (keepalive.js), отдельного механизма под трансфер
+не требуется.
+
+Известное ограничение: сайты, отдающие файл через СОБСТВЕННЫЙ service worker
+(раздача из Cache API / синтезированный Response только в контексте страницы),
+background-fetch обойдёт — такой ответ увидит только запрос из контекста
+страницы. Обходного content-script-пути нет (единый путь — осознанное решение:
+меньше расхождений).
 
 MCP-прогресс (П.5): на каждый принятый чанк сервер (поверх релея, без влияния
 на ack/backpressure) шлёт MCP-клиенту `notifications/progress`

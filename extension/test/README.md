@@ -14,7 +14,7 @@ NB: буквальная форма `node --test extension/test/` (катало�
 аргументом) на Node v22.23.2 НЕ работает — runner принимает позиционные
 аргументы за glob-паттерны и пытается исполнить сам каталог как модуль
 (MODULE_NOT_FOUND). Это особенность версии Node, а не тестов; рабочие формы —
-выше, все 28 тестов зелёные.
+выше, все 48 тестов зелёные.
 
 Моки (`helpers.mjs`): глобалы `chrome`/`browser`, storage.local, события
 (`makeEvent().fire(...)`). Скрипты расширения — не ESM, поэтому грузятся в
@@ -28,3 +28,7 @@ vm-песочницу (`loadScript`) с подменёнными глобала�
   default-deny, popup-назначение, очистка);
 - `config.test.mjs` — миграция конфига single→list;
 - `keepalive.test.mjs` — alarms-keepalive MV3 service worker.
+- `file-relay.test.mjs` — фоновый файловый релей: вектора SHA-256 (sha256.js),
+  потоковая сборка чанков из fake ReadableStream, backpressure по ack,
+  ранний res после заголовков, маппинг ошибок (HTTP/сеть/сбой стрима),
+  подмена Referer/Origin через webRequest.

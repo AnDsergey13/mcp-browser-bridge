@@ -58,7 +58,7 @@ function boot(storageData) {
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  for (const f of ["config.js", "owners.js", "keepalive.js", "injector.js", "background.js"]) {
+  for (const f of ["config.js", "owners.js", "keepalive.js", "injector.js", "sha256.js", "file-relay.js", "background.js"]) {
     vm.runInContext(readFileSync(path.join(SRC, f), "utf8"), sandbox, { filename: f });
   }
   return { browser, getAlarm: () => alarmArmed };
