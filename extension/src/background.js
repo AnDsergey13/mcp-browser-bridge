@@ -649,7 +649,10 @@ function matchPatternToRegExp(pattern) {
     hostRe = host.split("*").map(escapeRe).join("[^/]*");
   }
   const pathRe = m[3].split("*").map(escapeRe).join(".*");
-  return new RegExp("^" + scheme + "://" + hostRe + pathRe + "$");
+  // В проверяемом URL может быть явный порт (match patterns его не несут —
+  // MDN), поэтому порт допускаем опционально, иначе "*://127.0.0.1/*"
+  // не матчит "http://127.0.0.1:8077/".
+  return new RegExp("^" + scheme + "://" + hostRe + "(?::\\d+)?" + pathRe + "$");
 }
 
 function urlMatchesPolicy(patterns, url) {

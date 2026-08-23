@@ -1,7 +1,7 @@
 // injector.test.mjs — выбор ветки по доступным API, регистрация/перерегистрация.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { loadScript, makeBrowser, makeChrome, j } from "./helpers.mjs";
+import { loadScript, makeBrowser, makeChrome, makeEvent, j } from "./helpers.mjs";
 
 const PATTERNS = ["*://*.a.com/*", "*://b.com/*"];
 
@@ -105,4 +105,25 @@ test("MV3-ветка: смена политики — unregister старых id
   const regs = chrome.calls.filter((c) => c[0] === "scripting.registerContentScripts");
   assert.equal(regs.length, 2);
   assert.deepEqual(j(regs[1][1][0].matches), ["*://c.com/*"]);
+});
+
+test("fallback: URL с явным портом матчит паттерн без порта (MDN: порт в match pattern недопустим)", async () => {
+  const executed = [];
+  const tabs = {
+    onUpdated: makeEvent(),
+    executeScript: async (tabId, opts) => {
+      executed.push([tabId, opts.file]);
+    },
+  };
+  const browser = makeBrowser({ tabs });
+  const { exported: inj } = loadScript("injector.js", "BridgeInjector", { browser });
+  assert.equal(inj.detectMode(), "fallback");
+
+  const r = await inj.applyPolicy({ match_patterns: ["*://127.0.0.1/*"] });
+  assert.equal(r.registered, true);
+
+  tabs.onUpdated.fire(7, { status: "complete" }, { id: 7, url: "http://127.0.0.1:8077/" });
+  await new Promise((resolve) => setTimeout(resolve, 0)); // hasHostPermission().then
+  assert.ok(executed.length > 0, "content scripts инжектируются в URL с портом");
+  assert.equal(executed[0][0], 7);
 });
