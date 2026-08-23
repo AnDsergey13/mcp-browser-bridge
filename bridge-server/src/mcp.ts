@@ -1,4 +1,4 @@
-// mcp.ts — 21 MCP-инструмент (фаза 7 + act.hover/page.console). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
+// mcp.ts — 22 MCP-инструмента (фаза 7 + act.hover/page.console + page.eval). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
 // Здесь же общее состояние моста: реестр вкладок, кэш снапшотов (для классификатора
 // и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу.
 // Фаза 9 (D5, D6): мультиклиентность — реестры по ключу `clientId:tabId`,
@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Transport, BridgeError, type SessionState } from './transport.ts';
-import { PolicyEngine, hostOf, type GatedCategory, type ResolvedDomain } from './policy.ts';
+import { PolicyEngine, hostOf, type Capability, type GatedCategory, type ResolvedDomain } from './policy.ts';
 import { classifyUrl, classifyElement, parseSnapshotRefs, type ElementMeta } from './classifier.ts';
 import { Pacing, PacingLimitError } from './pacing.ts';
 import { capResponse } from './compress.ts';
@@ -40,7 +40,10 @@ const SWEEP_INTERVAL_MS = 60_000;
 
 const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for', 'page.console']);
 // page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
-const ACT_TOOLS = new Set(['act.click', 'act.hover', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan']);
+// page.eval — тоже ACT_TOOLS (L1.1): вызовы учитываются в pacing-окне 30 act/мин,
+// иначе скрипт через файл-REPL получил бы скорострельный обход human-pacing.
+// Capability у page.eval своя ('eval') — переопределяется в шаге 6 callTool.
+const ACT_TOOLS = new Set(['act.click', 'act.hover', 'act.type', 'act.select', 'act.scroll', 'act.key', 'act.batch', 'page.scan', 'page.eval']);
 
 function shortHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -307,7 +310,7 @@ export class BridgeCore {
       if (name === 'policy.request_preset') return finish(await this.toolRequestPreset(String(args['name'] ?? ''), reminder, clientId));
 
       // 6. Определяем целевой URL и capability.
-      const capability = PAGE_TOOLS.has(name) ? 'read' : ACT_TOOLS.has(name) ? 'interact' : name === 'file.download' ? 'download' : null;
+      const capability = name === 'page.eval' ? 'eval' : PAGE_TOOLS.has(name) ? 'read' : ACT_TOOLS.has(name) ? 'interact' : name === 'file.download' ? 'download' : null;
       let targetUrl: string | null = null;
       if (name === 'tab.open') {
         targetUrl = String(args['url'] ?? '');
@@ -329,7 +332,7 @@ export class BridgeCore {
       // для gated недопустим. Одинаковые категории проверяются один раз.
       if (targetUrl) {
         for (const category of this.classifyAll(name, args, tabId, clientId, targetUrl)) {
-          const check = this.policy.check(targetUrl, capability as 'read' | 'interact' | 'download' | null, category, clientId ?? undefined);
+          const check = this.policy.check(targetUrl, capability as Capability | null, category, clientId ?? undefined);
           if (check.decision === 'deny') return finish(this.fail(check.error_code, check.hint, reminder()));
           resolved = check.resolved;
           if (check.decision === 'consent') {
@@ -366,8 +369,9 @@ export class BridgeCore {
         : urlForReminder;
       resolved = urlForReminder ? this.policy.resolveDomain(urlForReminder) : resolved;
 
-      // 10. N15: контент страниц — untrusted.
-      if ((PAGE_TOOLS.has(name) || name === 'page.scan') && data && typeof data === 'object') {
+      // 10. N15: контент страниц — untrusted (результат page.eval — тоже:
+      // страница может подделать ответ MAIN-world runner'а).
+      if ((PAGE_TOOLS.has(name) || name === 'page.scan' || name === 'page.eval') && data && typeof data === 'object') {
         (data as Record<string, unknown>)['untrusted_page_content'] = true;
       }
 
@@ -421,6 +425,10 @@ export class BridgeCore {
 
   private classify(name: string, args: Record<string, unknown>, tabId: number | null, clientId: string | null, targetUrl: string): GatedCategory | null {
     if (name === 'tab.open') return classifyUrl(targetUrl);
+    // page.eval (L1.1): DOM-элемента нет, категория — всегда 'eval' (gated
+    // confirm по умолчанию): eval обходит action-модель gated, поэтому
+    // подтверждение обязательно независимо от содержимого expression.
+    if (name === 'page.eval') return 'eval';
     if (tabId !== null && clientId !== null) return this.classifyAct(name, args, tabId, clientId);
     return null;
   }
@@ -458,6 +466,11 @@ export class BridgeCore {
 
   private describeAction(name: string, args: Record<string, unknown>): string {
     if (name === 'tab.open') return `Открыть ${String(args['url'] ?? '')}`;
+    // page.eval: пользователь обязан видеть, ЧТО будет исполнено (consent-баннер).
+    if (name === 'page.eval') {
+      const expr = String(args['expression'] ?? '').replace(/\s+/g, ' ').trim();
+      return `page.eval: ${expr.slice(0, 120)}${expr.length > 120 ? '…' : ''}`;
+    }
     if (name === 'act.batch') {
       const n = Array.isArray(args['steps']) ? (args['steps'] as unknown[]).length : 0;
       return `act.batch (${n} шагов)`;
@@ -674,6 +687,8 @@ export class BridgeCore {
       case 'page.scan':
         // П2-3: контентный дедлайн 45 с — транспортный таймаут больше.
         return this.pageCommand('scan', tabId, clientId!, { max_screens: args['max_screens'] }, 55000);
+      case 'page.eval':
+        return this.executeEval(tabId, clientId!, args);
       case 'file.download':
         return this.executeDownload(tabId, clientId!, String(args['url'] ?? ''), args['name'] ? String(args['name']) : undefined, onProgress);
       default:
@@ -732,6 +747,56 @@ export class BridgeCore {
     if (tabId !== null && typeof res?.url === 'string') {
       this.tabs.set(this.tabKey(clientId, tabId), { tabId, url: res.url, title: typeof res.title === 'string' ? res.title : '', clientId, ts: Date.now() });
     }
+    return res;
+  }
+
+  /**
+   * page.eval (L1.1): выполнение JS в MAIN world вкладки. Гейтинг — в callTool
+   * (capability 'eval' + gated 'eval: confirm' + pacing); здесь — исполнение,
+   * аудит expression в policy-audit.jsonl (N17) и маршрутизация больших
+   * результатов (>16 KB) через файловый релей в downloads/ (иначе серверная
+   * резка N7 вернула бы обрубок JSON). Ожидание трансфера регистрируется ДО
+   * запроса (как executeDownload); инлайн-ответ — ожидание снимается
+   * (cancelExpect, паттерн фикса A: протухшее ожидание не должно приклеиться
+   * к чужому трансферу по FIFO).
+   */
+  private async executeEval(tabId: number | null, clientId: string, args: Record<string, unknown>): Promise<unknown> {
+    const expression = String(args['expression'] ?? '');
+    if (!expression.trim()) throw new BridgeError('INTERNAL', 'page.eval: пустое expression');
+    const timeoutMs = Math.min(Math.max(Number(args['timeout_ms']) || 10000, 500), 30000);
+    const tabUrl = tabId !== null ? (this.tabs.get(this.tabKey(clientId, tabId))?.url ?? '') : '';
+    const domain = tabUrl ? (this.policy.resolveDomain(tabUrl, clientId)?.key ?? hostOf(tabUrl)) : '';
+    const exprSha256 = crypto.createHash('sha256').update(expression).digest('hex');
+    const auditEval = (decision: string) => this.policy.audit({
+      kind: 'eval', domain, browser: clientId, decision,
+      expression_sha256: exprSha256, expression_preview: expression.slice(0, 500),
+    });
+
+    const relayKey = `eval:tab${tabId ?? 0}`;
+    const transferPromise = this.downloads.expectTransfer(relayKey, clientId);
+    transferPromise.catch(() => {}); // страховка от unhandled rejection
+    let res: Record<string, unknown>;
+    try {
+      res = await this.pageCommand('eval', tabId, clientId, {
+        expression, awaitPromise: args['awaitPromise'], timeout_ms: timeoutMs,
+      }, timeoutMs + 15000) as Record<string, unknown>;
+    } catch (err) {
+      this.downloads.cancelExpect(clientId, relayKey);
+      auditEval('eval_error');
+      throw err;
+    }
+    if (res['relayed'] === true) {
+      try {
+        const completed = await transferPromise;
+        auditEval('eval_exec_relayed');
+        return { ...res, file: completed.name, size: completed.size, sha256: completed.sha256 };
+      } catch (err) {
+        auditEval('eval_error');
+        throw err;
+      }
+    }
+    this.downloads.cancelExpect(clientId, relayKey);
+    auditEval('eval_exec');
     return res;
   }
 
@@ -800,6 +865,7 @@ export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
     ['page.console', 'Кольцевой буфер console.*/onerror страницы (≤100 записей {ts,level,text}, text ≤500 символов) — диагностика «почему клик не сработал». MAIN-world хук; жёсткий CSP страницы может его запретить → честный маркер console_unavailable, а не молчаливый пустой буфер', { tabId, limit: z.number().max(100).optional(), browser }],
+    ['page.eval', 'Выполнить JS в MAIN world вкладки (window-состояние SPA, fetch к внутренним API страницы; awaitPromise:true по умолчанию await\'ит Promise результата). Мощный примитив: capability eval per-domain + gated eval:confirm (пользователь видит expression в баннере), expression пишется в policy-audit, вызов идёт в pacing-окно 30 act/мин. Ответ untrusted (N15). Результат ≤16 KB — инлайн {value_json, value_type}; больше — автоматически файловым релеем в downloads/ ({relayed:true, file, size, sha256}). CSP страницы может запретить MAIN-world runner → EVAL_UNAVAILABLE: это СТОП и доклад, не обход', { tabId, expression: z.string().min(1), awaitPromise: z.boolean().optional(), timeout_ms: z.number().max(30000).optional(), browser }],
     ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
     ['act.hover', 'Наведение на элемент без клика (ref из снапшота ИЛИ text): раскрыть hover-меню/тултип/подсказку. Gated-классификация — как у act.click', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],

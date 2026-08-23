@@ -496,6 +496,119 @@
     }
   })();
 
+  // ---------- page.eval: MAIN-world исполнитель (L1.1) ----------
+  // Тот же путь, что у console-хука: eval-runner.js из web_accessible_resources
+  // исполняет выражение в MAIN world (window-состояние страницы), обмен —
+  // postMessage с requestId. Гейтинг (capability eval, gated eval:confirm,
+  // аудит, pacing) — на сервере; здесь только честное исполнение пропущенного.
+  // CSP запретил загрузку runner'а → EVAL_UNAVAILABLE (честный маркер,
+  // как console_unavailable), а не молчаливый отказ.
+  const EVAL_INLINE_CAP = 16000; // символов JSON инлайн; больше — файловый релей
+  const EVAL_DEFAULT_TIMEOUT_MS = 10000;
+  let evalHookState = "pending"; // pending | ok | failed
+  let evalReqSeq = 0;
+  const evalPending = new Map(); // requestId → {resolve, timer}
+
+  (function injectEvalRunner() {
+    try {
+      const s = document.createElement("script");
+      s.src = browser.runtime.getURL("src/eval-runner.js");
+      s.onload = () => {
+        evalHookState = "ok";
+        s.remove();
+      };
+      s.onerror = () => {
+        evalHookState = "failed";
+        s.remove();
+      };
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {
+      evalHookState = "failed";
+    }
+  })();
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const d = event.data;
+    if (!d || d.__bridge_eval_result !== true) return;
+    const p = evalPending.get(String(d.requestId || ""));
+    if (!p) return;
+    evalPending.delete(String(d.requestId || ""));
+    clearTimeout(p.timer);
+    p.resolve(d);
+  });
+
+  /**
+   * Большой результат уходит файловым релеем в downloads/ (иначе
+   * RESPONSE_TOO_LARGE от серверной резки — L1.1). Релей делает background
+   * (kind:"relayText"), res на команду уходит сразу — трансфер доживает в
+   * фоне, сервер ждёт его по expectTransfer (как fetchFile).
+   */
+  function relayEvalResult(text) {
+    const transferId = "ev_" + Date.now().toString(36) + "_" + ++evalReqSeq;
+    browser.runtime
+      .sendMessage({
+        kind: "relayText",
+        transferId,
+        name: "eval-result-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json",
+        text,
+      })
+      .catch(() => {}); // релей — best effort; серверный expect оттаймаутится честно
+    return transferId;
+  }
+
+  async function evalHandler(params) {
+    if (evalHookState === "failed") {
+      throw cerr(
+        "EVAL_UNAVAILABLE",
+        "MAIN-world eval-runner не загрузился (CSP страницы?) — eval невозможен"
+      );
+    }
+    const expression = String(params.expression || "");
+    if (!expression.trim()) throw cerr("INTERNAL", "page.eval: пустое expression");
+    const timeoutMs = Math.min(
+      Math.max(Number(params.timeout_ms) || EVAL_DEFAULT_TIMEOUT_MS, 500),
+      30000
+    );
+    const requestId = "evq_" + Date.now().toString(36) + "_" + ++evalReqSeq;
+    const response = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        evalPending.delete(requestId);
+        reject(cerr("EVAL_TIMEOUT", "eval не завершился за " + timeoutMs + " мс"));
+      }, timeoutMs);
+      evalPending.set(requestId, { resolve, timer });
+      window.postMessage(
+        {
+          __bridge_eval: true,
+          requestId,
+          expression,
+          awaitPromise: params.awaitPromise !== false,
+        },
+        "*"
+      );
+    });
+    if (!response.ok) {
+      throw cerr("EVAL_ERROR", String((response.error && response.error.message) || "ошибка eval"));
+    }
+    const json = String(response.json == null ? "null" : response.json);
+    const bytes = json.length;
+    if (bytes > EVAL_INLINE_CAP) {
+      const transferId = relayEvalResult(json);
+      return Object.assign(pageState(), {
+        relayed: true,
+        transferId,
+        value_type: String(response.value_type || ""),
+        bytes,
+      });
+    }
+    return Object.assign(pageState(), {
+      value_json: json,
+      value_type: String(response.value_type || ""),
+      bytes,
+    });
+  }
+
+
   // ---------- обработчики команд ----------
   const handlers = {
     // Опрос после навигации, инициированной background'ом или полной перезагрузкой.
@@ -676,6 +789,10 @@
         out.console_unavailable = "MAIN-world хук не загрузился (CSP страницы?) — буфер не пишется";
       }
       return out;
+    },
+
+    async eval(params) {
+      return evalHandler(params || {});
     },
   };
 

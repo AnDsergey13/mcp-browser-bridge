@@ -37,7 +37,19 @@
 
 ## L.1 Тир 1 — ядро лаборатории (оценка 2–3 дня суммарно)
 
-### L1.1 `page.eval {tabId, expression, awaitPromise?, world:"MAIN"}` — ☐ кандидат
+### L1.1 `page.eval {tabId, expression, awaitPromise?, world:"MAIN"}` — ✔ сделано (2026-08-23; живой прогон на хосте: consent-баннер с expression, DOM-вставка на 127.0.0.1:8077, аудит consent_allow/eval_exec подтверждён)
+
+- **Статус 2026-08-23:** реализовано. MAIN-world runner `src/eval-runner.js`
+  (web_accessible_resources + postMessage, как console-hook — единый путь для
+  Firefox/Chromium, wrappedJSObject не понадобился); двойной гейт: capability
+  `eval` per-domain + gated `eval: confirm` (дефолт; consent-баннер показывает
+  expression); expression в policy-audit.jsonl (preview + sha256); pacing-окно
+  30 act/мин (page.eval в ACT_TOOLS); ответ `untrusted_page_content` (N15);
+  ≤16 KB инлайн, больше — файловый релей в `downloads/eval-result-*.json`;
+  CSP → `EVAL_UNAVAILABLE`, таймаут → `EVAL_TIMEOUT`, исключение → `EVAL_ERROR`.
+  Живая проверка (lab-полигон, перезагрузка расширения, `eval` в capabilities
+  и hard_floor policy.yaml — правит пользователь) — на хосте, до неё пункт не
+  закрывать.
 
 - Что даёт: сырой DOM, window-состояние SPA, GraphQL-клиенты, localStorage,
   произвольные выборки, чтение закрытых для снапшота структур. Заменяет

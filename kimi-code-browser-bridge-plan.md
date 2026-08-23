@@ -508,6 +508,14 @@ MVP (фазы 0–3 базово + 4 базово): ~1.5–2.5k строк су�
   untrusted-ответ маркировать как контент страницы (N15).
   → Каталог, предохранители и статус: `lab-expansion-plan.md`, пункт L1.1.
 
+- **UX consent-баннера `page.eval`** (живая приёмка 2026-08-23, запрос
+  пользователя): (а) баннер показывает expression обрезанным (~120 символов)
+  — нельзя прочитать весь внедряемый код перед «Разрешить»: нужен
+  скролл/разворачивание полного expression и кнопка «копировать»;
+  (б) в баннере виден только домен — не видно, В КАКУЮ вкладку/страницу
+  внедряется JS: показывать title + URL вкладки-цели (consent.ask уже
+  получает tabId, осталось пробросить title/url в params баннера).
+
 ## Открытые риски (докладывать пользователю, не решать молча)
 
 - **У контейнера НЕТ прямого egress** (прокси 10.89.0.2:3128 → 403 на всё
@@ -706,11 +714,15 @@ popup, кнопка «сохранить session-грант в пресет», �
 
 ### Далее — отдельным решением пользователя (рисковые, но ценные; детали в lab-expansion-plan.md)
 
-6. `page.eval` (L1.1) — только после п.1 и п.3; полный набор предохранителей:
-   capability `eval` per-domain, gated `eval: confirm` (предложение: внести
-   в hard_floor рядом с `pay`), аудит expression в policy-audit.jsonl,
-   untrusted-ответы (N15), cap результата + релей больших выгрузок,
-   `world:"MAIN"` с отдельным прогоном Firefox (wrappedJSObject).
+6. ✔ `page.eval` (L1.1) — **сделано 2026-08-23** (сервер 76/76, extension
+   59/59, поверхность 22 инструмента): MAIN-world runner через
+   web_accessible_resources (единый путь Firefox/Chromium), capability `eval`
+   per-domain + gated `eval: confirm`, аудит expression в policy-audit.jsonl,
+   untrusted (N15), pacing-окно, ≤16 KB инлайн / больше — релей в downloads/,
+   CSP → EVAL_UNAVAILABLE. Живая проверка на хосте пройдена: consent-баннер с
+   expression (consent_allow), DOM-вставка на 127.0.0.1:8077, аудит
+   eval_exec с sha256 — всё подтверждено. `eval` добавляется в capabilities
+   доменов правкой policy.yaml (popup-чекбокс — отдельным решением).
 7. `net.watch` (L1.2) — строго Firefox-first (webRequest/filterResponseData);
    Chromium-хук — отдельное решение (детектится антиботами); CDP не брать.
    Обязательны фильтр по URL и лимит тел — иначе удар по токен-экономике.

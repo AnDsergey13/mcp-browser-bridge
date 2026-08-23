@@ -220,6 +220,23 @@ export class MockExtension {
           ...(t.consoleUnavailable ? { console_unavailable: t.consoleUnavailable } : {}),
         };
       }
+      case 'eval': {
+        // page.eval (L1.1): вкладка отдаёт scripted результат. t.evalResult —
+        // готовая JSON-строка (≤16 KB → инлайн; больше — имитация релея, как
+        // content-bridge: file.* события + {relayed:true}); t.evalError —
+        // ошибка исполнения со стороны страницы.
+        const t = this.tabOrThrow(p.tabId);
+        (this.actions ??= []).push('eval');
+        this.lastEvalParams = p;
+        if (t.evalError) throw Object.assign(new Error(t.evalError), { code: 'EVAL_ERROR' });
+        if (t.evalUnavailable) throw Object.assign(new Error('MAIN-world eval-runner не загрузился (CSP страницы?)'), { code: 'EVAL_UNAVAILABLE' });
+        const json = String(t.evalResult ?? 'null');
+        if (json.length > 16000) {
+          this.serveFile({}, { name: 'eval-result.json', content: Buffer.from(json) }).catch(() => {});
+          return { url: t.url, title: t.title, flags: t.flags, relayed: true, transferId: 'mock-relay', value_type: 'string', bytes: json.length };
+        }
+        return { url: t.url, title: t.title, flags: t.flags, value_json: json, value_type: 'object', bytes: json.length };
+      }
       case 'waitFor': {
         const t = this.tabOrThrow(p.tabId);
         const cond = p.condition ?? {};
@@ -261,8 +278,8 @@ export class MockExtension {
    * как background-релей: transport-timeout сервера покрывает только старт)
    * → chunk (ждём ack) → file.end.
    */
-  async serveFile(p) {
-    const file = this.fileToServe;
+  async serveFile(p, fileOverride) {
+    const file = fileOverride ?? this.fileToServe;
     if (!file) return;
     const transferId = `t_${++transferSeq}`;
     const content = file.content;

@@ -7,7 +7,7 @@
   "optional_host_permissions": ["<all_urls>"],
   "web_accessible_resources": [
     {
-      "resources": ["src/console-hook.js"],
+      "resources": ["src/console-hook.js", "src/eval-runner.js"],
       "matches": ["<all_urls>"]
     }
   ],

@@ -100,10 +100,10 @@ bash /путь/к/mcp-browser-bridge/start-relay.sh
 
 ## Использование
 
-- **Агенту** доступен 21 MCP-инструмент: `policy.status`,
+- **Агенту** доступен 22 MCP-инструмента: `policy.status`,
   `policy.request_preset`, `tab.list` / `tab.open` / `tab.close`,
   `page.snapshot` / `page.extract` / `page.find` / `page.screenshot` /
-  `page.wait_for` / `page.scan` / `page.console`, `act.click` / `act.hover` /
+  `page.wait_for` / `page.scan` / `page.console` / `page.eval`, `act.click` / `act.hover` /
   `act.type` / `act.select` / `act.scroll` / `act.key` / `act.batch`,
   `file.download`, `net.list`
   (в Chromium недоступен — нет webRequest в MV3 service worker).

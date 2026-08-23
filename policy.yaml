@@ -18,6 +18,7 @@ gated_defaults:
 # если в пресете нет явного `allow_unsafe: true`.
 hard_floor:
   pay: confirm
+  eval: confirm
 
 # N6: human-pacing
 pacing:
@@ -31,11 +32,11 @@ presets:
     # pacing можно переопределить на уровень пресета (доверенные/локальные —
     # быстрее): pacing: { min_delay_ms: 100, max_delay_ms: 600, max_actions_per_minute: 60 }
     domains:
-      "localhost:8080":
-        capabilities: [read, interact]
+      "localhost:18547":
+        capabilities: [read, interact, eval]
         gated: { login: auto, submit: auto, delete: confirm }
-      "127.0.0.1:3000":
-        capabilities: [read, interact]
+      "127.0.0.1:8077":
+        capabilities: [eval]
         gated: { login: auto }
 
   course:

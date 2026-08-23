@@ -5,11 +5,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
 
-export type GatedCategory = 'pay' | 'login' | 'submit' | 'delete';
+// 'eval' (L1.1): выполнение JS в MAIN world — мощный примитив (обходит
+// action-модель gated), поэтому default confirm и рекомендация держать
+// `eval: confirm` в hard_floor policy.yaml.
+export type GatedCategory = 'pay' | 'login' | 'submit' | 'delete' | 'eval';
 export type GatedDecision = 'auto' | 'confirm' | 'deny';
-export type Capability = 'read' | 'interact' | 'download';
+export type Capability = 'read' | 'interact' | 'download' | 'eval';
 
-export const GATED_CATEGORIES: GatedCategory[] = ['pay', 'login', 'submit', 'delete'];
+export const GATED_CATEGORIES: GatedCategory[] = ['pay', 'login', 'submit', 'delete', 'eval'];
 
 // Сила решения: чем больше — тем безопаснее. hard_floor запрещает ослабление.
 const STRENGTH: Record<GatedDecision, number> = { auto: 0, confirm: 1, deny: 2 };
