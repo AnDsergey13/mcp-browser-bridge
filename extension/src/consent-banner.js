@@ -123,7 +123,9 @@
 
       wrap.querySelector(".allow").addEventListener("click", () => finish("allow"));
       wrap.querySelector(".deny").addEventListener("click", () => finish("deny"));
-      wrap.querySelector(".allow10").addEventListener("click", () => finish("allow_10min"));
+      // В grant-режиме (П2-5) кнопка «10 мин» удалена выше — слушатель только при наличии.
+      const allow10Btn = wrap.querySelector(".allow10");
+      if (allow10Btn) allow10Btn.addEventListener("click", () => finish("allow_10min"));
 
       function renderTimer() {
         const left = Math.max(0, deadline - Date.now());
