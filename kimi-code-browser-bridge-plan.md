@@ -636,7 +636,7 @@ ExtensionManifestV2Availability выпилена в 139, последние фл
 **Остатки прошлых планов (не реализовано):** фаза 6 — `state/current-task.json`
 (чекпоинт pause/resume, task.pause_status) и `memory/facts.md`; фаза 8 —
 prompt-injection тест, нагрузка 50 страниц, приёмочный чеклист (10 сценариев);
-backlog — in-page баннер download-гранта на домен файла, per-site gated-UI в
+backlog — per-site gated-UI в
 popup, кнопка «сохранить session-грант в пресет», полноценный фикс таймаута
 больших загрузок (MCP progress-нотификации; hint-минимум сделан).
 
@@ -653,8 +653,8 @@ popup, кнопка «сохранить session-грант в пресет», �
 
 ### Подтверждённое состояние на 2026-08-18
 
-- optimization_plan: П0, П1, П2-3, П2-4 — реализованы; П2-5 (in-page баннер
-  download-гранта) — в backlog.
+- optimization_plan: П0, П1, П2-3, П2-4, П2-5 — реализованы (П2-5: in-page
+  баннер download-гранта — 2026-09-19, см. п.8 очереди ниже).
 - Фазы 0–5, 7, 9 — сделано. Фаза 6 — частично (нет `state/current-task.json`,
   `memory/facts.md`, `task.pause_status`). Фаза 8 — не начата.
 - `act.hover`: обработчик готов (`content-bridge.js:676`, mock-extension),
@@ -726,8 +726,15 @@ popup, кнопка «сохранить session-грант в пресет», �
 7. `net.watch` (L1.2) — строго Firefox-first (webRequest/filterResponseData);
    Chromium-хук — отдельное решение (детектится антиботами); CDP не брать.
    Обязательны фильтр по URL и лимит тел — иначе удар по токен-экономике.
-8. П2-5 in-page баннер download-гранта (уже в backlog; текст баннера — про
-   домен ФАЙЛА, а не вкладки).
+8. ✔ П2-5 in-page баннер download-гранта — **сделано 2026-09-19** (сервер
+   82/82, extension 59/59): deny `file.download` на домене ФАЙЛА → серверный
+   req `grant.ask` в браузер-владелец вкладки; баннер — режим `grant:true` в
+   consent-banner.js (allow «Разрешить скачивание (на сессию)», без «10 мин»),
+   текст — про домен ФАЙЛА, а не вкладки; при allow background сам шлёт
+   `grant.add` (download, session) до ответа → повторный policy.check проходит
+   без ретрая агента. Fail-closed (таймаут/сбой → исходная ошибка), анти-спам:
+   pending-дедуп по (clientId, domain) + deny-кэш 10 мин; deny несёт
+   `data:{domain}`. Тесты — bridge-server/test/grant-ask.test.mjs.
 9. iframe (L2.1) — политика обязана проверять origin ФРЕЙМА; самая дорогая
    переделка, делать последней.
 

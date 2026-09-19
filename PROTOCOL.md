@@ -214,6 +214,23 @@ Gated-действие: сервер → ext req `consent.ask`
 `{decision:"allow"|"deny"|"allow_10min"}`. По таймауту расширение само шлёт
 `deny`. `allow_10min` — сервер кэширует решение на (domain, category) на 10 мин.
 
+Download-грант с баннера (П2-5): когда `file.download` получает deny
+(`DOMAIN_NOT_ALLOWED` / `CAPABILITY_DENIED`) на домене ФАЙЛА, сервер шлёт
+ext req `grant.ask` `{requestId, category:"download_grant", grant:true, domain,
+ url, description, tabId, timeout_ms}` в браузер-владелец вкладки-источника
+(таймаут транспорта — `timeout_ms + 1000`, как у consent.ask). `domain` —
+домен ФАЙЛА, не вкладки. Расширение рисует тот же shadow-DOM баннер в режиме
+гранта: allow подписан «Разрешить скачивание (на сессию)», кнопки «10 мин» нет
+(кэш категорий бессмысленен для гранта домену). Ответ `{decision:"allow"|"deny"}`;
+таймаут/сбой/невалидный ответ → `deny` (fail-closed). При `allow` расширение
+СНАЧАЛА шлёт `grant.add {domain, capabilities:["download"], scope:"session"}`
+и лишь затем отвечает на `grant.ask` — порядок на одном WS гарантирует, что
+грант применён до повторного policy.check сервера: загрузка продолжается без
+ретрая агента. Анти-спам на сервере: pending-дедупликация запросов по
+`(clientId, domain)` и deny-кэш 10 минут после deny/таймаута (пакетная загрузка
+с одного CDN не спамит баннерами). Ошибка deny на `file.download` несёт
+`data:{domain}` — домен файла машиночитаем, а не только текстом в hint.
+
 События паузы (ext→server evt):
 - `pause.global` `{paused:bool}` — красная кнопка в popup.
 - `pause.auto` `{tabId, reason, flags}` — контент-скрипт увидел капчу/челлендж/2FA.

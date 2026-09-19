@@ -1,6 +1,7 @@
 // mcp.ts — 22 MCP-инструмента (фаза 7 + act.hover/page.console + page.eval). Каждый ответ: {ok, data|error_code, hint, policy_reminder}.
 // Здесь же общее состояние моста: реестр вкладок, кэш снапшотов (для классификатора
-// и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу.
+// и reconcile), паузы (pause.global / pause.auto / resume + STATE_DIVERGED), gating-флоу
+// (consent.ask; П2-5: grant.ask — баннер download-гранта при deny на file.download).
 // Фаза 9 (D5, D6): мультиклиентность — реестры по ключу `clientId:tabId`,
 // опциональный параметр browser во всех tab-инструментах, AMBIGUOUS_BROWSER
 // при коллизии tabId, consent/события — в браузер-владелец вкладки.
@@ -37,6 +38,11 @@ interface AutoPause { reason: string; checkpoint: { url: string | null; dom_hash
 // (страховка на случай, если tab.list больше не зовут — напр. браузер офлайн).
 const REGISTRY_TTL_MS = 30 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
+// П2-5: deny-кэш баннера download-гранта — после deny/таймаута grant.ask
+// повторные deny по (clientId, домен ФАЙЛА) 10 минут сразу идут в исходную
+// ошибку, без баннера: пакетная загрузка (десятки картинок с одного CDN
+// подряд) не должна спамить баннером на каждый файл.
+const GRANT_ASK_DENY_TTL_MS = 10 * 60_000;
 
 const PAGE_TOOLS = new Set(['page.snapshot', 'page.extract', 'page.find', 'page.screenshot', 'net.list', 'page.wait_for', 'page.console']);
 // page.scan живёт в ACT_TOOLS: скроллит страницу → capability interact + pacing (П2-3).
@@ -66,6 +72,11 @@ export class BridgeCore {
   private autoPaused = new Map<string, AutoPause>();
   private diverged = new Map<string, { url: string; dom_hash: string }>();
   private consentSeq = 0;
+  // П2-5: анти-спам grant.ask. pending — дедупликация параллельных deny по
+  // (clientId, домен) к одному баннеру; denyUntil — deny-кэш 10 мин.
+  // Ключ: `${clientId}\n${domain}`. allow не кэшируется: грант уже в policy engine.
+  private grantAskPending = new Map<string, Promise<'allow' | 'deny'>>();
+  private grantAskDenyUntil = new Map<string, number>();
   // П0-1: состояние версионирования policy_reminder.
   private reminderCounter = 0;
   private lastReminderHash: string | null = null;
@@ -100,6 +111,8 @@ export class BridgeCore {
   sweepExpired(now: number = Date.now()): void {
     for (const [key, t] of this.tabs) if (now - t.ts > REGISTRY_TTL_MS) this.tabs.delete(key);
     for (const [key, s] of this.snapshots) if (now - s.ts > REGISTRY_TTL_MS) this.snapshots.delete(key);
+    // П2-5: протухшие записи deny-кэша grant.ask тоже вытесняем — Map не растёт бесконечно.
+    for (const [key, until] of this.grantAskDenyUntil) if (until <= now) this.grantAskDenyUntil.delete(key);
   }
 
   close(): void {
@@ -332,8 +345,23 @@ export class BridgeCore {
       // для gated недопустим. Одинаковые категории проверяются один раз.
       if (targetUrl) {
         for (const category of this.classifyAll(name, args, tabId, clientId, targetUrl)) {
-          const check = this.policy.check(targetUrl, capability as Capability | null, category, clientId ?? undefined);
-          if (check.decision === 'deny') return finish(this.fail(check.error_code, check.hint, reminder()));
+          let check = this.policy.check(targetUrl, capability as Capability | null, category, clientId ?? undefined);
+          // П2-5: deny на file.download → in-page баннер download-гранта на
+          // вкладке-источнике (домен ФАЙЛА, не вкладки). Расширение при allow
+          // шлёт grant.add ДО ответа (порядок на одном WS), поэтому повторный
+          // check проходит без ретрая агента. Повторный deny (гонка: грант
+          // отозван между баннером и check) — честный fail ниже.
+          if (check.decision === 'deny' && name === 'file.download' && clientId !== null) {
+            const grant = await this.askDownloadGrant(clientId, tabId ?? 0, hostOf(targetUrl), targetUrl);
+            if (grant === 'allow') {
+              check = this.policy.check(targetUrl, capability as Capability | null, category, clientId);
+            }
+          }
+          if (check.decision === 'deny') {
+            // П2-5: домен файла — машиночитаемым полем data (сейчас он только текстом в hint).
+            const data = name === 'file.download' ? { domain: hostOf(targetUrl) } : undefined;
+            return finish(this.fail(check.error_code, check.hint, reminder(), data));
+          }
           resolved = check.resolved;
           if (check.decision === 'consent') {
             const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0, clientId!);
@@ -490,6 +518,53 @@ export class BridgeCore {
     } catch {
       return 'deny'; // таймаут/офлайн → запрет
     }
+  }
+
+  /**
+   * П2-5: grant.ask — баннер download-гранта на вкладке-источнике file.download
+   * (в браузер-владелец вкладки, как consent.ask). domain — домен ФАЙЛА.
+   * Анти-спам: повторный deny по (clientId, domain), пока висит баннер,
+   * присоединяется к тому же запросу (баннер всё равно один на страницу —
+   * consent-banner.js); после deny/таймаута — deny-кэш GRANT_ASK_DENY_TTL_MS.
+   */
+  private async askDownloadGrant(clientId: string, tabId: number, domain: string, url: string): Promise<'allow' | 'deny'> {
+    if (tabId === 0) return 'deny'; // вкладки-источника нет — баннеру некуда встать
+    const key = `${clientId}\n${domain}`;
+    const denyUntil = this.grantAskDenyUntil.get(key);
+    if (denyUntil && denyUntil > Date.now()) return 'deny';
+    const pending = this.grantAskPending.get(key);
+    if (pending) return pending;
+    const request = this.doAskDownloadGrant(clientId, tabId, domain, url);
+    this.grantAskPending.set(key, request);
+    try {
+      return await request;
+    } finally {
+      this.grantAskPending.delete(key);
+    }
+  }
+
+  /** Сам запрос grant.ask. Fail-closed (как askConsent): таймаут/офлайн/невалидный ответ → deny. */
+  private async doAskDownloadGrant(clientId: string, tabId: number, domain: string, url: string): Promise<'allow' | 'deny'> {
+    const requestId = `g_${++this.consentSeq}`;
+    let decision: 'allow' | 'deny' = 'deny';
+    try {
+      const res = await this.transport.request(clientId, 'grant.ask', {
+        requestId, category: 'download_grant', grant: true, domain, url,
+        description: `Агент просит download-доступ к этому домену файла: ${domain}. Грант действует до конца сессии и только в этом браузере.`,
+        tabId, timeout_ms: this.consentTimeoutMs,
+      }, this.consentTimeoutMs + 1000) as { decision?: string };
+      // allow_10min для грантов НЕТ: session-грант и так ограничен сессией.
+      if (res && (res.decision === 'allow' || res.decision === 'deny')) decision = res.decision;
+    } catch {
+      decision = 'deny'; // таймаут/офлайн → запрет
+    }
+    this.policy.audit({
+      kind: decision === 'allow' ? 'grant' : 'deny',
+      domain, browser: clientId, capability: 'download', url,
+      decision: decision === 'allow' ? 'grant_ask_allow' : 'grant_ask_deny',
+    });
+    if (decision === 'deny') this.grantAskDenyUntil.set(`${clientId}\n${domain}`, Date.now() + GRANT_ASK_DENY_TTL_MS);
+    return decision;
   }
 
   private toolPolicyStatus(): ToolPayload {
@@ -874,7 +949,7 @@ export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],
     ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string(), browser }],
     ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10), browser }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). При deny на домене ФАЙЛА пользователю сначала показывается in-page баннер download-гранта (П2-5): «Разрешить» выдаёт session-грант и загрузка продолжается без ретрая; deny/таймаут → исходная ошибка с data:{domain}. Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];

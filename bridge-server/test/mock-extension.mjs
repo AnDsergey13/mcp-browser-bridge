@@ -19,6 +19,10 @@ export class MockExtension {
    * @param opts.tabs — [{tabId, url, title, flags?, snapshot?, markdown?}]
    * @param opts.pages — {url: {title, snapshot, markdown, flags}} для tab.open
    * @param opts.consent — 'allow'|'deny'|'allow_10min'|'timeout'|function(params) => decision|'timeout'
+   * @param opts.grantAsk — scripted decision для grant.ask (П2-5): 'allow'|'deny'|
+   *   'timeout'|'throw'|function(params). На 'allow' мок, как background, сам шлёт
+   *   grant.add (download, session) ДО ответа на req. Default 'deny' — существующие
+   *   deny-тесты file.download не меняют поведения.
    * @param opts.fileToServe — {name, content:Buffer} для fetchFile
    */
   constructor(opts) {
@@ -38,10 +42,12 @@ export class MockExtension {
     }
     this.pages = opts.pages ?? {};
     this.consent = opts.consent ?? 'allow';
+    this.grantAsk = opts.grantAsk ?? 'deny';
     this.fileToServe = opts.fileToServe ?? null;
     this.fetchFails = false; // true → fetchFile отвечает ошибкой до file.start
     this.policyUpdates = [];
     this.consentRequests = [];
+    this.grantAskRequests = [];
     this.ws = null;
     this.reqSeq = 0;
     this.pendingRes = new Map();   // e_<n> → {resolve, reject}
@@ -259,6 +265,18 @@ export class MockExtension {
         this.consentRequests.push(p);
         const decision = typeof this.consent === 'function' ? this.consent(p) : this.consent;
         if (decision === 'timeout') return undefined; // не отвечаем — сервер оттаймаутится
+        return { decision };
+      }
+      case 'grant.ask': {
+        // П2-5: как background — на allow сначала шлём grant.add (download,
+        // session), и лишь затем отвечаем на req.
+        this.grantAskRequests.push(p);
+        const decision = typeof this.grantAsk === 'function' ? this.grantAsk(p) : this.grantAsk;
+        if (decision === 'timeout') return undefined; // не отвечаем — сервер оттаймаутится
+        if (decision === 'throw') throw Object.assign(new Error('grant.ask boom (mock)'), { code: 'INTERNAL' });
+        if (decision === 'allow') {
+          await this.sendReq('grant.add', { domain: p.domain, capabilities: ['download'], scope: 'session' });
+        }
         return { decision };
       }
       case 'fetchFile': {

@@ -287,6 +287,14 @@ password уже gated, но всё равно: маскировать значе
 login-форм при журналировании args).
 
 ### П2-5. (Опционально, из backlog пользователя) In-page баннер download-гранта
+**Статус: ✔ реализовано (2026-09-19).** Deny на `file.download` → серверный req
+`grant.ask` в браузер-владелец вкладки (mcp.ts, `askDownloadGrant`); баннер —
+режим `grant:true` в consent-banner.js (категория `download_grant`, allow
+«Разрешить скачивание (на сессию)», без «10 мин»); при allow background сам
+шлёт `grant.add` (download, session) до ответа — повторный policy.check
+проходит без ретрая агента. Fail-closed (таймаут/сбой → исходная ошибка),
+анти-спам: pending-дедуп по (clientId, domain) + deny-кэш 10 мин; deny несёт
+`data:{domain}`. Протокол — PROTOCOL.md §6, тесты — test/grant-ask.test.mjs.
 **Что**: при `CAPABILITY_DENIED` на `file.download` сервер включает домен файла
 в ошибку; расширение показывает на странице баннер «нужен доступ к домену X»
 с выдачей гранта на месте (consent-механика, `grant.add` из content script).

@@ -469,6 +469,39 @@ function createServerConnection(cfg) {
       case "consent.ask":
         await BridgeOwners.assertAccess(params.tabId, label, connCount);
         return consentCommand(policyPatterns, params);
+      case "grant.ask": {
+        // П2-5: баннер download-гранта (домен ФАЙЛА) — механика та же, что у
+        // consent.ask (assertAccess → consentCommand: проверка домена вкладки,
+        // fallback-инжекция content script, таймаут → deny). Отличие: при
+        // «allow» background сам шлёт grant.add (download, session) ДО ответа
+        // на req — порядок на одном WS гарантирует применение гранта до
+        // повторного policy.check сервера, агенту ретрай не нужен. Сбой или
+        // отказ grant.add → deny (fail-closed: без гранта сервер всё равно
+        // откажет, но честный deny понятнее ложного allow).
+        await BridgeOwners.assertAccess(params.tabId, label, connCount);
+        const st = await consentCommand(policyPatterns, params);
+        if (st.decision !== "allow") return st;
+        const domain = String(params.domain || "");
+        let addRes;
+        try {
+          addRes = await sendReq("grant.add", {
+            domain: domain,
+            capabilities: ["download"],
+            scope: "session",
+          });
+        } catch (e) {
+          return { decision: "deny", note: "grant.add failed: " + (e.code || e.message) };
+        }
+        if (!addRes || addRes.granted !== true) {
+          return { decision: "deny", note: "grant.add rejected" };
+        }
+        // Трекинг выданных грантов — popup показывает их списком (как grant.add из popup).
+        const grants = connStateOf(label).sessionGrants || [];
+        if (!grants.includes(domain)) {
+          await saveConnState(label, { sessionGrants: grants.concat(domain).slice(-50) });
+        }
+        return st;
+      }
       default:
         if (CONTENT_METHODS.has(method)) {
           await BridgeOwners.assertAccess(params.tabId, label, connCount);
