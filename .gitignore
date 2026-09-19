@@ -9,3 +9,4 @@ memory/*
 ENVIRONMENT.local.md
 tools/
 __pycache__/
+lab/blog/
