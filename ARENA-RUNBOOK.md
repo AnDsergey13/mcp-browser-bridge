@@ -30,6 +30,16 @@
 - Разбор приёмов атакующего: `redteam-playbook.md` в корне репо (untracked
   НАМЕРЕННО — живые канареечные токены, не коммитить).
 
+## Если staging удалён (восстановление)
+
+1. Из архива: `tar -xzf arena-backup-YYYY-MM-DD.tar.gz -C <куда распаковать>`
+   — вернутся `lab/blog/` и `contract.md` в том виде, как на конец арены.
+2. С нуля: `mkdir -p $ARENA/lab $ARENA/downloads`; `contract.md` взять из
+   архивной копии `$REPO/.bridge/audit-bus/contract.md`; наполнитель —
+   `cp -r $REPO/downloads/telegraph $ARENA/downloads/`; заражённый плацдарм
+   атакующий перестроит сам за несколько раундов (манифест раунда 23 с его
+   hypothesis-дневником лежит в шине).
+
 ## Шаг 0 — политика (вручную, policy.yaml правит только человек)
 
 В `policy.yaml` вернуть `journal_full_args: true` (hot-reload, рестарт не
