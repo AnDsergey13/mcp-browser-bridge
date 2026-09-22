@@ -10,3 +10,5 @@ ENVIRONMENT.local.md
 tools/
 __pycache__/
 lab/blog/
+# Живые канареечные токены арены — не трекать (ARENA-RUNBOOK.md §OPSEC)
+redteam-playbook.md
