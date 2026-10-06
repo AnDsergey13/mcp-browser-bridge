@@ -116,6 +116,22 @@ bash /путь/к/mcp-browser-bridge/start-relay.sh
 - **Правила** — только `policy.yaml`: пресеты доменов, capabilities,
   gated-категории, pacing. Hot-reload: сохранил файл — расширение и агент
   получили обновление.
+- **Новый сайт — типовой рецепт.** Разовый доступ — popup «Выдать доступ к
+  сайтам» (read / interact / download, per-browser, на сессию). Постоянный —
+  домен в `policy.yaml` по шаблону:
+
+  ```yaml
+  presets:
+    dev:   # или свой пресет
+      domains:
+        "example.com":
+          capabilities: [read, interact, download, eval]
+          gated: { eval: confirm }   # каждое внедрение JS — с подтверждением
+  ```
+
+  `eval` — для `page.eval` (внутренние API сайта, разработка юзерскриптов);
+  popup его не выдаёт принципиально, только YAML и только человек. Если eval
+  не нужен — убрать его из `capabilities` и убрать строку `gated` целиком.
 - **Баннер download-гранта (П2-5)**: `file.download` на домене без гранта
   (или без capability download) показывает на вкладке баннер «Разрешить
   скачивание (на сессию)» — session-грант выдаётся на месте, без похода в
