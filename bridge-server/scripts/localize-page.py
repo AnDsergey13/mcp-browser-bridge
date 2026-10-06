@@ -107,8 +107,36 @@ def main():
         return m.group(0) + f' <!-- не скачано: {url} -->'
     md = re.sub(r'\[(embedded|video|audio): (\S+)\]', sub_embed, md)
 
-    title = a.title or d['title']
-    header = f'# {title}\n\nИсточник: {source_url}\n\n'
+    title = a.title or re.sub(r'\s+[–-]\s+Telegraph\s*$', '', d['title'])
+
+    # Шапка telegra.ph: «# title», «Автор Дата», «# title», «Автор» — дубли.
+    # Схлопываем: заголовок остаётся один (наш header), автор с датой
+    # поднимается в него же, повторы выкидываем.
+    author = ''
+    tnorm = title.strip().lower()
+    rest = []
+    stripping = True
+    for ln in md.split('\n'):
+        s = ln.strip()
+        if stripping:
+            if not s:
+                continue
+            if s.startswith('#') and s.lstrip('#').strip().lower() == tnorm:
+                continue
+            m = re.match(r'^(\S.*?),?\s+([A-Z][a-z]+ \d{1,2}, \d{4})$', s)
+            if m and not author:
+                author = f'{m.group(1)}, {m.group(2)}'
+                continue
+            if author and s == author.rsplit(',', 2)[0].strip():
+                continue
+            stripping = False
+        rest.append(ln)
+    md = '\n'.join(rest)
+
+    header = f'# {title}\n\nИсточник: {source_url}\n'
+    if author:
+        header += f'Автор: {author}\n'
+    header += '\n'
     out_path = os.path.join(a.out, 'content.md')
     with open(out_path, 'w') as f:
         f.write(header + md + '\n')

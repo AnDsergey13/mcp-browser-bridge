@@ -469,6 +469,39 @@ function createServerConnection(cfg) {
       case "consent.ask":
         await BridgeOwners.assertAccess(params.tabId, label, connCount);
         return consentCommand(policyPatterns, params);
+      case "grant.ask": {
+        // П2-5: баннер download-гранта (домен ФАЙЛА) — механика та же, что у
+        // consent.ask (assertAccess → consentCommand: проверка домена вкладки,
+        // fallback-инжекция content script, таймаут → deny). Отличие: при
+        // «allow» background сам шлёт grant.add (download, session) ДО ответа
+        // на req — порядок на одном WS гарантирует применение гранта до
+        // повторного policy.check сервера, агенту ретрай не нужен. Сбой или
+        // отказ grant.add → deny (fail-closed: без гранта сервер всё равно
+        // откажет, но честный deny понятнее ложного allow).
+        await BridgeOwners.assertAccess(params.tabId, label, connCount);
+        const st = await consentCommand(policyPatterns, params);
+        if (st.decision !== "allow") return st;
+        const domain = String(params.domain || "");
+        let addRes;
+        try {
+          addRes = await sendReq("grant.add", {
+            domain: domain,
+            capabilities: ["download"],
+            scope: "session",
+          });
+        } catch (e) {
+          return { decision: "deny", note: "grant.add failed: " + (e.code || e.message) };
+        }
+        if (!addRes || addRes.granted !== true) {
+          return { decision: "deny", note: "grant.add rejected" };
+        }
+        // Трекинг выданных грантов — popup показывает их списком (как grant.add из popup).
+        const grants = connStateOf(label).sessionGrants || [];
+        if (!grants.includes(domain)) {
+          await saveConnState(label, { sessionGrants: grants.concat(domain).slice(-50) });
+        }
+        return st;
+      }
       default:
         if (CONTENT_METHODS.has(method)) {
           await BridgeOwners.assertAccess(params.tabId, label, connCount);
@@ -1028,7 +1061,47 @@ const CONTENT_METHODS = new Set([
   "findText",
   "getStateHash",
   "consoleLog",
+  "eval",
 ]);
+
+/**
+ * relayText (page.eval, L1.1): content script передаёт большой результат
+ * MAIN-world eval — стримим его в downloads/ существующим файловым релеем
+ * (file.start/chunk/end + ack, как fetchFile), чтобы ответ команды не
+ * упирался в серверную резку 20 KB. Подключение — владелец вкладки-источника
+ * (как pause.auto); fire-and-forget: res на eval уже ушёл, сбой стрима —
+ * честный file.abort.
+ */
+async function relayTextToServer(conn, msg) {
+  const transferId = String(msg.transferId || conn.nextTransferId());
+  const bytes = new TextEncoder().encode(String(msg.text || ""));
+  const name = String(msg.name || "eval-result.json");
+  const hash = BridgeSha256.create();
+  conn.sendEvt("file.start", {
+    transferId,
+    name,
+    size: bytes.length,
+    mime: "application/json",
+  });
+  let seq = 0;
+  try {
+    for (let off = 0; off < bytes.length; off += BridgeFileRelay.CHUNK_SIZE, seq++) {
+      const chunk = bytes.subarray(off, off + BridgeFileRelay.CHUNK_SIZE);
+      hash.update(chunk);
+      const ack = await conn.sendFileChunk({
+        transferId,
+        seq,
+        data_base64: BridgeFileRelay.u8ToBase64(chunk),
+      });
+      if (!ack || !ack.ok) {
+        throw new Error("file.ack не получен: " + ((ack && ack.error) || "нет ответа"));
+      }
+    }
+    conn.sendEvt("file.end", { transferId, sha256: hash.digestHex() });
+  } catch (e) {
+    conn.sendEvt("file.abort", { transferId, reason: String((e && e.message) || e) });
+  }
+}
 
 /**
  * П2-6: после (пере)запуска/обновления расширения уже открытые вкладки держат
@@ -1244,6 +1317,19 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       });
       syncAutoPaused();
     }
+    return undefined;
+  }
+
+  if (msg.kind === "relayText") {
+    // page.eval: большой результат — в downloads/ файловым релеем (см. выше).
+    const tabId = sender.tab ? sender.tab.id : 0;
+    const owner = tabId ? BridgeOwners.ownerOf(tabId) : null;
+    const conn =
+      (owner && connections.find((c) => c.label === owner)) || connections[0];
+    if (!conn) return undefined;
+    relayTextToServer(conn, msg).catch((e) =>
+      console.warn("[bridge] relayText:", e)
+    );
     return undefined;
   }
 

@@ -1,7 +1,9 @@
 "use strict";
 
 /**
- * consent-banner.js — баннер подтверждения gated-действий (N4).
+ * consent-banner.js — баннер подтверждения gated-действий (N4) и баннер
+ * download-гранта (П2-5, params.grant === true: домен ФАЙЛА, allow выдаёт
+ * session-грант, кнопки «10 мин» нет).
  * Shadow DOM (mode:"closed") поверх страницы: страница не может ни прочитать,
  * ни нажать баннер. По таймауту сам возвращает deny.
  * Экспортирует window.__BRIDGE__.showConsent(params) → Promise<{decision}>.
@@ -15,6 +17,8 @@
     login: "Логин / 2FA",
     submit: "Отправка формы",
     delete: "Удаление / отмена",
+    eval: "Выполнение JS",
+    download_grant: "Загрузка файла с домена",
     custom: "Действие агента",
   };
 
@@ -54,7 +58,7 @@
   `;
 
   /**
-   * @param {{category:string, domain:string, description:string, timeout_ms:number}} params
+   * @param {{category:string, domain:string, description:string, timeout_ms:number, grant?:boolean}} params
    * @returns {Promise<{decision:"allow"|"deny"|"allow_10min"}>}
    */
   B.showConsent = function showConsent(params) {
@@ -99,6 +103,15 @@
       wrap.querySelector(".desc").textContent = (params && params.description) || "";
       const timerEl = wrap.querySelector(".timer");
 
+      // П2-5: режим download-гранта (grant.ask): domain — домен ФАЙЛА, allow
+      // выдаёт session-грант (подпись явно об этом); кнопка «10 мин» скрыта —
+      // кэш allow_10min работает для gated-категорий, а не для грантов домену.
+      if (params && params.grant === true) {
+        wrap.querySelector(".allow").textContent = "Разрешить скачивание (на сессию)";
+        const allow10 = wrap.querySelector(".allow10");
+        if (allow10) allow10.remove();
+      }
+
       let settled = false;
       function finish(decision) {
         if (settled) return;
@@ -110,7 +123,9 @@
 
       wrap.querySelector(".allow").addEventListener("click", () => finish("allow"));
       wrap.querySelector(".deny").addEventListener("click", () => finish("deny"));
-      wrap.querySelector(".allow10").addEventListener("click", () => finish("allow_10min"));
+      // В grant-режиме (П2-5) кнопка «10 мин» удалена выше — слушатель только при наличии.
+      const allow10Btn = wrap.querySelector(".allow10");
+      if (allow10Btn) allow10Btn.addEventListener("click", () => finish("allow_10min"));
 
       function renderTimer() {
         const left = Math.max(0, deadline - Date.now());

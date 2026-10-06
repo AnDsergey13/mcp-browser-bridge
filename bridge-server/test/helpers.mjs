@@ -6,15 +6,15 @@ import path from 'node:path';
 export const TEST_POLICY = `version: 2
 active_preset: test
 default: deny
-gated_defaults: { pay: confirm, login: confirm, submit: confirm, delete: confirm }
-hard_floor: { pay: confirm }
+gated_defaults: { pay: confirm, login: confirm, submit: confirm, delete: confirm, eval: confirm }
+hard_floor: { pay: confirm, eval: confirm }
 pacing: { min_delay_ms: 0, max_delay_ms: 0, max_actions_per_minute: 1000 }
 presets:
   test:
     description: "Тестовый пресет"
     domains:
       "localhost:18547":
-        capabilities: [read, interact, download]
+        capabilities: [read, interact, download, eval]
         gated: { login: auto, submit: confirm, delete: confirm, pay: auto }
       "allowed.example":
         capabilities: [read, interact, download]

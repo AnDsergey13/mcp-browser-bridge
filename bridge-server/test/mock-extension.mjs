@@ -19,6 +19,10 @@ export class MockExtension {
    * @param opts.tabs — [{tabId, url, title, flags?, snapshot?, markdown?}]
    * @param opts.pages — {url: {title, snapshot, markdown, flags}} для tab.open
    * @param opts.consent — 'allow'|'deny'|'allow_10min'|'timeout'|function(params) => decision|'timeout'
+   * @param opts.grantAsk — scripted decision для grant.ask (П2-5): 'allow'|'deny'|
+   *   'timeout'|'throw'|function(params). На 'allow' мок, как background, сам шлёт
+   *   grant.add (download, session) ДО ответа на req. Default 'deny' — существующие
+   *   deny-тесты file.download не меняют поведения.
    * @param opts.fileToServe — {name, content:Buffer} для fetchFile
    */
   constructor(opts) {
@@ -38,10 +42,12 @@ export class MockExtension {
     }
     this.pages = opts.pages ?? {};
     this.consent = opts.consent ?? 'allow';
+    this.grantAsk = opts.grantAsk ?? 'deny';
     this.fileToServe = opts.fileToServe ?? null;
     this.fetchFails = false; // true → fetchFile отвечает ошибкой до file.start
     this.policyUpdates = [];
     this.consentRequests = [];
+    this.grantAskRequests = [];
     this.ws = null;
     this.reqSeq = 0;
     this.pendingRes = new Map();   // e_<n> → {resolve, reject}
@@ -220,6 +226,23 @@ export class MockExtension {
           ...(t.consoleUnavailable ? { console_unavailable: t.consoleUnavailable } : {}),
         };
       }
+      case 'eval': {
+        // page.eval (L1.1): вкладка отдаёт scripted результат. t.evalResult —
+        // готовая JSON-строка (≤16 KB → инлайн; больше — имитация релея, как
+        // content-bridge: file.* события + {relayed:true}); t.evalError —
+        // ошибка исполнения со стороны страницы.
+        const t = this.tabOrThrow(p.tabId);
+        (this.actions ??= []).push('eval');
+        this.lastEvalParams = p;
+        if (t.evalError) throw Object.assign(new Error(t.evalError), { code: 'EVAL_ERROR' });
+        if (t.evalUnavailable) throw Object.assign(new Error('MAIN-world eval-runner не загрузился (CSP страницы?)'), { code: 'EVAL_UNAVAILABLE' });
+        const json = String(t.evalResult ?? 'null');
+        if (json.length > 16000) {
+          this.serveFile({}, { name: 'eval-result.json', content: Buffer.from(json) }).catch(() => {});
+          return { url: t.url, title: t.title, flags: t.flags, relayed: true, transferId: 'mock-relay', value_type: 'string', bytes: json.length };
+        }
+        return { url: t.url, title: t.title, flags: t.flags, value_json: json, value_type: 'object', bytes: json.length };
+      }
       case 'waitFor': {
         const t = this.tabOrThrow(p.tabId);
         const cond = p.condition ?? {};
@@ -244,6 +267,18 @@ export class MockExtension {
         if (decision === 'timeout') return undefined; // не отвечаем — сервер оттаймаутится
         return { decision };
       }
+      case 'grant.ask': {
+        // П2-5: как background — на allow сначала шлём grant.add (download,
+        // session), и лишь затем отвечаем на req.
+        this.grantAskRequests.push(p);
+        const decision = typeof this.grantAsk === 'function' ? this.grantAsk(p) : this.grantAsk;
+        if (decision === 'timeout') return undefined; // не отвечаем — сервер оттаймаутится
+        if (decision === 'throw') throw Object.assign(new Error('grant.ask boom (mock)'), { code: 'INTERNAL' });
+        if (decision === 'allow') {
+          await this.sendReq('grant.add', { domain: p.domain, capabilities: ['download'], scope: 'session' });
+        }
+        return { decision };
+      }
       case 'fetchFile': {
         // fetchFails — имитация падения fetch на стороне расширения (CORS и пр.):
         // ошибка уходит ДО file.start (живой кейс: xet-редирект HF).
@@ -261,8 +296,8 @@ export class MockExtension {
    * как background-релей: transport-timeout сервера покрывает только старт)
    * → chunk (ждём ack) → file.end.
    */
-  async serveFile(p) {
-    const file = this.fileToServe;
+  async serveFile(p, fileOverride) {
+    const file = fileOverride ?? this.fileToServe;
     if (!file) return;
     const transferId = `t_${++transferSeq}`;
     const content = file.content;

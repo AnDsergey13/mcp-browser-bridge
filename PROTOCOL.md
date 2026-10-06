@@ -115,6 +115,29 @@
   хука → честный маркер `console_unavailable` (по образцу
   `netlog_unavailable`), а не молчаливый пустой буфер.
   MCP-инструмент: `page.console`, capability `read`.
+- `eval` `{tabId, expression, awaitPromise?:bool (дефолт true), timeout_ms?:≤30000 (дефолт 10000)}` →
+  `{url,title,flags,value_json,value_type,bytes}` — инлайн (≤16000 символов
+  JSON) — или `{url,title,flags,relayed:true,transferId,value_type,bytes}` —
+  большой результат ушёл файловым релеем (§8) в `downloads/eval-result-*.json`
+  (сервер ждёт трансфер по expectTransfer, как file.download, и отвечает
+  `{relayed:true, file, size, sha256, …}`).
+  Выполнение JS в MAIN world вкладки (window-состояние SPA, `fetch(...)` к
+  внутренним API страницы — L1.1). Content script в isolated world страницу
+  не видит — исполняет MAIN-world runner `src/eval-runner.js`
+  (web_accessible_resources; внедряется content script'ом через `<script src>`,
+  т.е. только на доменах политики), обмен — `window.postMessage` с requestId
+  (маркеры `__bridge_eval` / `__bridge_eval_result`; косвенный eval в
+  глобальном scope, awaitPromise await'ит Promise результата; сериализация
+  устойчива к circular/DOM/функциям/BigInt/Map/Set/Error). Жёсткий CSP
+  страницы может запретить загрузку runner'а → ошибка `EVAL_UNAVAILABLE`
+  (честный маркер, как `console_unavailable`). Таймаут исполнения →
+  `EVAL_TIMEOUT`; исключение в выражении → `EVAL_ERROR` с сообщением страницы.
+  MCP-инструмент: `page.eval`. Гейтинг — двойной: capability `eval`
+  per-domain (default-deny) + gated `eval: confirm` (по умолчанию; consent-
+  баннер показывает expression, рекомендуется `eval: confirm` в hard_floor).
+  Expression пишется в policy-audit.jsonl (preview + sha256), вызов
+  учитывается в pacing-окне 30 act/мин, ответ маркируется
+  `untrusted_page_content` (N15 — страница может подделать ответ runner'а).
 - `scan` `{tabId, max_screens?:≤20}` → `{url,title,flags,scan,screens,unique[,scan_truncated]}` —
   автоскролл ленты с агрегацией уникальных интерактивных (П2-3): дедуп по
   сигнатуре строки, стоп после 3 экранов без роста или у дна ленты, жёсткие
@@ -190,6 +213,23 @@ Gated-действие: сервер → ext req `consent.ask`
 Расширение рисует shadow-DOM баннер во вкладке `tabId`. Ответы:
 `{decision:"allow"|"deny"|"allow_10min"}`. По таймауту расширение само шлёт
 `deny`. `allow_10min` — сервер кэширует решение на (domain, category) на 10 мин.
+
+Download-грант с баннера (П2-5): когда `file.download` получает deny
+(`DOMAIN_NOT_ALLOWED` / `CAPABILITY_DENIED`) на домене ФАЙЛА, сервер шлёт
+ext req `grant.ask` `{requestId, category:"download_grant", grant:true, domain,
+ url, description, tabId, timeout_ms}` в браузер-владелец вкладки-источника
+(таймаут транспорта — `timeout_ms + 1000`, как у consent.ask). `domain` —
+домен ФАЙЛА, не вкладки. Расширение рисует тот же shadow-DOM баннер в режиме
+гранта: allow подписан «Разрешить скачивание (на сессию)», кнопки «10 мин» нет
+(кэш категорий бессмысленен для гранта домену). Ответ `{decision:"allow"|"deny"}`;
+таймаут/сбой/невалидный ответ → `deny` (fail-closed). При `allow` расширение
+СНАЧАЛА шлёт `grant.add {domain, capabilities:["download"], scope:"session"}`
+и лишь затем отвечает на `grant.ask` — порядок на одном WS гарантирует, что
+грант применён до повторного policy.check сервера: загрузка продолжается без
+ретрая агента. Анти-спам на сервере: pending-дедупликация запросов по
+`(clientId, domain)` и deny-кэш 10 минут после deny/таймаута (пакетная загрузка
+с одного CDN не спамит баннерами). Ошибка deny на `file.download` несёт
+`data:{domain}` — домен файла машиночитаем, а не только текстом в hint.
 
 События паузы (ext→server evt):
 - `pause.global` `{paused:bool}` — красная кнопка в popup.
@@ -317,6 +357,8 @@ title: …
 `BATCH_STEP_FAILED` (act.batch: шаг упал, `data.batch_completed` — сколько успело),
 `WAIT_BUSY` (на вкладке уже активен page.wait_for),
 `SCREENSHOT_TOO_LARGE` (скриншот за потолком — base64 не отдан),
+`EVAL_UNAVAILABLE` (CSP запретил MAIN-world eval-runner), `EVAL_TIMEOUT`,
+`EVAL_ERROR` (исключение в выражении — текст страницы, untrusted),
 `RESPONSE_TOO_LARGE` (после резки — hint), `TIMEOUT`, `INTERNAL`.
 
 Формат ответа MCP-инструмента: `{ok, data|error_code, hint, policy_reminder}`.

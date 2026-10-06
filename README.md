@@ -100,10 +100,10 @@ bash /путь/к/mcp-browser-bridge/start-relay.sh
 
 ## Использование
 
-- **Агенту** доступен 21 MCP-инструмент: `policy.status`,
+- **Агенту** доступен 22 MCP-инструмента: `policy.status`,
   `policy.request_preset`, `tab.list` / `tab.open` / `tab.close`,
   `page.snapshot` / `page.extract` / `page.find` / `page.screenshot` /
-  `page.wait_for` / `page.scan` / `page.console`, `act.click` / `act.hover` /
+  `page.wait_for` / `page.scan` / `page.console` / `page.eval`, `act.click` / `act.hover` /
   `act.type` / `act.select` / `act.scroll` / `act.key` / `act.batch`,
   `file.download`, `net.list`
   (в Chromium недоступен — нет webRequest в MV3 service worker).
@@ -116,8 +116,31 @@ bash /путь/к/mcp-browser-bridge/start-relay.sh
 - **Правила** — только `policy.yaml`: пресеты доменов, capabilities,
   gated-категории, pacing. Hot-reload: сохранил файл — расширение и агент
   получили обновление.
+- **Новый сайт — типовой рецепт.** Разовый доступ — popup «Выдать доступ к
+  сайтам» (read / interact / download, per-browser, на сессию). Постоянный —
+  домен в `policy.yaml` по шаблону:
+
+  ```yaml
+  presets:
+    dev:   # или свой пресет
+      domains:
+        "example.com":
+          capabilities: [read, interact, download, eval]
+          gated: { eval: confirm }   # каждое внедрение JS — с подтверждением
+  ```
+
+  `eval` — для `page.eval` (внутренние API сайта, разработка юзерскриптов);
+  popup его не выдаёт принципиально, только YAML и только человек. Если eval
+  не нужен — убрать его из `capabilities` и убрать строку `gated` целиком.
+- **Баннер download-гранта (П2-5)**: `file.download` на домене без гранта
+  (или без capability download) показывает на вкладке баннер «Разрешить
+  скачивание (на сессию)» — session-грант выдаётся на месте, без похода в
+  popup, и загрузка продолжается без ретрая агента. «Запретить» или таймаут —
+  исходная ошибка агенту, повторные обращения к этому домену 10 минут идут
+  уже без баннера (deny-кэш).
 - Ошибки gating (`ACTION_DENIED`, `PAUSED`, `DOMAIN_NOT_ALLOWED`…) — это
-  стоп и доклад пользователю, а не повторные попытки.
+  стоп и доклад пользователю, а не повторные попытки (на `file.download`
+  перед ошибкой сначала отрабатывает баннер гранта — выше).
 
 ## Структура репозитория
 
