@@ -180,24 +180,27 @@
       }
 
       let settled = false;
-      function finish(decision) {
+      // П.3: reason — «click» (явное решение пользователя) или «timeout»
+      // (баннер сам закрылся по дедлайну). Сервер кэширует deny только при
+      // явном клике: по таймауту пользователь мог баннер не видеть.
+      function finish(decision, reason) {
         if (settled) return;
         settled = true;
         clearInterval(tick);
         host.remove();
-        resolve({ decision });
+        resolve({ decision, reason: reason || "click" });
       }
 
-      wrap.querySelector(".allow").addEventListener("click", () => finish("allow"));
-      wrap.querySelector(".deny").addEventListener("click", () => finish("deny"));
+      wrap.querySelector(".allow").addEventListener("click", () => finish("allow", "click"));
+      wrap.querySelector(".deny").addEventListener("click", () => finish("deny", "click"));
       // В grant-режиме (П2-5) кнопка «10 мин» удалена выше — слушатель только при наличии.
       const allow10Btn = wrap.querySelector(".allow10");
-      if (allow10Btn) allow10Btn.addEventListener("click", () => finish("allow_10min"));
+      if (allow10Btn) allow10Btn.addEventListener("click", () => finish("allow_10min", "click"));
 
       function renderTimer() {
         const left = Math.max(0, deadline - Date.now());
         timerEl.textContent = Math.ceil(left / 1000) + " c";
-        if (left <= 0) finish("deny"); // таймаут → автозапрет (N4)
+        if (left <= 0) finish("deny", "timeout"); // таймаут → автозапрет (N4), но без deny-кэша (П.3)
       }
       const tick = setInterval(renderTimer, 250);
       renderTimer();

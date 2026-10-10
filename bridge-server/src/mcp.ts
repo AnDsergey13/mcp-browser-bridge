@@ -574,7 +574,8 @@ export class BridgeCore {
    * (в браузер-владелец вкладки, как consent.ask). domain — домен ФАЙЛА.
    * Анти-спам: повторный deny по (clientId, domain), пока висит баннер,
    * присоединяется к тому же запросу (баннер всё равно один на страницу —
-   * consent-banner.js); после deny/таймаута — deny-кэш GRANT_ASK_DENY_TTL_MS.
+   * consent-banner.js); после ЯВНОГО deny (клик) — deny-кэш
+   * GRANT_ASK_DENY_TTL_MS; таймаут/ошибка кэша НЕ ставят (П.3).
    */
   private async askDownloadGrant(clientId: string, tabId: number, domain: string, url: string): Promise<'allow' | 'deny'> {
     if (tabId === 0) return 'deny'; // вкладки-источника нет — баннеру некуда встать
@@ -596,23 +597,41 @@ export class BridgeCore {
   private async doAskDownloadGrant(clientId: string, tabId: number, domain: string, url: string): Promise<'allow' | 'deny'> {
     const requestId = `g_${++this.consentSeq}`;
     let decision: 'allow' | 'deny' = 'deny';
+    // П.3: reason от баннера — «click» (явное решение) или «timeout» (дедлайн).
+    // Ошибка транспорта/офлайн — «error» здесь, локально.
+    let reason: string | undefined;
     try {
       const res = await this.transport.request(clientId, 'grant.ask', {
         requestId, category: 'download_grant', grant: true, domain, url,
         description: `Агент просит download-доступ к этому домену файла: ${domain}. Грант действует до конца сессии и только в этом браузере.`,
         tabId, timeout_ms: this.consentTimeoutMs,
-      }, this.consentTimeoutMs + 1000) as { decision?: string };
+      }, this.consentTimeoutMs + 1000) as { decision?: string; reason?: string };
       // allow_10min для грантов НЕТ: session-грант и так ограничен сессией.
-      if (res && (res.decision === 'allow' || res.decision === 'deny')) decision = res.decision;
+      if (res && (res.decision === 'allow' || res.decision === 'deny')) {
+        decision = res.decision;
+        reason = res.reason;
+      } else {
+        reason = 'error';
+      }
     } catch {
       decision = 'deny'; // таймаут/офлайн → запрет
+      reason = 'error';
     }
+    const auditDecision = decision === 'allow' ? 'grant_ask_allow'
+      : reason === 'timeout' ? 'grant_ask_timeout'
+      : reason === 'error' ? 'grant_ask_error'
+      : 'grant_ask_deny';
     this.policy.audit({
       kind: decision === 'allow' ? 'grant' : 'deny',
       domain, browser: clientId, capability: 'download', url,
-      decision: decision === 'allow' ? 'grant_ask_allow' : 'grant_ask_deny',
+      decision: auditDecision,
     });
-    if (decision === 'deny') this.grantAskDenyUntil.set(`${clientId}\n${domain}`, Date.now() + GRANT_ASK_DENY_TTL_MS);
+    // П.3: deny-кэш ставит только ЯВНЫЙ отказ (клик «Запретить»). По таймауту
+    // пользователь мог баннер не видеть — повторный запрос обязан показать
+    // баннер снова. Старое расширение без reason — прежнее поведение (кэш).
+    if (decision === 'deny' && reason !== 'timeout' && reason !== 'error') {
+      this.grantAskDenyUntil.set(`${clientId}\n${domain}`, Date.now() + GRANT_ASK_DENY_TTL_MS);
+    }
     return decision;
   }
 

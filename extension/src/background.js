@@ -1141,7 +1141,9 @@ async function consentCommand(patterns, params) {
       return { decision: "deny", note: "domain_mismatch: " + (tab.url || "") };
     }
     const st = await sendCmdToTab(params.tabId, "__consent", params, timeoutMs);
-    return { decision: st.decision || "deny" };
+    // reason («click»/«timeout») прокидываем наверх — сервер кэширует deny
+    // только при явном клике (П.3).
+    return { decision: st.decision || "deny", reason: st.reason || undefined };
   } catch (e) {
     return { decision: "deny", note: "content_script_absent: " + e.message };
   }
