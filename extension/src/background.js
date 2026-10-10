@@ -338,6 +338,9 @@ function createServerConnection(cfg) {
   async function notifyApproval() {
     const base = {
       type: "basic",
+      // Собственная иконка: в Chromium basic-уведомление без iconUrl может не
+      // показаться (исторически обязателен), в Firefox — просто косметика.
+      iconUrl: browser.runtime.getURL("icons/icon48.png"),
       title: "Bridge: новая сессия агента",
       message:
         "Сервер «" + label + "» запрашивает доступ к браузеру. Разрешить сессию?",
@@ -1141,10 +1144,26 @@ async function fetchBlobCommand(conn, params) {
 // Вкладка ушла с домена политики → консервативный deny с пояснением.
 async function consentCommand(patterns, params) {
   const timeoutMs = (Number(params.timeout_ms) || 120000) + 10000;
+  let notifId = null;
   try {
     const tab = await getTab(params.tabId);
     if (!urlMatchesPolicy(patterns, tab.url || "")) {
       return { decision: "deny", note: "domain_mismatch: " + (tab.url || "") };
+    }
+    // П.2: баннер рисуется во вкладке — если она не активна, пользователь его
+    // не увидит. Дублируем системным уведомлением (клик по нему не обязателен;
+    // решение принимается в баннере). Автофокус вкладки НЕ делаем: он крадёт
+    // ввод, если пользователь печатает/диктует в другой вкладке.
+    if (!tab.active) {
+      notifId = "bridge-consent-" + params.tabId + "-" + Date.now();
+      await browser.notifications
+        .create(notifId, {
+          type: "basic",
+          iconUrl: browser.runtime.getURL("icons/icon48.png"),
+          title: "Мост: нужно подтверждение",
+          message: ((params.domain || "") + " — " + (params.description || "")).slice(0, 200),
+        })
+        .catch(() => {}); // уведомление — резервный канал, сбой не должен ломать consent
     }
     const st = await sendCmdToTab(params.tabId, "__consent", params, timeoutMs);
     // reason («click»/«timeout») прокидываем наверх — сервер кэширует deny
@@ -1152,6 +1171,8 @@ async function consentCommand(patterns, params) {
     return { decision: st.decision || "deny", reason: st.reason || undefined };
   } catch (e) {
     return { decision: "deny", note: "content_script_absent: " + e.message };
+  } finally {
+    if (notifId) browser.notifications.clear(notifId).catch(() => {});
   }
 }
 

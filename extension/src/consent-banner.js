@@ -15,6 +15,8 @@
   const B = (window.__BRIDGE__ = window.__BRIDGE__ || {});
 
   const HOST_ID = "__bridge-consent-host";
+  // П.2: маркер заголовка вкладки на время показа баннера (без автофокуса).
+  const TITLE_MARK = "[Мост] ";
   const CATEGORY_LABELS = {
     pay: "Оплата",
     login: "Логин / 2FA",
@@ -183,6 +185,7 @@
       }
 
       let settled = false;
+      let origTitle = document.title; // П.2: исходный заголовок — для снятия маркера
       // П.3: reason — «click» (явное решение пользователя) или «timeout»
       // (баннер сам закрылся по дедлайну). Сервер кэширует deny только при
       // явном клике: по таймауту пользователь мог баннер не видеть.
@@ -192,6 +195,11 @@
         clearInterval(tick);
         observer.disconnect();
         if (B.__activeConsent === ticket) B.__activeConsent = null;
+        // П.2: снимаем маркер заголовка; если SPA уже перезаписал title своим
+        // (маркера нет) — не трогаем.
+        if (document.title.startsWith(TITLE_MARK)) {
+          document.title = document.title.slice(TITLE_MARK.length);
+        }
         host.remove();
         resolve({ decision, reason: reason || "click" });
       }
@@ -206,9 +214,42 @@
       if (allow10Btn) allow10Btn.addEventListener("click", () => finish("allow_10min", "click"));
 
       function renderTimer() {
+        applyTitleMark(); // SPA мог перезаписать title — восстанавливаем маркер
         const left = Math.max(0, deadline - Date.now());
         timerEl.textContent = Math.ceil(left / 1000) + " c";
         if (left <= 0) finish("deny", "timeout"); // таймаут → автозапрет (N4), но без deny-кэша (П.3)
+      }
+
+      // П.2: привлечение внимания БЕЗ автофокуса вкладки (фокус крадёт ввод —
+      // пользователь может диктовать текст в другой вкладке).
+      // Маркер "[Мост] " в заголовке виден в списке вкладок.
+      function applyTitleMark() {
+        if (!document.title.startsWith(TITLE_MARK)) {
+          origTitle = document.title;
+          document.title = TITLE_MARK + origTitle;
+        }
+      }
+      // Короткий beep, только если вкладка скрыта: для открытой вкладки звук
+      // лишний. Autoplay-policy может запретить AudioContext до жеста
+      // пользователя — молча отказываемся (резервный канал — системное
+      // уведомление из background, шлётся для неактивной вкладки).
+      function beep() {
+        if (!document.hidden) return;
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return;
+          const ctx = new AC();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = "sine";
+          osc.frequency.value = 880;
+          gain.gain.setValueAtTime(0.08, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.7);
+          osc.connect(gain).connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.7);
+          osc.onended = () => ctx.close().catch(() => {});
+        } catch (e) { /* autoplay-policy или нет Audio API — звука не будет */ }
       }
       // П.1: SPA-перерисовка может выкинуть host из DOM — перевешиваем, пока
       // баннер не settled. Два плоских наблюдателя (host — прямой потомок
@@ -229,6 +270,8 @@
       renderTimer();
 
       (document.documentElement || document.body).appendChild(host);
+      applyTitleMark();
+      beep();
     });
   };
 })();

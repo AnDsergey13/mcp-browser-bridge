@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Мост между bridge-server (контейнер) и браузером: выполнение команд страницы по политике, выдаваемой сервером.",
   "permissions": ["tabs", "notifications", "storage", "webRequest", "scripting", "alarms"],
+  "icons": { "48": "icons/icon48.png" },
   "optional_host_permissions": ["<all_urls>"],
   "web_accessible_resources": [
     {
@@ -16,6 +17,7 @@
   },
   "action": {
     "default_popup": "src/popup/popup.html",
-    "default_title": "Bridge"
+    "default_title": "Bridge",
+    "default_icon": { "48": "icons/icon48.png" }
   }
 }
