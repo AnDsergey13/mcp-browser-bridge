@@ -33,7 +33,9 @@ const NOTIF_PREFIX = "bridge-session-"; // id уведомления = NOTIF_PRE
 
 // ---------- общее состояние ----------
 let paused = false;
-let reinjectDone = false; // П2-6: одноразовая переинжекция открытых вкладок
+// П2-6/П.7: сигнатура паттернов последней переинжекции открытых вкладок
+// (null — ещё не было). Повторяем при ИЗМЕНЕНИИ union-паттернов.
+let lastReinjectSig = null;
 /** @type {Array} подключения к серверам (ServerConnection) */
 const connections = [];
 /** Кэш per-connection состояния для popup; персистится как storage.local["connState"]. */
@@ -1209,25 +1211,34 @@ async function relayTextToServer(conn, msg) {
 }
 
 /**
- * П2-6: после (пере)запуска/обновления расширения уже открытые вкладки держат
- * СТАРЫЕ content scripts (SETUP.md требовал F5). Один раз по первому
- * policy.update переинжектируем вкладки, чьи URL попадают в match_patterns
- * политики (только грантованные домены, только при host-правах).
+ * П2-6/П.7: уже открытые вкладки держат СТАРЫЕ content scripts (или не имеют
+ * их вовсе, если домен грантован после открытия вкладки). По каждому
+ * policy.update переинжектируем вкладки, чьи URL попадают в union
+ * match_patterns — но только если набор паттернов ИЗМЕНИЛСЯ с прошлого раза
+ * (сигнатура): новый грант из popup расширяет union и вкладки нового домена
+ * получают скрипты без F5. При неудаче (нет host-прав, ошибка tabs.query)
+ * сигнатуру НЕ помечаем — следующий policy.update повторит попытку.
  * Скрипты идемпотентны: content-bridge.js имеет guard __BRIDGE_CONTENT_LOADED__;
  * серверный ref-кэш протухает сам (свежий snapshot / авто-retry после STALE_REF).
  * Сверка идёт по ОБЪЕДИНЕНИЮ паттернов всех подключений (content script общий).
  */
 async function reinjectOpenTabs() {
-  if (reinjectDone) return;
-  reinjectDone = true;
+  const patterns = unionPatterns().sort();
+  const sig = patterns.join("\n");
+  if (sig === lastReinjectSig) return;
   try {
     if (!(await BridgeInjector.hasHostPermission())) return;
-    const patterns = unionPatterns();
+    let injected = 0;
     const tabs = await browser.tabs.query({});
     for (const t of tabs) {
       if (!t.id || !t.url || !urlMatchesPolicy(patterns, t.url)) continue;
-      await tryInjectContentScripts(t.id);
+      if (await tryInjectContentScripts(t.id)) injected++;
     }
+    lastReinjectSig = sig;
+    // Для диагностики в popup/дебаге: когда и сколько вкладок переинжектировано.
+    await saveState({
+      lastReinject: { ts: Date.now(), tabs: injected, patterns: patterns.length },
+    });
   } catch (e) {
     console.warn("[bridge] reinject:", e);
   }
@@ -1265,7 +1276,7 @@ async function onPolicyUpdate(conn, data) {
     console.warn("[bridge] applyPolicy failed:", e);
     await saveState({ lastError: "applyPolicy: " + e.message });
   }
-  reinjectOpenTabs(); // одноразово (П2-6), без await — не блокируем policy.update
+  reinjectOpenTabs(); // П.7: повторяется при смене union-паттернов, без await — не блокируем policy.update
 }
 
 // ---------- сообщения от popup ----------
