@@ -77,8 +77,15 @@
 - `extractMarkdown` `{tabId, selector?, images?:"inline"|"manifest"|"off", max_chars?:число}` →
   `{url,title,markdown,images:[{n,src,alt,w,h}],flags}`
   Картинки и embed'ы стоят ИНЛАЙН в markdown на своих местах: `![alt](src)`,
-  `[embedded: iframe-src]`, `[video|audio: src]`. Манифест `images` — для
-  скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
+  `[embedded: iframe-src]`, `[video|audio: src]` — маркеры embed только у
+  ВИДИМЫХ (достаточно больших) плееров/фреймов; скрытые/0x0 — числом
+  `[скрытые embed] ×N` без URL (Д3, SECURITY.md §4 №3). Скрытый текст
+  (display:none, visibility:hidden, закрытые `<details>` — пометка spoiler)
+  не смешивается с видимым: он вырезается из основного markdown и идёт
+  отдельной секцией `## Скрытый текст` в конце (Д1; кап 10 блоков/2000
+  символов, блок ≤300) с пометкой untrusted — спойлеры доступны по запросу,
+  но скрытая инъекция не маскируется под видимый контент. Манифест `images` —
+  для скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
   `images:"manifest"` — только манифест, без инлайна в тексте; `"off"` — без
   картинок вовсе (чистое чтение). Дефолт `"inline"` — контракт
   `localize-page.py`, не менять. `max_chars` (дефолт 15000) — лимит markdown
@@ -341,6 +348,9 @@ title: …
 # Заголовок раздела
 Текст абзаца… (видимый текст main/viewport, сжатый)
 ```
+
+- Сжатый текст в конце снапшота — только видимый: скрытые поддеревья
+  (display:none, закрытые `<details>`) вырезаются, как в extractMarkdown (Д1).
 
 - ref-метки `eN` — только интерактивные: a, button, input, select, textarea,
   summary, [role=button|link|checkbox|…], [contenteditable], [tabindex].
