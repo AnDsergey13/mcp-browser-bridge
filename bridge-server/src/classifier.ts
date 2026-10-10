@@ -5,7 +5,8 @@ import type { GatedCategory } from './policy.ts';
 export interface ElementMeta {
   ref: string;
   role: string;             // link | button | textbox | select | checkbox | ...
-  text: string;             // подпись/текст элемента (первый quoted-литерал)
+  text: string;             // подпись/текст элемента (первый quoted-литерал, видимый)
+  aria: string | null;      // Д2: [aria: "…"] — aria-label при расхождении с видимым
   href: string | null;      // для link: "→ /path"
   attrs: Record<string, string>; // name=..., type=..., ...
 }
@@ -41,11 +42,14 @@ export function parseSnapshotRefs(snapshotText: string): Map<string, ElementMeta
 }
 
 function parseRefMeta(ref: string, role: string, rest: string): ElementMeta {
-  const meta: ElementMeta = { ref, role, text: '', href: null, attrs: {} };
+  const meta: ElementMeta = { ref, role, text: '', aria: null, href: null, attrs: {} };
   const hrefM = /→\s*(\S+)/.exec(rest);
   if (hrefM) meta.href = hrefM[1];
   const textM = /"([^"]*)"/.exec(rest);
   if (textM) meta.text = textM[1];
+  // Д2: маркер расхождения [aria: "…"] — aria-текст тоже идёт в классификацию.
+  const ariaM = /\[aria:\s*"([^"]*)"\]/.exec(rest);
+  if (ariaM) meta.aria = ariaM[1];
   // атрибуты key=value (value — слово или "quoted")
   const attrRe = /([a-zA-Z-]+)=("([^"]*)"|\S+)/g;
   let am: RegExpExecArray | null;
@@ -66,7 +70,9 @@ export function classifyUrl(url: string): GatedCategory | null {
 export function classifyElement(meta: ElementMeta | null | undefined): GatedCategory | null {
   if (!meta) return null;
   if (meta.attrs['type'] === 'password') return 'login';
-  const hay = `${meta.text} ${meta.href ?? ''}`;
+  // Д2: gated-паттерны ищем и в видимом тексте, и в aria-маркере —
+  // расхождение «кнопка говорит одно, aria другое» не должно обходить сеть.
+  const hay = `${meta.text} ${meta.aria ?? ''} ${meta.href ?? ''}`;
   if (TEXT_PAY.test(hay)) return 'pay';
   if (TEXT_DELETE.test(hay)) return 'delete';
   if (meta.href && URL_PAY.test(meta.href)) return 'pay';

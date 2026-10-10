@@ -22,7 +22,7 @@
         80
       );
     }
-    return labelOf(el);
+    return labelBits(el).text;
   }
 
   function sigRole(el) {
@@ -239,17 +239,67 @@
     return el.tagName === "INPUT" && (el.type || "").toLowerCase() === "hidden";
   }
 
-  function labelOf(el) {
-    return clean(
-      el.getAttribute("aria-label") ||
-        el.innerText ||
-        el.value ||
-        el.placeholder ||
-        el.title ||
-        el.getAttribute("name") ||
-        "",
-      80
-    );
+  // ---------- Д2: метки элементов (visible-first) ----------
+  // Приоритет ВИДИМОГО текста; aria-label/title/name — с маркером источника.
+  // При расхождении видимого и aria показываем оба: "видимое" + [aria: "…"] —
+  // подмена (человек видит одно, assistive-дерево другое) становится явной.
+  function visibleTextOf(el) {
+    const it = el.innerText;
+    if (it && it.trim()) return it; // у input/textarea innerText пуст — ниже
+    const lb = el.getAttribute("aria-labelledby");
+    if (lb) {
+      const t = lb
+        .split(/\s+/)
+        .map((id) => {
+          const n = document.getElementById(id);
+          return n ? n.innerText || n.textContent || "" : "";
+        })
+        .join(" ");
+      if (t.trim()) return t;
+    }
+    const img = el.querySelector && el.querySelector("img[alt]");
+    if (img) return img.getAttribute("alt") || "";
+    const svgT = el.querySelector && el.querySelector("svg title");
+    if (svgT && svgT.textContent && svgT.textContent.trim()) return svgT.textContent;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") {
+      const t = (el.type || "").toLowerCase();
+      if (t === "checkbox" || t === "radio") {
+        // value у чекбокса/радио — технический ("on"), не метка; видимая
+        // подпись — связанный <label> (for= или обёртка), API .labels.
+        const lab = el.labels && el.labels[0];
+        return (lab && lab.innerText) || "";
+      }
+      return el.value || el.placeholder || "";
+    }
+    return "";
+  }
+
+  // В маркер глушим " и = — текст приходит со страницы и не должен ломать
+  // quoted-формат строки или подделывать key=value биты (classifier.ts).
+  function sanitizeMarker(s) {
+    return s.replace(/"/g, "'").replace(/=/g, ":");
+  }
+
+  function labelBits(el) {
+    const visible = clean(visibleTextOf(el), 80);
+    const aria = clean(el.getAttribute("aria-label") || "", 80);
+    if (aria && visible && aria !== visible) {
+      return { text: visible, marker: ` [aria: "${sanitizeMarker(aria)}"]` };
+    }
+    if (aria && !visible) return { text: aria, marker: " [из aria-label]" };
+    if (visible) return { text: visible, marker: "" };
+    const title = clean(el.getAttribute("title") || "", 80);
+    if (title) return { text: title, marker: " [из title]" };
+    const name = clean(el.getAttribute("name") || "", 80);
+    return { text: name, marker: name ? " [из name]" : "" };
+  }
+
+  // Фрагмент строки снапшота: "текст" + маркер ВНЕ кавычек — первый
+  // quoted-литерал строки должен оставаться видимым текстом (classifier).
+  function labelFrag(el) {
+    const b = labelBits(el);
+    return `"${b.text.replace(/"/g, "'")}"${b.marker}`;
   }
 
   function implicitRole(el) {
@@ -277,7 +327,7 @@
     const nameBit = name ? " name=" + name : "";
 
     if (tag === "a") {
-      return `[${ref}] link "${labelOf(el)}" → ${el.getAttribute("href") || ""}`;
+      return `[${ref}] link ${labelFrag(el)} → ${el.getAttribute("href") || ""}`;
     }
     if (tag === "select") {
       const opts = [];
@@ -293,12 +343,12 @@
     if (tag === "input") {
       const type = (el.type || "text").toLowerCase();
       if (type === "checkbox" || type === "radio") {
-        return `[${ref}] ${type} "${labelOf(el)}" checked=${el.checked}`;
+        return `[${ref}] ${type} ${labelFrag(el)} checked=${el.checked}`;
       }
       if (type === "button" || type === "submit" || type === "reset") {
         // Д4: type=submit в строке — classifier.ts ищет этот бит (gated submit).
         const tBit = type === "submit" ? " type=submit" : "";
-        return `[${ref}] button "${labelOf(el) || clean(el.value, 60)}"${tBit}`;
+        return `[${ref}] button ${labelFrag(el)}${tBit}`;
       }
       if (type === "password") {
         // Д4: бит type=password (classifier → login, mcp.ts маскирует журнал),
@@ -314,15 +364,15 @@
         tag === "button" && el.type === "submit" && el.closest("form")
           ? " type=submit"
           : "";
-      return `[${ref}] button "${labelOf(el)}"${submitBit}`;
+      return `[${ref}] button ${labelFrag(el)}${submitBit}`;
     }
-    if (role === "link") return `[${ref}] link "${labelOf(el)}"`;
+    if (role === "link") return `[${ref}] link ${labelFrag(el)}`;
     if (role === "checkbox" || role === "switch" || role === "radio") {
-      return `[${ref}] checkbox "${labelOf(el)}" checked=${el.getAttribute("aria-checked") === "true"}`;
+      return `[${ref}] checkbox ${labelFrag(el)} checked=${el.getAttribute("aria-checked") === "true"}`;
     }
-    if (tag === "summary") return `[${ref}] summary "${labelOf(el)}"`;
-    if (el.isContentEditable) return `[${ref}] textbox${nameBit} "${labelOf(el)}"`;
-    return `[${ref}] ${role || tag} "${labelOf(el)}"`;
+    if (tag === "summary") return `[${ref}] summary ${labelFrag(el)}`;
+    if (el.isContentEditable) return `[${ref}] textbox${nameBit} ${labelFrag(el)}`;
+    return `[${ref}] ${role || tag} ${labelFrag(el)}`;
   }
 
   // ---------- скоуп ----------
@@ -492,7 +542,7 @@
       if (!isVisible(el) || isSkippable(el)) return;
       const role = (el.getAttribute("role") || implicitRole(el)).toLowerCase();
       if (roleFilter && role !== roleFilter) return;
-      const text = labelOf(el);
+      const text = labelBits(el).text;
       if (text.toLowerCase().includes(query)) {
         matches.push({ ref: refs.assign(el), text: clean(text, 120) });
       }
@@ -513,7 +563,7 @@
     const near = [];
     forEachInteractive(document.body, (el) => {
       if (!isVisible(el) || isSkippable(el)) return;
-      const t = clean(labelOf(el));
+      const t = clean(labelBits(el).text);
       if (!t) return;
       const lt = t.toLowerCase();
       if (near.length < 5 && lt.indexOf(firstToken) !== -1) near.push(t.slice(0, 60));

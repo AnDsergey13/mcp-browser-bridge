@@ -328,12 +328,22 @@ title: …
 [e5] checkbox "Согласен" checked=false
 [e6] button "Отправить" type=submit
 [e7] textbox name=pwd type=password placeholder="Пароль" value="***"
+[e8] button "Подробнее" [aria: "Купить сейчас"]
+[e9] button "Закрыть" [из aria-label]
 # Заголовок раздела
 Текст абзаца… (видимый текст main/viewport, сжатый)
 ```
 
 - ref-метки `eN` — только интерактивные: a, button, input, select, textarea,
   summary, [role=button|link|checkbox|…], [contenteditable], [tabindex].
+- Метка элемента — ВИДИМЫЙ текст в приоритете (innerText → цель
+  aria-labelledby → alt/title вложенных img/svg → value/placeholder у полей).
+  Если есть только aria-label/title/name — текст с маркером источника
+  `[из aria-label]` / `[из title]` / `[из name]`. Если видимый текст и
+  aria-label РАСХОДЯТСЯ — показываются оба: `"видимое" [aria: "aria-текст"]`
+  (подмена становится явной; gated-классификатор сканирует оба текста).
+  Кавычки и `=` в метках глушатся (`"`→`'`, `=`→`:`), чтобы текст страницы
+  не ломал формат строки.
 - `type=submit` ставится на `input[type=submit]` и на `<button>` внутри
   `<form>` без явного `type` (неявный submit); бит читает gated-классификатор.
   `input[type=password]` печатается с `type=password`, значение всегда
