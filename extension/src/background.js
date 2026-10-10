@@ -461,6 +461,15 @@ function createServerConnection(cfg) {
         const waitMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 30000);
         return sendCmdToTab(params.tabId, "waitFor", params, waitMs + 10000);
       }
+      case "eval": {
+        // Ж.2: content ждёт до per-domain потолка сервера (≤300 с) — таймаут
+        // команды обязан быть больше контентного, иначе вместо честного
+        // EVAL_TIMEOUT сервер получит безликий TIMEOUT транспорта.
+        await BridgeOwners.assertAccess(params.tabId, label, connCount);
+        await assertTabDomain(policyPatterns, params.tabId);
+        const evalMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 300000);
+        return sendCmdToTab(params.tabId, "eval", params, evalMs + 10000);
+      }
       case "scan":
         // До 20 экранов с человеческим темпом — дедлайн контента 45 с (П2-3).
         await BridgeOwners.assertAccess(params.tabId, label, connCount);
@@ -1020,6 +1029,16 @@ async function screenshotCommand(params) {
 async function fetchFileCommand(conn, params) {
   await assertTabDomain(conn.policyPatterns, params.tabId);
   const tab = await getTab(params.tabId);
+  // Ж.1: blob: URL живёт в origin и процессе страницы — из background его не
+  // достать. Читаем постранично в MAIN world вкладки (scripting.executeScript
+  // НЕ зависит от CSP страницы, в отличие от eval-runner'а) и льём в тот же
+  // файловый релей. Гейтинг (capability download по домену вкладки, сверка
+  // origin blob'а) — на сервере; здесь — честное исполнение пропущенного.
+  // Отличие от http-ветки: res уходит ПОСЛЕ file.end (серверный transport-
+  // timeout 120 с покрывает весь трансфер, а не только старт).
+  if (String(params.url || "").startsWith("blob:")) {
+    return fetchBlobCommand(conn, params);
+  }
   const transferId = conn.nextTransferId();
   return BridgeFileRelay.start(
     { url: params.url, name: params.name, transferId, referer: tab.url || "" },
@@ -1030,6 +1049,86 @@ async function fetchFileCommand(conn, params) {
       sendAbort: (d) => conn.sendEvt("file.abort", d),
     }
   );
+}
+
+const BLOB_SLICE = 256 * 1024;
+
+/* Исполняется в MAIN world страницы (сериализуется scripting.executeScript) —
+ * без замыканий, самодостаточна. Срез blob'а → base64. */
+async function __bridgeBlobSlice(url, offset, len) {
+  const resp = await fetch(url);
+  const blob = await resp.blob();
+  const u8 = new Uint8Array(await blob.slice(offset, offset + len).arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  return { size: blob.size, mime: blob.type || "application/octet-stream", data_base64: btoa(bin) };
+}
+
+function base64ToU8(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+async function execInMainWorld(tabId, func, args) {
+  if (!browser.scripting || !browser.scripting.executeScript) {
+    throw perr("FETCH_FAILED", "scripting.executeScript недоступен — blob: скачивание не поддержано в этом браузере");
+  }
+  let results;
+  try {
+    results = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func, args });
+  } catch (e) {
+    throw perr("FETCH_FAILED", "blob: MAIN-world чтение не удалось: " + ((e && e.message) || e));
+  }
+  const r = Array.isArray(results) ? results[0] : null;
+  if (!r || r.error) {
+    throw perr("FETCH_FAILED", "blob: " + ((r && r.error && r.error.message) || "MAIN-world скрипт не вернул результат"));
+  }
+  return r.result;
+}
+
+async function fetchBlobCommand(conn, params) {
+  const transferId = conn.nextTransferId();
+  const io = {
+    sendStart: (d) => conn.sendEvt("file.start", d),
+    sendChunk: (d) => conn.sendFileChunk(d), // Promise file.ack — backpressure
+    sendEnd: (d) => conn.sendEvt("file.end", d),
+    sendAbort: (d) => conn.sendEvt("file.abort", d),
+  };
+  const name = params.name || "blob-download.bin";
+  const hash = BridgeSha256.create();
+  let offset = 0, seq = 0, started = false, total = 0, mime = "application/octet-stream";
+  try {
+    for (;;) {
+      const r = await execInMainWorld(params.tabId, __bridgeBlobSlice, [String(params.url), offset, BLOB_SLICE]);
+      if (!r || typeof r.size !== "number") throw new Error("неожиданный ответ MAIN-world среза");
+      if (!started) {
+        total = r.size;
+        mime = r.mime || mime;
+        io.sendStart({ transferId, name, size: total || undefined, mime });
+        started = true;
+      }
+      const b64 = String(r.data_base64 || "");
+      if (b64) {
+        const u8 = base64ToU8(b64);
+        hash.update(u8);
+        const ack = await io.sendChunk({ transferId, seq, data_base64: b64 });
+        if (!ack || !ack.ok) throw new Error("file.ack не получен: " + ((ack && ack.error) || "нет ответа"));
+        seq++;
+        offset += u8.length;
+      }
+      if (offset >= total || !b64) break;
+    }
+    io.sendEnd({ transferId, sha256: hash.digestHex() });
+    return { transferId, size: total, mime };
+  } catch (e) {
+    if (started) io.sendAbort({ transferId, reason: String((e && e.message) || e) });
+    if (e && e.code) throw e;
+    throw perr("FETCH_FAILED", "blob: " + String((e && e.message) || e));
+  }
 }
 
 // consent.ask: баннер рисует content script; нет скрипта (challenge-страница) → deny.

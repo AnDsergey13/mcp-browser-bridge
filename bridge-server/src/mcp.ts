@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Transport, BridgeError, type SessionState } from './transport.ts';
-import { PolicyEngine, hostOf, type Capability, type GatedCategory, type ResolvedDomain } from './policy.ts';
+import { PolicyEngine, hostOf, EVAL_TIMEOUT_DEFAULT_MS, type Capability, type GatedCategory, type ResolvedDomain } from './policy.ts';
 import { classifyUrl, classifyElement, parseSnapshotRefs, type ElementMeta } from './classifier.ts';
 import { Pacing, PacingLimitError } from './pacing.ts';
 import { capResponse } from './compress.ts';
@@ -357,7 +357,33 @@ export class BridgeCore {
         // tab.close тоже идёт через policy (interact): нельзя закрыть чужую вкладку.
         // file.download: проверяем домен ФАЙЛА, а не вкладки — capability download
         // должна быть выдана домену, с которого реально скачиваем.
-        targetUrl = name === 'file.download' ? String(args['url'] ?? '') : known.url;
+        // Ж.1: blob:/data: — контент создан самой страницей, host у схемы
+        // пустой → policy по домену ВКЛАДКИ. blob чужого origin отклоняем:
+        // иначе грант одного сайта скачивал бы blob, подсунутый со страницы
+        // другого origin (fetch blob: в MAIN world и так бы упал — это
+        // честная ранняя ошибка вместо непонятного FETCH_FAILED).
+        if (name === 'file.download') {
+          const rawUrl = String(args['url'] ?? '');
+          const scheme = (/^([a-z][a-z0-9+.-]*):/i.exec(rawUrl)?.[1] ?? '').toLowerCase();
+          if (scheme === 'blob' || scheme === 'data') {
+            targetUrl = known.url;
+            if (scheme === 'blob') {
+              try {
+                const innerOrigin = new URL(rawUrl.slice(5)).origin;
+                const tabOrigin = new URL(known.url).origin;
+                if (innerOrigin !== tabOrigin) {
+                  return finish(this.fail('VALIDATION_ERROR', `blob: URL чужого origin (${innerOrigin}), вкладка — ${tabOrigin}. Можно скачивать только blob, созданный этой вкладкой.`, reminder()));
+                }
+              } catch {
+                return finish(this.fail('VALIDATION_ERROR', `Некорректный blob: URL: ${rawUrl.slice(0, 80)}…`, reminder()));
+              }
+            }
+          } else {
+            targetUrl = rawUrl;
+          }
+        } else {
+          targetUrl = known.url;
+        }
       }
 
       // 7. Policy-проверка: домен + capability + gated-категория — от имени
@@ -861,9 +887,12 @@ export class BridgeCore {
   private async executeEval(tabId: number | null, clientId: string, args: Record<string, unknown>): Promise<unknown> {
     const expression = String(args['expression'] ?? '');
     if (!expression.trim()) throw new BridgeError('INTERNAL', 'page.eval: пустое expression');
-    const timeoutMs = Math.min(Math.max(Number(args['timeout_ms']) || 10000, 500), 30000);
     const tabUrl = tabId !== null ? (this.tabs.get(this.tabKey(clientId, tabId))?.url ?? '') : '';
-    const domain = tabUrl ? (this.policy.resolveDomain(tabUrl, clientId)?.key ?? hostOf(tabUrl)) : '';
+    const resolvedDom = tabUrl ? this.policy.resolveDomain(tabUrl, clientId) : null;
+    // Ж.2: потолок таймаута — per-domain eval_timeout_ms (policy.yaml), дефолт 30 с.
+    const capMs = resolvedDom?.eval_timeout_ms ?? EVAL_TIMEOUT_DEFAULT_MS;
+    const timeoutMs = Math.min(Math.max(Number(args['timeout_ms']) || Math.min(10000, capMs), 500), capMs);
+    const domain = resolvedDom?.key ?? (tabUrl ? hostOf(tabUrl) : '');
     const exprSha256 = crypto.createHash('sha256').update(expression).digest('hex');
     const auditEval = (decision: string) => this.policy.audit({
       kind: 'eval', domain, browser: clientId, decision,
@@ -963,7 +992,7 @@ export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
     ['page.console', 'Кольцевой буфер console.*/onerror страницы (≤100 записей {ts,level,text}, text ≤500 символов) — диагностика «почему клик не сработал». MAIN-world хук; жёсткий CSP страницы может его запретить → честный маркер console_unavailable, а не молчаливый пустой буфер', { tabId, limit: z.number().max(100).optional(), browser }],
-    ['page.eval', 'Выполнить JS в MAIN world вкладки (window-состояние SPA, fetch к внутренним API страницы; awaitPromise:true по умолчанию await\'ит Promise результата). Мощный примитив: capability eval per-domain + gated eval:confirm (пользователь видит expression в баннере), expression пишется в policy-audit, вызов идёт в pacing-окно 30 act/мин. ОБЯЗАТЕЛЬНЫЙ description: 1–2 предложения простым языком, ЧТО делает скрипт — пользователь не читает JS, description показывается в баннере первым и без него решение невозможно (пустой/отсутствующий → VALIDATION_ERROR до баннера). Сам expression начинай с комментария-шапки (// что делает скрипт): баннер показывает его целиком. Ответ untrusted (N15). Результат ≤16 KB — инлайн {value_json, value_type}; больше — автоматически файловым релеем в downloads/ ({relayed:true, file, size, sha256}). CSP страницы может запретить MAIN-world runner → EVAL_UNAVAILABLE: это СТОП и доклад, не обход', { tabId, expression: z.string().min(1), description: z.string().min(1), awaitPromise: z.boolean().optional(), timeout_ms: z.number().max(30000).optional(), browser }],
+    ['page.eval', 'Выполнить JS в MAIN world вкладки (window-состояние SPA, fetch к внутренним API страницы; awaitPromise:true по умолчанию await\'ит Promise результата). Мощный примитив: capability eval per-domain + gated eval:confirm (пользователь видит expression в баннере), expression пишется в policy-audit, вызов идёт в pacing-окно 30 act/мин. ОБЯЗАТЕЛЬНЫЙ description: 1–2 предложения простым языком, ЧТО делает скрипт — пользователь не читает JS, description показывается в баннере первым и без него решение невозможно (пустой/отсутствующий → VALIDATION_ERROR до баннера). Сам expression начинай с комментария-шапки (// что делает скрипт): баннер показывает его целиком. Ответ untrusted (N15). Результат ≤16 KB — инлайн {value_json, value_type}; больше — автоматически файловым релеем в downloads/ ({relayed:true, file, size, sha256}). CSP страницы может запретить MAIN-world runner → EVAL_UNAVAILABLE: это СТОП и доклад, не обход', { tabId, expression: z.string().min(1), description: z.string().min(1), awaitPromise: z.boolean().optional(), timeout_ms: z.number().max(300000).optional().describe('мс; дефолт 10 с, потолок 30 с — per-domain eval_timeout_ms в policy.yaml поднимает потолок до 300 с'), browser }],
     ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
     ['act.hover', 'Наведение на элемент без клика (ref из снапшота ИЛИ text): раскрыть hover-меню/тултип/подсказку. Gated-классификация — как у act.click', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
@@ -972,7 +1001,7 @@ export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?
     ['act.scroll', 'Скролл на dy пикселей или scrollIntoView к ref', { tabId, dy: z.number().optional(), ref: ref.optional(), browser }],
     ['act.key', 'Нажатие клавиши (Enter, Tab, Escape, …)', { tabId, key: z.string(), browser }],
     ['act.batch', 'Пакет до 10 действий (click/type/select/key) одним вызовом: единый policy-check в начале (gated-шаг без гранта отклоняет весь пакет), один after-блок в конце. Шаги учитываются в окне 30 act/мин', { tabId, steps: z.array(z.object({ do: z.enum(['click', 'type', 'select', 'key']), ref: ref.optional(), text: z.string().optional(), value: z.string().optional(), clear: z.boolean().optional(), key: z.string().optional() })).min(1).max(10), browser }],
-    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). При deny на домене ФАЙЛА пользователю сначала показывается in-page баннер download-гранта (П2-5): «Разрешить» выдаёт session-грант и загрузка продолжается без ретрая; deny/таймаут → исходная ошибка с data:{domain}. Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
+    ['file.download', 'Скачать файл со страницы через браузерную сессию (WS-релей в downloads/). blob:/data: URL (сгенерированные страницей файлы) — тоже поддерживаются: policy проверяется по домену ВКЛАДКИ, blob чужого origin отклоняется (VALIDATION_ERROR); blob читается постранично из MAIN world вкладки. При deny на домене ФАЙЛА пользователю сначала показывается in-page баннер download-гранта (П2-5): «Разрешить» выдаёт session-грант и загрузка продолжается без ретрая; deny/таймаут → исходная ошибка с data:{domain}. Большие файлы (>30 с релея) качают скрипты файл-REPL; при таймауте -32001 НЕ повторять вызов: проверить downloads/manifest.jsonl (status ok) — трансфер может завершиться в фоне. Повтор идентичного файла возвращает существующий (dedup), а не копию. Во время релея сервер шлёт notifications/progress (если клиент прислал progressToken): клиенты с resetTimeoutOnProgress таймаута -32001 не увидят', { tabId, url: z.string(), name: z.string().optional(), browser }],
     ['policy.status', 'Активный пресет, гранты, gated-правила, состояние пауз', {}],
     ['policy.request_preset', 'Запросить переключение пресета политики (требует подтверждения пользователя)', { name: z.string() }],
   ];

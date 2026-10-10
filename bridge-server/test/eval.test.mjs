@@ -150,3 +150,19 @@ test('page.eval: пустое expression → ошибка до обращени�
   assert.equal(res.ok, false);
   assert.equal(mock.actions.length, 0);
 });
+
+test('page.eval: per-domain eval_timeout_ms (Ж.2) — потолок из policy.yaml вместо 30 с', async () => {
+  prime();
+  mock.tabs.get(1).evalResult = '1';
+  // У localhost:18547 в TEST_POLICY eval_timeout_ms: 120000.
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка per-domain потолка таймаута eval.', timeout_ms: 60000 });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(mock.lastEvalParams.timeout_ms, 60000, 'timeout_ms не зажат прежним потолком 30 с');
+  const res2 = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка клампа сверх per-domain потолка.', timeout_ms: 999999 });
+  assert.equal(res2.ok, true, JSON.stringify(res2));
+  assert.equal(mock.lastEvalParams.timeout_ms, 120000, 'зажато per-domain потолком из policy.yaml');
+  // Без аргумента — прежний дефолт 10 с.
+  const res3 = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка дефолта таймаута eval.' });
+  assert.equal(res3.ok, true, JSON.stringify(res3));
+  assert.equal(mock.lastEvalParams.timeout_ms, 10000);
+});

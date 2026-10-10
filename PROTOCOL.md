@@ -122,7 +122,7 @@
   хука → честный маркер `console_unavailable` (по образцу
   `netlog_unavailable`), а не молчаливый пустой буфер.
   MCP-инструмент: `page.console`, capability `read`.
-- `eval` `{tabId, expression, awaitPromise?:bool (дефолт true), timeout_ms?:≤30000 (дефолт 10000)}` →
+- `eval` `{tabId, expression, awaitPromise?:bool (дефолт true), timeout_ms?:дефолт 10000, потолок 30000 — per-domain `eval_timeout_ms` в policy.yaml поднимает до 300000}` →
   `{url,title,flags,value_json,value_type,bytes}` — инлайн (≤16000 символов
   JSON) — или `{url,title,flags,relayed:true,transferId,value_type,bytes}` —
   большой результат ушёл файловым релеем (§8) в `downloads/eval-result-*.json`
@@ -308,6 +308,18 @@ Chromium-варианта).
 цель редиректа отдельно не проверяется (тот же trust-model, что навигация
 браузера по редиректу).
 
+**blob:/data: (Ж.1).** У таких URL пустой host — политика проверяется по домену
+ВКЛАДКИ (capability `download` должен быть выдан ей), а для blob: сервер
+дополнительно сверяет origin внутри URL с origin вкладки (чужой →
+`VALIDATION_ERROR` до policy-гейта). Физически blob: живёт в процессе страницы:
+background читает его постранично (срезы по 256 КБ) через
+`scripting.executeScript({world:"MAIN"})` — это НЕ eval-runner и от CSP
+страницы не зависит. Отличия ветки: res на `fetchFile` уходит ПОСЛЕ `file.end`
+(трансфер целиком покрыт transport-timeout 120 с — для очень больших blob это
+честный таймаут, а не фоновый дожим), `data:` обрабатывается обычным
+background-fetch (менять нечего). Firefox: `browser.scripting` + `world:"MAIN"`
+— FF ≥ 128; на более старых — честный `FETCH_FAILED`.
+
 MV3: трансфер минутами живёт в service worker — WS-трафик (file.chunk/ack)
 сбрасывает idle-таймер (Chrome 116+, подтверждено спайком G1); страховка —
 штатный alarms-keepalive (keepalive.js), отдельного механизма под трансфер
@@ -397,8 +409,10 @@ title: …
 `RESPONSE_TOO_LARGE` (после резки — hint), `TIMEOUT`, `INTERNAL`.
 
 Формат ответа MCP-инструмента: `{ok, data|error_code, hint, policy_reminder}`.
-`policy_reminder`: активный пресет + security-ограничения домена +
-содержимое `memory/domains/<domain>.md` и `memory/global-notes.md`, если есть.
+`policy_reminder`: активный пресет + security-ограничения домена + КАРТОЧКИ
+плейбуков `memory/domains/<domain>.md` и `memory/global-notes.md`
+(`{file, bytes, title}` — Ж.3: тело в ответ не вкладывается, полный текст
+модель читает файлом по запросу).
 
 ## 11. Мультиклиентность (несколько браузеров у одного сервера)
 

@@ -171,6 +171,13 @@
       onRemoved: wrapEvent(chrome.tabs.onRemoved),
     };
   }
+  if (chrome.scripting && chrome.scripting.executeScript) {
+    // Прямой пасsthrough MV3-API (func/args/world:"MAIN" — Ж.1, постраничное
+    // чтение blob: в контексте страницы). Firefox: нативный browser.scripting.
+    shim.scripting = {
+      executeScript: promisify(chrome.scripting.executeScript, chrome.scripting),
+    };
+  }
   if (chrome.permissions) {
     shim.permissions = {
       contains: promisify(chrome.permissions.contains, chrome.permissions),

@@ -10,6 +10,16 @@ function digest(obj: unknown): { sha256: string; bytes: number } {
   return { sha256: crypto.createHash('sha256').update(s).digest('hex').slice(0, 12), bytes: s.length };
 }
 
+/**
+ * Ж.3: карточка плейбука для policy_reminder — путь (абсолютный, чтобы модель
+ * могла сразу Read), размер и первая непустая строка как заголовок. Тело
+ * не вкладываем: экономия токенов на каждом ответе.
+ */
+function notesCard(file: string, text: string): Record<string, unknown> {
+  const title = (text.split('\n').find((l) => l.trim()) ?? '').trim().slice(0, 120);
+  return { file, bytes: Buffer.byteLength(text), title };
+}
+
 export class MemoryStore {
   private memoryDir: string;
   private log: (msg: string) => void;
@@ -50,18 +60,12 @@ export class MemoryStore {
     }
   }
 
-  domainNotes(domainKey: string | null): string | null {
-    if (!domainKey) return null;
-    return this.readIfExists(path.join(this.memoryDir, 'domains', domainFileName(domainKey)));
-  }
-
-  globalNotes(): string | null {
-    return this.readIfExists(path.join(this.memoryDir, 'global-notes.md'));
-  }
-
   /**
    * policy_reminder для ответа MCP-инструмента: активный пресет +
-   * security-ограничения домена + плейбуки (trusted, пишет пользователь — N15).
+   * security-ограничения домена + КАРТОЧКИ плейбуков (Ж.3: тело плейбука в
+   * каждый ответ не вкладываем — только путь/размер/заголовок; полный текст
+   * модель читает файлом по запросу). Карточки — trusted (пишет пользователь,
+   * N15).
    */
   buildPolicyReminder(policy: PolicyEngine, resolved: ResolvedDomain | null): Record<string, unknown> {
     const reminder: Record<string, unknown> = {
@@ -76,11 +80,13 @@ export class MemoryStore {
         gated: resolved.gated,
         source: resolved.source,
       };
-      const notes = this.domainNotes(resolved.key);
-      if (notes) reminder.domain_notes = notes;
+      const notesFile = path.join(this.memoryDir, 'domains', domainFileName(resolved.key));
+      const notes = this.readIfExists(notesFile);
+      if (notes) reminder.domain_notes = notesCard(notesFile, notes);
     }
-    const globalNotes = this.globalNotes();
-    if (globalNotes) reminder.global_notes = globalNotes;
+    const globalFile = path.join(this.memoryDir, 'global-notes.md');
+    const globalNotes = this.readIfExists(globalFile);
+    if (globalNotes) reminder.global_notes = notesCard(globalFile, globalNotes);
     return reminder;
   }
 }

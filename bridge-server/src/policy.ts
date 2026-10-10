@@ -21,6 +21,17 @@ export interface DomainGrant {
   capabilities: Capability[];
   gated: Partial<Record<GatedCategory, GatedDecision>>;
   source: 'preset' | 'session';
+  /** Ж.2: потолок таймаута page.eval из policy.yaml (только пресетная запись домена). */
+  eval_timeout_ms?: number;
+}
+
+// Ж.2: per-domain потолок таймаута page.eval. Дефолт 30 с, абсолютный потолок 300 с.
+export const EVAL_TIMEOUT_DEFAULT_MS = 30000;
+export const EVAL_TIMEOUT_MAX_MS = 300000;
+function clampEvalTimeout(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return EVAL_TIMEOUT_DEFAULT_MS;
+  return Math.min(Math.max(Math.round(n), 1000), EVAL_TIMEOUT_MAX_MS);
 }
 
 /** Session-грант (D4): привязан к браузеру-источнику; clientId undefined — для всех (back-compat вызовов без clientId). */
@@ -33,6 +44,8 @@ export interface ResolvedDomain {
   capabilities: Capability[];
   gated: Record<GatedCategory, GatedDecision>;
   source: 'preset' | 'session';
+  /** Ж.2: эффективный потолок timeout_ms для page.eval (дефолт 30 с, ≤300 с). */
+  eval_timeout_ms: number;
 }
 
 export type CheckResult =
@@ -55,6 +68,8 @@ interface PolicyFile {
     domains?: Record<string, {
       capabilities?: string[];
       gated?: Partial<Record<GatedCategory, GatedDecision>>;
+      /** Ж.2: потолок таймаута page.eval для домена (дефолт 30 с, ≤300 с). */
+      eval_timeout_ms?: number;
       /** D4: clientId'ы браузеров, которым доступен домен; без поля — всем. */
       browsers?: string[];
     }>;
@@ -289,6 +304,9 @@ export class PolicyEngine {
       capabilities: [...caps],
       gated,
       source: sessions.length > 0 && !fromPreset ? 'session' : 'preset',
+      // Ж.2: eval_timeout_ms — только пресетная запись; session-грант его не несёт
+      // и не стирает (REPLACE-семантика грантов касается capabilities/gated).
+      ...(fromPreset?.eval_timeout_ms !== undefined ? { eval_timeout_ms: fromPreset.eval_timeout_ms } : {}),
     };
   }
 
@@ -325,7 +343,7 @@ export class PolicyEngine {
     if (!key) return null;
     const grant = this.grantFor(key, clientId);
     if (!grant) return null;
-    return { key, capabilities: grant.capabilities, gated: this.resolveGated(key, grant), source: grant.source };
+    return { key, capabilities: grant.capabilities, gated: this.resolveGated(key, grant), source: grant.source, eval_timeout_ms: clampEvalTimeout(grant.eval_timeout_ms) };
   }
 
   // ---- проверка команды ----

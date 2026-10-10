@@ -2,6 +2,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { makeTempEnv, startTestBridge, waitFor, FORM_TAB, TEST_POLICY } from './helpers.mjs';
 import { MockExtension } from './mock-extension.mjs';
 
@@ -165,4 +166,44 @@ test('журнал (фаза 6 п.1): tool calls пишутся в journal.jsonl
   assert.ok(click.ts && click.args_digest?.sha256 && click.result_digest?.sha256);
   assert.equal(click.tabId, 1);
   assert.match(click.url, /localhost:18547/);
+});
+
+test('eval_timeout_ms (Ж.2): дефолт 30 с, per-domain значение, кламп [1000, 300000]', async () => {
+  const { PolicyEngine } = await import('../src/policy.ts');
+  const yaml = `version: 2
+active_preset: t
+default: deny
+presets:
+  t:
+    domains:
+      "a.example": { capabilities: [read, eval] }
+      "b.example": { capabilities: [read, eval], eval_timeout_ms: 120000 }
+      "c.example": { capabilities: [read, eval], eval_timeout_ms: 999999 }
+`;
+  const e2 = makeTempEnv(t0, yaml);
+  const pe = new PolicyEngine({ policyPath: e2.policyPath, memoryDir: e2.memoryDir });
+  pe.load();
+  assert.equal(pe.resolveDomain('https://a.example/')?.eval_timeout_ms, 30000, 'дефолт 30 с');
+  assert.equal(pe.resolveDomain('https://b.example/')?.eval_timeout_ms, 120000, 'per-domain потолок');
+  assert.equal(pe.resolveDomain('https://c.example/')?.eval_timeout_ms, 300000, 'зажато абсолютным потолком 300 с');
+});
+
+test('policy_reminder (Ж.3): плейбуки приходят карточками {file, bytes, title}, тело не вкладывается', async () => {
+  handle.policy.setActivePreset('test');
+  await primeTab();
+  // Файлы пишем ПОСЛЕ primeTab: хэш reminder'а меняется → следующий ответ
+  // вернёт полную форму (иначе primeTab сам поглотит смену хэша).
+  fs.writeFileSync(path.join(env.memoryDir, 'domains', 'localhost_18547.md'), '# Плейбук localhost\n\nСелекторы: секрет-тело\n');
+  fs.writeFileSync(path.join(env.memoryDir, 'global-notes.md'), '# Общие заметки\n');
+  // Файлы изменили хэш reminder'а → следующий ответ вернёт полную форму.
+  const res = await handle.core.callTool('page.snapshot', { tabId: 1 });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const dn = res.policy_reminder.domain_notes;
+  assert.ok(dn && typeof dn === 'object', 'карточка плейбука домена');
+  assert.match(dn.file, /domains\/localhost_18547\.md$/);
+  assert.ok(dn.bytes > 0);
+  assert.equal(dn.title, '# Плейбук localhost');
+  assert.ok(!JSON.stringify(dn).includes('секрет-тело'), 'тело плейбука не вкладывается в ответ');
+  const gn = res.policy_reminder.global_notes;
+  assert.ok(gn && typeof gn === 'object' && gn.bytes > 0 && gn.file.endsWith('global-notes.md'), 'карточка global-notes');
 });
