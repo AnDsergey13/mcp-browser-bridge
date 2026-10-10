@@ -351,7 +351,7 @@ export class BridgeCore {
       } else if (tabId !== null && name !== 'tab.list') {
         const known = this.tabs.get(key!);
         if (!known) {
-          return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`, reminder()));
+          return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу — сделай tab.list. Если расширение/браузер перезагружались, tabId сменились; старую вкладку — обновить (F5).`, reminder()));
         }
         knownTab = known;
         // tab.close тоже идёт через policy (interact): нельзя закрыть чужую вкладку.
@@ -466,9 +466,9 @@ export class BridgeCore {
         BROWSER_OFFLINE: 'Соединение с браузером потеряно. Попроси пользователя проверить браузер/расширение.',
         TIMEOUT: 'Расширение не ответило вовремя. Повтори или сделай свежий page.snapshot.',
         STALE_REF: 'ref инвалидирован (страница изменилась). Сделай свежий page.snapshot и используй новые ref.',
-        NO_TAB: 'Вкладка не найдена. Сделай tab.list.',
-        FETCH_FAILED: 'Скачивание не удалось. Проверь URL и попробуй ещё раз.',
-        CONTENT_SCRIPT_ABSENT: 'Домен вне match_patterns политики — content script не загружен.',
+        NO_TAB: 'Вкладка неизвестна серверу — сделай tab.list. Если расширение/браузер перезагружались, tabId могли смениться; если вкладка открыта давно — попроси пользователя обновить страницу (F5).',
+        FETCH_FAILED: 'Скачивание не удалось — причина в сообщении ошибки. Проверь URL и попробуй ещё раз.',
+        CONTENT_SCRIPT_ABSENT: 'Во вкладке нет живого content script. Чаще всего вкладка открыта ДО перезагрузки расширения — попроси пользователя обновить страницу (F5). Реже: домен вне match_patterns политики или страница не даёт инжекцию (chrome://, галерея дополнений).',
         NAV_TIMEOUT: 'Навигация не завершилась вовремя.',
       };
       // AMBIGUOUS_BROWSER: message несёт список браузеров — это и есть hint.
