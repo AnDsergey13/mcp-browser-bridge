@@ -132,9 +132,17 @@
   страницы может запретить загрузку runner'а → ошибка `EVAL_UNAVAILABLE`
   (честный маркер, как `console_unavailable`). Таймаут исполнения →
   `EVAL_TIMEOUT`; исключение в выражении → `EVAL_ERROR` с сообщением страницы.
-  MCP-инструмент: `page.eval`. Гейтинг — двойной: capability `eval`
-  per-domain (default-deny) + gated `eval: confirm` (по умолчанию; consent-
-  баннер показывает expression, рекомендуется `eval: confirm` в hard_floor).
+  MCP-инструмент: `page.eval` `{tabId, expression, description, awaitPromise?,
+  timeout_ms?, browser?}` — `description` ОБЯЗАТЕЛЕН: 1–2 предложения простым
+  языком, ЧТО делает скрипт (пользователь не читает JS); пустой/отсутствующий →
+  `VALIDATION_ERROR` до policy-гейта и баннера. Гейтинг — двойной: capability
+  `eval` per-domain (default-deny) + gated `eval: confirm` (по умолчанию,
+  рекомендуется `eval: confirm` в hard_floor). Consent-баннер для eval
+  получает в params `description`, `title`/`url` вкладки-цели и ПОЛНЫЙ
+  `expression` и показывает: description первым, затем вкладку, затем
+  expression блоком кода с прокруткой (max-height + overflow:auto) и кнопкой
+  «Копировать» (navigator.clipboard с fallback); без этих полей (старый
+  сервер) баннер остаётся прежним (деградация по наличию полей).
   Expression пишется в policy-audit.jsonl (preview + sha256), вызов
   учитывается в pacing-окне 30 act/мин, ответ маркируется
   `untrusted_page_content` (N15 — страница может подделать ответ runner'а).

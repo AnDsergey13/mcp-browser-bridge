@@ -55,6 +55,19 @@ function shortHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
+/**
+ * Е: extra-поля consent-баннера для page.eval — ПОЛНЫЙ expression (баннер
+ * рисует его блоком кода с прокруткой) и title/url вкладки-цели. Вкладки в
+ * реестре может не быть → title/url пустые, баннер деградирует к старому виду.
+ */
+function evalConsentParams(args: Record<string, unknown>, tab?: TabInfo): Record<string, unknown> {
+  return {
+    expression: String(args['expression'] ?? ''),
+    title: tab?.title ?? '',
+    url: tab?.url ?? '',
+  };
+}
+
 export class BridgeCore {
   transport: Transport;
   policy: PolicyEngine;
@@ -322,9 +335,17 @@ export class BridgeCore {
       // 5. Специальные инструменты без page-конвейера.
       if (name === 'policy.request_preset') return finish(await this.toolRequestPreset(String(args['name'] ?? ''), reminder, clientId));
 
+      // 5.5. Е: у page.eval обязателен осмысленный description — без него
+      // человек не вынесет решение в баннере (он не читает JS). Проверка ДО
+      // policy-гейта и consent-баннера; zod-схема дублирует её на SDK-уровне.
+      if (name === 'page.eval' && !String(args['description'] ?? '').trim()) {
+        return finish(this.fail('VALIDATION_ERROR', 'page.eval: нужен description — 1–2 предложения простым языком, ЧТО делает скрипт (его первым видит человек в баннере подтверждения).', reminder()));
+      }
+
       // 6. Определяем целевой URL и capability.
       const capability = name === 'page.eval' ? 'eval' : PAGE_TOOLS.has(name) ? 'read' : ACT_TOOLS.has(name) ? 'interact' : name === 'file.download' ? 'download' : null;
       let targetUrl: string | null = null;
+      let knownTab: TabInfo | undefined; // Е: title/url вкладки уходят в баннер page.eval
       if (name === 'tab.open') {
         targetUrl = String(args['url'] ?? '');
       } else if (tabId !== null && name !== 'tab.list') {
@@ -332,6 +353,7 @@ export class BridgeCore {
         if (!known) {
           return finish(this.fail('NO_TAB', `Вкладка ${tabId} неизвестна серверу. Сначала tab.list.`, reminder()));
         }
+        knownTab = known;
         // tab.close тоже идёт через policy (interact): нельзя закрыть чужую вкладку.
         // file.download: проверяем домен ФАЙЛА, а не вкладки — capability download
         // должна быть выдана домену, с которого реально скачиваем.
@@ -364,7 +386,9 @@ export class BridgeCore {
           }
           resolved = check.resolved;
           if (check.decision === 'consent') {
-            const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0, clientId!);
+            // Е: баннер page.eval получает extra — полный expression + title/url вкладки.
+            const extra = name === 'page.eval' ? evalConsentParams(args, knownTab) : undefined;
+            const decision = await this.askConsent(check.category, this.describeAction(name, args), check.resolved.key, tabId ?? 0, clientId!, extra);
             if (decision === 'deny') {
               this.policy.audit({ kind: 'deny', domain: check.resolved.key, category: check.category, decision: 'consent_deny' });
               return finish(this.fail('ACTION_DENIED', `Пользователь не подтвердил действие категории "${check.category}" (deny/timeout). Не повторяй без изменения замысла.`, reminder()));
@@ -494,11 +518,10 @@ export class BridgeCore {
 
   private describeAction(name: string, args: Record<string, unknown>): string {
     if (name === 'tab.open') return `Открыть ${String(args['url'] ?? '')}`;
-    // page.eval: пользователь обязан видеть, ЧТО будет исполнено (consent-баннер).
-    if (name === 'page.eval') {
-      const expr = String(args['expression'] ?? '').replace(/\s+/g, ' ').trim();
-      return `page.eval: ${expr.slice(0, 120)}${expr.length > 120 ? '…' : ''}`;
-    }
+    // page.eval (Е): description баннера — осмысленное описание от агента
+    // (обязательный параметр, шаг 5.5); сам expression баннер получает
+    // отдельным полем (evalConsentParams) и показывает целиком.
+    if (name === 'page.eval') return String(args['description'] ?? '');
     if (name === 'act.batch') {
       const n = Array.isArray(args['steps']) ? (args['steps'] as unknown[]).length : 0;
       return `act.batch (${n} шагов)`;
@@ -506,12 +529,12 @@ export class BridgeCore {
     return `${name} ref=${String(args['ref'] ?? '-')}`;
   }
 
-  /** consent.ask — в браузер-владелец вкладки (D6). */
-  private async askConsent(category: GatedCategory | 'custom', description: string, domain: string, tabId: number, clientId: string): Promise<'allow' | 'deny' | 'allow_10min'> {
+  /** consent.ask — в браузер-владелец вкладки (D6). extra — доп. поля params (Е: page.eval → expression/title/url). */
+  private async askConsent(category: GatedCategory | 'custom', description: string, domain: string, tabId: number, clientId: string, extra?: Record<string, unknown>): Promise<'allow' | 'deny' | 'allow_10min'> {
     const requestId = `c_${++this.consentSeq}`;
     try {
       const res = await this.transport.request(clientId, 'consent.ask', {
-        requestId, category, description, domain, tabId, timeout_ms: this.consentTimeoutMs,
+        requestId, category, description, domain, tabId, timeout_ms: this.consentTimeoutMs, ...(extra ?? {}),
       }, this.consentTimeoutMs + 1000) as { decision?: string };
       if (res && (res.decision === 'allow' || res.decision === 'allow_10min' || res.decision === 'deny')) return res.decision;
       return 'deny';
@@ -940,7 +963,7 @@ export function buildMcpServer(core: BridgeCore, opts?: { progressMinIntervalMs?
     ['page.screenshot', 'Скриншот вкладки (JPEG base64, ≤1280px)', { tabId, browser }],
     ['net.list', 'Пассивный лог media-запросов вкладки (m3u8/mpd/media) — прямые URL потоков для скачивания', { tabId, browser }],
     ['page.console', 'Кольцевой буфер console.*/onerror страницы (≤100 записей {ts,level,text}, text ≤500 символов) — диагностика «почему клик не сработал». MAIN-world хук; жёсткий CSP страницы может его запретить → честный маркер console_unavailable, а не молчаливый пустой буфер', { tabId, limit: z.number().max(100).optional(), browser }],
-    ['page.eval', 'Выполнить JS в MAIN world вкладки (window-состояние SPA, fetch к внутренним API страницы; awaitPromise:true по умолчанию await\'ит Promise результата). Мощный примитив: capability eval per-domain + gated eval:confirm (пользователь видит expression в баннере), expression пишется в policy-audit, вызов идёт в pacing-окно 30 act/мин. Ответ untrusted (N15). Результат ≤16 KB — инлайн {value_json, value_type}; больше — автоматически файловым релеем в downloads/ ({relayed:true, file, size, sha256}). CSP страницы может запретить MAIN-world runner → EVAL_UNAVAILABLE: это СТОП и доклад, не обход', { tabId, expression: z.string().min(1), awaitPromise: z.boolean().optional(), timeout_ms: z.number().max(30000).optional(), browser }],
+    ['page.eval', 'Выполнить JS в MAIN world вкладки (window-состояние SPA, fetch к внутренним API страницы; awaitPromise:true по умолчанию await\'ит Promise результата). Мощный примитив: capability eval per-domain + gated eval:confirm (пользователь видит expression в баннере), expression пишется в policy-audit, вызов идёт в pacing-окно 30 act/мин. ОБЯЗАТЕЛЬНЫЙ description: 1–2 предложения простым языком, ЧТО делает скрипт — пользователь не читает JS, description показывается в баннере первым и без него решение невозможно (пустой/отсутствующий → VALIDATION_ERROR до баннера). Сам expression начинай с комментария-шапки (// что делает скрипт): баннер показывает его целиком. Ответ untrusted (N15). Результат ≤16 KB — инлайн {value_json, value_type}; больше — автоматически файловым релеем в downloads/ ({relayed:true, file, size, sha256}). CSP страницы может запретить MAIN-world runner → EVAL_UNAVAILABLE: это СТОП и доклад, не обход', { tabId, expression: z.string().min(1), description: z.string().min(1), awaitPromise: z.boolean().optional(), timeout_ms: z.number().max(30000).optional(), browser }],
     ['page.scan', 'Автоскролл ленты с агрегацией уникальных интерактивных элементов (refs живые). Стоп: 3 экрана без роста, ≤20 экранов, ≤45 с', { tabId, max_screens: z.number().max(20).optional(), browser }],
     ['act.click', 'Клик по элементу (ref из снапшота ИЛИ text — атомарный поиск+клик по тексту, устойчив к STALE_REF)', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],
     ['act.hover', 'Наведение на элемент без клика (ref из снапшота ИЛИ text): раскрыть hover-меню/тултип/подсказку. Gated-классификация — как у act.click', { tabId, ref: ref.optional(), text: z.string().optional(), browser }],

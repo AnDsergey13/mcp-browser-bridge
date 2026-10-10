@@ -4,6 +4,9 @@
  * consent-banner.js — баннер подтверждения gated-действий (N4) и баннер
  * download-гранта (П2-5, params.grant === true: домен ФАЙЛА, allow выдаёт
  * session-грант, кнопки «10 мин» нет).
+ * Режим page.eval (Е, category:"eval" + params.expression): description первым,
+ * затем title/URL вкладки-цели, затем ПОЛНЫЙ expression блоком кода с
+ * прокруткой и кнопкой «Копировать». Без этих полей (старый сервер) — прежний вид.
  * Shadow DOM (mode:"closed") поверх страницы: страница не может ни прочитать,
  * ни нажать баннер. По таймауту сам возвращает deny.
  * Экспортирует window.__BRIDGE__.showConsent(params) → Promise<{decision}>.
@@ -46,6 +49,18 @@
     .domain { color: #9fb4cc; font-size: 13px; word-break: break-all; }
     .timer { margin-left: auto; color: #f2c14e; font-variant-numeric: tabular-nums; }
     .desc { margin: 6px 0 12px; color: #e8edf3; word-break: break-word; }
+    .tabline { margin: 0 0 8px; color: #9fb4cc; font-size: 13px; word-break: break-all; }
+    .codebar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin: 0 0 4px; color: #9fb4cc; font-size: 12px;
+    }
+    .code {
+      margin: 0 0 12px; padding: 8px 10px; max-height: 240px; overflow: auto;
+      background: #0d1117; border: 1px solid #334155; border-radius: 7px;
+      font: 12px/1.4 ui-monospace, Consolas, monospace;
+      white-space: pre-wrap; word-break: break-word; color: #d7e3f0;
+    }
+    .copy { padding: 3px 10px; font-size: 12px; background: #245073; color: #cfe4f7; border-color: #3b6e99; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; }
     button {
       font: inherit; padding: 7px 14px; border-radius: 7px; border: 1px solid transparent;
@@ -57,8 +72,31 @@
     button:focus-visible { outline: 2px solid #f2c14e; outline-offset: 2px; }
   `;
 
+  // Копирование expression в буфер (Е): navigator.clipboard (secure context),
+  // fallback — скрытый textarea + execCommand("copy") для небезопасных origins.
+  function copyExpression(text, btn) {
+    const done = (ok) => {
+      btn.textContent = ok ? "Скопировано" : "Не удалось";
+      setTimeout(() => { btn.textContent = "Копировать"; }, 1500);
+    };
+    const fallback = () => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;opacity:0";
+      (document.body || document.documentElement).appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { /* ignore */ }
+      ta.remove();
+      done(ok);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), fallback);
+    } else fallback();
+  }
+
   /**
-   * @param {{category:string, domain:string, description:string, timeout_ms:number, grant?:boolean}} params
+   * @param {{category:string, domain:string, description:string, timeout_ms:number, grant?:boolean, expression?:string, title?:string, url?:string}} params
    * @returns {Promise<{decision:"allow"|"deny"|"allow_10min"}>}
    */
   B.showConsent = function showConsent(params) {
@@ -102,6 +140,35 @@
       wrap.querySelector(".domain").textContent = (params && params.domain) || "";
       wrap.querySelector(".desc").textContent = (params && params.description) || "";
       const timerEl = wrap.querySelector(".timer");
+
+      // Е: баннер page.eval — description уже выше (первым), ниже добавляем
+      // title/URL вкладки-цели и ПОЛНЫЙ expression блоком кода с прокруткой
+      // (скрипт может быть больше экрана) + кнопку «Копировать». Поля
+      // expression/title/url появились у сервера вместе с обязательным
+      // description — старый сервер их не шлёт, баннер остаётся прежним.
+      if (params && params.category === "eval" && typeof params.expression === "string" && params.expression) {
+        const rowEl = wrap.querySelector(".row");
+        if (params.title || params.url) {
+          const tabline = document.createElement("div");
+          tabline.className = "tabline";
+          tabline.textContent = "Вкладка: " + (params.title || "—") + " — " + (params.url || "—");
+          rowEl.before(tabline);
+        }
+        const codebar = document.createElement("div");
+        codebar.className = "codebar";
+        const codelabel = document.createElement("span");
+        codelabel.textContent = "Скрипт целиком:";
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "copy";
+        copyBtn.textContent = "Копировать";
+        copyBtn.addEventListener("click", () => copyExpression(params.expression, copyBtn));
+        codebar.append(codelabel, copyBtn);
+        const code = document.createElement("pre");
+        code.className = "code";
+        code.textContent = params.expression; // только textContent: приходит по сети
+        rowEl.before(codebar, code);
+      }
 
       // П2-5: режим download-гранта (grant.ask): domain — домен ФАЙЛА, allow
       // выдаёт session-грант (подпись явно об этом); кнопка «10 мин» скрыта —
