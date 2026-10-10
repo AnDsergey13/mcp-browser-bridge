@@ -1041,7 +1041,11 @@ async function fetchFileCommand(conn, params) {
   }
   const transferId = conn.nextTransferId();
   return BridgeFileRelay.start(
-    { url: params.url, name: params.name, transferId, referer: tab.url || "" },
+    {
+      url: params.url, name: params.name, transferId, referer: tab.url || "",
+      // П.5: финальный URL после редиректов — тоже только грантованный домен.
+      checkRedirect: (finalUrl) => urlMatchesPolicy(conn.policyPatterns, finalUrl),
+    },
     {
       sendStart: (d) => conn.sendEvt("file.start", d),
       sendChunk: (d) => conn.sendFileChunk(d), // Promise file.ack — backpressure

@@ -33,6 +33,14 @@ const BridgeFileRelay = (() => {
     return e;
   }
 
+  /** П.6: максимум диагностики в сообщении — тип ошибки, сообщение, цепочка cause. */
+  function describeErr(e) {
+    if (!e) return "unknown";
+    let s = (e.name ? e.name + ": " : "") + (e.message || String(e));
+    if (e.cause) s += " (cause: " + describeErr(e.cause) + ")";
+    return s;
+  }
+
   function u8ToBase64(bytes) {
     let bin = "";
     const SLICE = 0x8000; // fromCharCode.apply не переживает большие spread'ы
@@ -163,7 +171,9 @@ const BridgeFileRelay = (() => {
   /**
    * Запуск трансфера: fetch → проверка заголовков → file.start → res
    * ({transferId, size, mime}); стриминг продолжается в фоне.
-   * params: {url, name?, transferId, referer} (referer — URL вкладки).
+   * params: {url, name?, transferId, referer, checkRedirect?(finalUrl)→bool}
+   * (referer — URL вкладки; checkRedirect — П.5, проверка финального URL
+   * после редиректов, вызывается ДО чтения тела).
    * io: {sendStart, sendChunk→Promise<{ok}>, sendEnd, sendAbort}.
    * env — точка внедрения для тестов: {fetchImpl, hashImpl}.
    */
@@ -178,11 +188,29 @@ const BridgeFileRelay = (() => {
       resp = await fetchImpl(url, { credentials: "include" });
     } catch (e) {
       stopRewrite();
-      throw ferr("FETCH_FAILED", "fetch failed: " + ((e && e.message) || e));
+      throw ferr("FETCH_FAILED", "fetch failed: " + describeErr(e));
     }
     if (!resp.ok || !resp.body) {
       stopRewrite();
-      throw ferr("FETCH_FAILED", "HTTP " + resp.status);
+      throw ferr(
+        "FETCH_FAILED",
+        "HTTP " + resp.status +
+          (resp.statusText ? " " + resp.statusText : "") +
+          (typeof resp.url === "string" && resp.url && resp.url !== url ? " (финальный URL: " + resp.url + ")" : "")
+      );
+    }
+
+    // П.5: цель редиректа обязана быть грантованным доменом (background-fetch
+    // следует cross-origin редиректам свободно). Финальный URL проверяем ДО
+    // чтения тела — на диск ничего не утекает. Пер-хоп проверка промежуточных
+    // редиректов — осознанно не делаем (бэклог: возможное ужесточение).
+    const finalUrl = typeof resp.url === "string" && resp.url ? resp.url : url;
+    if (typeof params.checkRedirect === "function" && finalUrl !== url && !params.checkRedirect(finalUrl)) {
+      stopRewrite();
+      try {
+        if (resp.body && typeof resp.body.cancel === "function") await resp.body.cancel();
+      } catch (e) { /* тело могло быть уже заблокировано */ }
+      throw ferr("FETCH_FAILED", "редирект на негрантованный домен: " + finalUrl + " (начальный: " + url + ")");
     }
 
     const mime = resp.headers.get("content-type") || "application/octet-stream";
