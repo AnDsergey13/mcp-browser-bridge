@@ -101,9 +101,12 @@
    */
   B.showConsent = function showConsent(params) {
     return new Promise((resolve) => {
-      // Один баннер за раз: повторный запрос заменяет прежний.
+      // Один баннер за раз. П.1: прежний запрос ДОСРОЧНО завершаем deny —
+      // раньше prev.remove() оставлял его промис висеть до таймаута, а сервер
+      // ждал ответа. reason "replaced" — не «click», deny-кэш не отравляется.
+      if (B.__activeConsent) B.__activeConsent.cancel();
       const prev = document.getElementById(HOST_ID);
-      if (prev) prev.remove();
+      if (prev) prev.remove(); // страховка: host от копии скрипта без тикета
 
       const timeoutMs = Number(params && params.timeout_ms) || 120000;
       const deadline = Date.now() + timeoutMs;
@@ -187,9 +190,14 @@
         if (settled) return;
         settled = true;
         clearInterval(tick);
+        observer.disconnect();
+        if (B.__activeConsent === ticket) B.__activeConsent = null;
         host.remove();
         resolve({ decision, reason: reason || "click" });
       }
+      // П.1: тикет активного баннера — следующий showConsent завершит этот досрочно.
+      const ticket = { cancel: () => finish("deny", "replaced") };
+      B.__activeConsent = ticket;
 
       wrap.querySelector(".allow").addEventListener("click", () => finish("allow", "click"));
       wrap.querySelector(".deny").addEventListener("click", () => finish("deny", "click"));
@@ -202,6 +210,21 @@
         timerEl.textContent = Math.ceil(left / 1000) + " c";
         if (left <= 0) finish("deny", "timeout"); // таймаут → автозапрет (N4), но без deny-кэша (П.3)
       }
+      // П.1: SPA-перерисовка может выкинуть host из DOM — перевешиваем, пока
+      // баннер не settled. Два плоских наблюдателя (host — прямой потомок
+      // documentElement; body — страховка), subtree не нужен: дорого на
+      // тяжёлых SPA. Счётчик — защита от страниц, зацикленно чистящих DOM.
+      // document.open/write (новый documentElement) осознанно не обрабатываем.
+      let reattachLeft = 10;
+      const reattach = () => {
+        if (settled || host.isConnected) return;
+        if (reattachLeft-- <= 0) { observer.disconnect(); return; }
+        (document.documentElement || document.body).appendChild(host);
+      };
+      const observer = new MutationObserver(reattach);
+      if (document.documentElement) observer.observe(document.documentElement, { childList: true });
+      if (document.body) observer.observe(document.body, { childList: true });
+
       const tick = setInterval(renderTimer, 250);
       renderTimer();
 
