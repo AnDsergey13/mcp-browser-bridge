@@ -326,12 +326,19 @@ title: …
 [e3] textbox name=q placeholder="Поиск" value=""
 [e4] select name=city ["Минск","Гродно"]
 [e5] checkbox "Согласен" checked=false
+[e6] button "Отправить" type=submit
+[e7] textbox name=pwd type=password placeholder="Пароль" value="***"
 # Заголовок раздела
 Текст абзаца… (видимый текст main/viewport, сжатый)
 ```
 
 - ref-метки `eN` — только интерактивные: a, button, input, select, textarea,
   summary, [role=button|link|checkbox|…], [contenteditable], [tabindex].
+- `type=submit` ставится на `input[type=submit]` и на `<button>` внутри
+  `<form>` без явного `type` (неявный submit); бит читает gated-классификатор.
+  `input[type=password]` печатается с `type=password`, значение всегда
+  маскируется (`***` если поле заполнено) — в снапшот/журнал пароль не
+  попадает.
 - Скоуп по умолчанию: пересечение viewport и `main|article` (fallback body);
   `scope:"full"` — вся страница. При дефолтном скоупе интерактивные элементы
   из `header/nav/footer/aside` опускаются В КОНЕЦ снапшота (П1-4), при

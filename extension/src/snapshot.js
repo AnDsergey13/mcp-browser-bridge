@@ -296,11 +296,26 @@
         return `[${ref}] ${type} "${labelOf(el)}" checked=${el.checked}`;
       }
       if (type === "button" || type === "submit" || type === "reset") {
-        return `[${ref}] button "${labelOf(el) || clean(el.value, 60)}"`;
+        // Д4: type=submit в строке — classifier.ts ищет этот бит (gated submit).
+        const tBit = type === "submit" ? " type=submit" : "";
+        return `[${ref}] button "${labelOf(el) || clean(el.value, 60)}"${tBit}`;
+      }
+      if (type === "password") {
+        // Д4: бит type=password (classifier → login, mcp.ts маскирует журнал),
+        // само значение в снапшот не попадает — только факт заполнения.
+        return `[${ref}] textbox${nameBit} type=password placeholder="${clean(el.placeholder, 40)}" value="${el.value ? "***" : ""}"`;
       }
       return `[${ref}] textbox${nameBit} placeholder="${clean(el.placeholder, 40)}" value="${clean(el.value, 60)}"`;
     }
-    if (tag === "button" || role === "button") return `[${ref}] button "${labelOf(el)}"`;
+    if (tag === "button" || role === "button") {
+      // Д4: <button> без type внутри <form> — неявный submit
+      // (HTMLButtonElement.type по умолчанию "submit"); вне формы не помечаем.
+      const submitBit =
+        tag === "button" && el.type === "submit" && el.closest("form")
+          ? " type=submit"
+          : "";
+      return `[${ref}] button "${labelOf(el)}"${submitBit}`;
+    }
     if (role === "link") return `[${ref}] link "${labelOf(el)}"`;
     if (role === "checkbox" || role === "switch" || role === "radio") {
       return `[${ref}] checkbox "${labelOf(el)}" checked=${el.getAttribute("aria-checked") === "true"}`;
