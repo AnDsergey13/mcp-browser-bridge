@@ -229,26 +229,53 @@
           document.title = TITLE_MARK + origTitle;
         }
       }
-      // Короткий beep, только если вкладка скрыта: для открытой вкладки звук
-      // лишний. Autoplay-policy может запретить AudioContext до жеста
-      // пользователя — молча отказываемся (резервный канал — системное
-      // уведомление из background, шлётся для неактивной вкладки).
+      // Короткий beep при КАЖДОМ показе баннера: вкладка может быть активна,
+      // но окно браузера свёрнуто или перекрыто другим окном — document.hidden
+      // этого не различает (пожелание пользователя 2026-10-11). Autoplay-policy
+      // может запретить AudioContext до жеста пользователя — молча
+      // отказываемся (резервный канал — системное уведомление из background,
+      // шлётся для неактивной вкладки).
       function beep() {
-        if (!document.hidden) return;
         try {
           const AC = window.AudioContext || window.webkitAudioContext;
           if (!AC) return;
           const ctx = new AC();
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.type = "sine";
-          osc.frequency.value = 880;
-          gain.gain.setValueAtTime(0.08, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.7);
-          osc.connect(gain).connect(ctx.destination);
-          osc.start();
-          osc.stop(ctx.currentTime + 0.7);
-          osc.onended = () => ctx.close().catch(() => {});
+          const start = () => {
+            try {
+              // Три коротких сигнала «пи-пи-пи» (пожелание пользователя
+              // 2026-10-11): одиночный beep легко пропустить.
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = "sine";
+              osc.frequency.value = 880;
+              const t0 = ctx.currentTime;
+              gain.gain.setValueAtTime(0.0001, t0);
+              for (let i = 0; i < 3; i++) {
+                const b = t0 + i * 0.25;
+                gain.gain.setValueAtTime(0.08, b);
+                gain.gain.exponentialRampToValueAtTime(0.0001, b + 0.15);
+              }
+              osc.connect(gain).connect(ctx.destination);
+              osc.start();
+              osc.stop(t0 + 0.8);
+              osc.onended = () => ctx.close().catch(() => {});
+            } catch (e) { ctx.close().catch(() => {}); }
+          };
+          if (ctx.state !== "suspended") { start(); return; }
+          // Autoplay-policy: без жеста пользователя на странице AudioContext
+          // рождается suspended и играет молча. Даём resume() короткое окно;
+          // не успел — закрываем, чтобы не копить мёртвые контексты (Chrome
+          // лимитирует их число). Звука без жеста браузер не даст в принципе —
+          // резервный канал: системное уведомление из background.
+          const killer = setTimeout(() => ctx.close().catch(() => {}), 400);
+          Promise.resolve(ctx.resume()).then(
+            () => {
+              clearTimeout(killer);
+              if (ctx.state === "running") start();
+              else ctx.close().catch(() => {});
+            },
+            () => { clearTimeout(killer); ctx.close().catch(() => {}); }
+          );
         } catch (e) { /* autoplay-policy или нет Audio API — звука не будет */ }
       }
       // П.1: SPA-перерисовка может выкинуть host из DOM — перевешиваем, пока
