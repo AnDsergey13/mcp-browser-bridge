@@ -767,6 +767,12 @@ async function tryInjectContentScripts(tabId) {
     ]) {
       await browser.tabs.executeScript(tabId, { file, runAt: "document_idle" });
     }
+    // Успех снимает ЛИПКУЮ ошибку прошлых падений этого же пути: lastError
+    // нигде не сбрасывался сам и висел в popup вечно, выглядя актуальным.
+    const cur = await browser.storage.local.get({ lastError: "" });
+    if (String(cur.lastError || "").startsWith("executeScript fallback")) {
+      await saveState({ lastError: "" });
+    }
     return true;
   } catch (e) {
     await saveState({ lastError: "executeScript fallback (tab " + tabId + "): " + e.message });
@@ -1150,11 +1156,19 @@ async function consentCommand(patterns, params) {
     if (!urlMatchesPolicy(patterns, tab.url || "")) {
       return { decision: "deny", note: "domain_mismatch: " + (tab.url || "") };
     }
-    // П.2: баннер рисуется во вкладке — если она не активна, пользователь его
-    // не увидит. Дублируем системным уведомлением (клик по нему не обязателен;
-    // решение принимается в баннере). Автофокус вкладки НЕ делаем: он крадёт
-    // ввод, если пользователь печатает/диктует в другой вкладке.
-    if (!tab.active) {
+    // П.2: баннер рисуется во вкладке — если она не активна ИЛИ её окно не в
+    // фокусе (вкладка в отдельном окне «активна», даже когда браузер свёрнут),
+    // пользователь баннер не увидит. Дублируем системным уведомлением (решение
+    // принимается в баннере). Автофокус вкладки НЕ делаем: он крадёт ввод,
+    // если пользователь печатает/диктует в другой вкладке.
+    let attentionNeeded = !tab.active;
+    if (!attentionNeeded && browser.windows && browser.windows.get && tab.windowId != null) {
+      try {
+        const w = await browser.windows.get(tab.windowId);
+        attentionNeeded = !w.focused;
+      } catch (e) { /* windows API недоступен — остаёмся на tab.active */ }
+    }
+    if (attentionNeeded) {
       notifId = "bridge-consent-" + params.tabId + "-" + Date.now();
       await browser.notifications
         .create(notifId, {
