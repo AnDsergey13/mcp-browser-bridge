@@ -4,11 +4,53 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadScript, makeChrome, j } from "./helpers.mjs";
 
-test("Firefox: нативный browser есть → шим no-op", () => {
-  const native = { native: true };
-  const { sandbox } = loadScript("compat-browser.js", null, { browser: native });
+test("Firefox/LibreWolf: нативный browser с getBrowserInfo → шим no-op", () => {
+  const chrome = makeChrome(); // даже если chrome.* рядом доступен
+  const native = { runtime: { getBrowserInfo: async () => ({ name: "LibreWolf" }) } };
+  const { sandbox } = loadScript("compat-browser.js", null, { chrome, browser: native });
   assert.equal(sandbox.browser, native); // объект не подменён
   assert.equal(sandbox.browser.tabs, undefined); // ничего не добавлено
+});
+
+test("Chromium ≥128: нативный browser-алиас (только MV3-API) → дочиняем tabs.executeScript", async () => {
+  // Регрессия 2026-10-11: в свежем Chromium globalThis.browser уже существует
+  // (алиас chrome.* с промисами), но MV2-зонда tabs.executeScript в нём нет;
+  // ранний выход шима давал "browser.tabs.executeScript is not a function" на
+  // каждой переинжекции вкладок.
+  const chrome = makeChrome();
+  const alias = {
+    tabs: { get: async (id) => ({ id, url: "https://a.com/" }) },
+    runtime: {}, // без getBrowserInfo — не Firefox
+  };
+  const { sandbox } = loadScript("compat-browser.js", null, { chrome, browser: alias });
+  assert.equal(sandbox.browser, alias, "нативный объект не подменён");
+  assert.equal(typeof alias.tabs.executeScript, "function", "пробел дочинен адаптером");
+  await alias.tabs.executeScript(3, { file: "src/content-bridge.js" });
+  const call = chrome.calls.find((c) => c[0] === "scripting.executeScript");
+  assert.ok(call, "вызов ушёл в chrome.scripting.executeScript");
+  assert.deepEqual(j(call[1].target), { tabId: 3 });
+});
+
+test("Chromium-алиас в урезанном контексте (без browser.tabs): не падаем, не трогаем", () => {
+  const chrome = makeChrome();
+  const alias = { runtime: { sendMessage: async () => ({}) } };
+  const { sandbox } = loadScript("compat-browser.js", null, { chrome, browser: alias });
+  assert.equal(sandbox.browser, alias);
+  assert.equal(sandbox.browser.tabs, undefined);
+});
+
+test("Chromium ≥128: browser === chrome (один объект) — адаптер не рекурсирует в себя", async () => {
+  // Регрессия 2026-10-11: присвоение browser.tabs.executeScript ставило адаптер
+  // и на chrome.tabs.executeScript; адаптер видел «legacy API есть» и вызывал
+  // сам себя до RangeError: Maximum call stack size exceeded.
+  const chrome = makeChrome();
+  const { sandbox } = loadScript("compat-browser.js", null, { chrome, browser: chrome });
+  assert.equal(typeof chrome.tabs.executeScript, "function", "заплатка встала на общий объект");
+  const res = await sandbox.browser.tabs.executeScript(3, { file: "src/content-bridge.js" });
+  assert.equal(res, 42, "без рекурсии: ушло в chrome.scripting");
+  const call = chrome.calls.find((c) => c[0] === "scripting.executeScript");
+  assert.ok(call, "маппинг на chrome.scripting.executeScript");
+  assert.deepEqual(j(call[1].files), ["src/content-bridge.js"]);
 });
 
 test("Chromium: создаётся browser поверх chrome, методы резолвятся промисами", async () => {
