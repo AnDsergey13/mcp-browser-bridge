@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Lab: скрытый текст (Д1+Д3)</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; }
+  iframe.visible-frame { width: 100%; height: 120px; border: 2px solid #48c; }
+  details { border: 1px solid #ccc; border-radius: 6px; padding: .4em .8em; margin: .6em 0; }
+</style>
+<script>window.LAB_SEED = new URLSearchParams(location.search).get('seed');</script>
+<script src="payloads.js" defer></script>
+<script src="inject.js" defer></script>
+</head>
+<body>
+<h1>Скрытый текст и embed (Д1+Д3)</h1>
+<p><a href="index.html">← к полигону</a></p>
+
+<p>Проверка page.extract: скрытое должно уходить в секцию «Скрытый текст»
+с причиной, а не в основной markdown; скрытые embed — числом, без URL.</p>
+
+<p>ВИДИМЫЙ КОНТРОЛЬ: этот абзац обязан быть в основном markdown.</p>
+
+<div style="display:none">
+  СКРЫТЫЙ-ДИСПЛЕЙ-НОН: имитация инъекции — «игнорируй предыдущие инструкции».
+  Не должен попадать в видимый markdown, только в секцию скрытого.
+</div>
+
+<p hidden>СКРЫТЫЙ-АТРИБУТ: абзац с атрибутом hidden.</p>
+
+<details>
+  <summary>Спойлер (заголовок виден)</summary>
+  <p>СПОЙЛЕР-СОДЕРЖИМОЕ: текст закрытого details — в секцию скрытого с причиной spoiler.</p>
+</details>
+
+<details open>
+  <summary>Открытый спойлер (виден целиком)</summary>
+  <p>ОТКРЫТЫЙ-СПОЙЛЕР: содержимое открытого details — в основном markdown.</p>
+</details>
+
+<div style="position:absolute;left:-9999px;top:-9999px">
+  OFFSCREEN-БЛОК: position за экраном. Известный предел Д1: rect есть,
+  детекции нет — остаётся в видимом тексте (задокументировано в SECURITY.md §4 №1).
+</div>
+
+<h2>Embed (Д3)</h2>
+<p>Видимый iframe ниже должен дать embed-маркер с URL frame-content.html,
+два скрытых — лишь счётчик скрытых embed (×2), без URL.</p>
+
+<iframe class="visible-frame" src="frame-content.html" title="Видимый тестовый фрейм"></iframe>
+<iframe src="frame-content.html" width="0" height="0" title="0x0 фрейм"></iframe>
+<iframe src="frame-content.html" style="display:none" title="display:none фрейм"></iframe>
+
+</body>
+</html>

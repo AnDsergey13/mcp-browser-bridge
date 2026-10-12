@@ -4,10 +4,13 @@
 /**
  * compat-browser.js — шим `browser.*` поверх `chrome.*` для Chromium (D10).
  *
- * Firefox: нативный глобал `browser` уже есть → шим no-op.
- * Chromium: создаём глобал `browser` с промис-обёртками ТОЛЬКО для методов,
- * реально используемых расширением (список собран grep'ом `browser\.` по
- * extension/src): storage.local.get/set/remove + onChanged, tabs.get/query/
+ * Firefox: нативный глобал `browser` уже есть (маркер — getBrowserInfo) → шим no-op.
+ * Chromium ≥~128: нативный `browser` существует, но это алиас chrome.* только
+ *   для MV3-API → не выходим, а дочиняем пробел: tabs.executeScript (MV2)
+ *   маппим на chrome.scripting.executeScript.
+ * Chromium старый: создаём глобал `browser` с промис-обёртками ТОЛЬКО для
+ *   методов, реально используемых расширением (список собран grep'ом `browser\.`
+ *   по extension/src): storage.local.get/set/remove + onChanged, tabs.get/query/
  * create/update/remove/goBack/reload/sendMessage/executeScript/
  * captureVisibleTab + onUpdated/onRemoved, permissions.contains/request,
  * notifications.create/clear + onButtonClicked, runtime.getManifest/getURL/
@@ -26,8 +29,32 @@
  * первым в importScripts sw-loader.js.
  */
 (function () {
-  // Firefox (и повторная загрузка): ничего не делаем.
-  if (typeof globalThis.browser !== "undefined" && globalThis.browser) return;
+  const nativeBrowser = globalThis.browser;
+  if (nativeBrowser) {
+    // Firefox/LibreWolf: полный нативный browser (есть getBrowserInfo) — no-op.
+    if (nativeBrowser.runtime && typeof nativeBrowser.runtime.getBrowserInfo === "function") {
+      return;
+    }
+    // Chromium ≥~128: существует НАТИВНЫЙ `browser` — алиас chrome.* с промисами,
+    // но только для MV3-API. MV2-зонда tabs.executeScript там нет, и ранний
+    // выход «browser уже есть» приводил к "browser.tabs.executeScript is not a
+    // function" при каждой переинжекции. Дочиняем ровно этот пробел.
+    if (
+      nativeBrowser.tabs &&
+      typeof nativeBrowser.tabs.executeScript !== "function" &&
+      typeof chrome !== "undefined" &&
+      (chrome.scripting || (chrome.tabs && chrome.tabs.executeScript))
+    ) {
+      // strict mode: если нативный объект окажется замороженным, присвоение
+      // бросит — не роняем загрузку service worker из-за косметической заплатки.
+      try {
+        nativeBrowser.tabs.executeScript = executeScript;
+      } catch (e) {
+        console.warn("[bridge] compat: не удалось дочинить browser.tabs.executeScript:", e);
+      }
+    }
+    return;
+  }
   // Не контекст расширения Chromium — шимить нечего.
   if (typeof chrome === "undefined" || !chrome.runtime) return;
 
@@ -115,8 +142,13 @@
    * — поведение scripting по умолчанию, injectImmediately не трогаем).
    */
   function executeScript(tabId, details) {
-    if (chrome.tabs && chrome.tabs.executeScript) {
-      return promisify(chrome.tabs.executeScript, chrome.tabs)(tabId, details);
+    // В Chromium ≥128 browser === chrome (алиас): наш патч
+    // browser.tabs.executeScript = executeScript ставит ЭТУ ЖЕ функцию и на
+    // chrome.tabs.executeScript — без самопроверки адаптер вызывал бы сам себя
+    // до RangeError (инцидент 2026-10-11).
+    const legacy = chrome.tabs && chrome.tabs.executeScript;
+    if (legacy && legacy !== executeScript) {
+      return promisify(legacy, chrome.tabs)(tabId, details);
     }
     if (chrome.scripting && chrome.scripting.executeScript) {
       const injection = { target: { tabId } };
@@ -169,6 +201,18 @@
       executeScript,
       onUpdated: wrapEvent(chrome.tabs.onUpdated),
       onRemoved: wrapEvent(chrome.tabs.onRemoved),
+    };
+  }
+  if (chrome.windows) {
+    // П.2: consent-уведомление смотрит на фокус ОКНА вкладки, а не только на
+    // tab.active (вкладка в отдельном окне «активна», даже когда окно свёрнуто).
+    shim.windows = { get: promisify(chrome.windows.get, chrome.windows) };
+  }
+  if (chrome.scripting && chrome.scripting.executeScript) {
+    // Прямой пасsthrough MV3-API (func/args/world:"MAIN" — Ж.1, постраничное
+    // чтение blob: в контексте страницы). Firefox: нативный browser.scripting.
+    shim.scripting = {
+      executeScript: promisify(chrome.scripting.executeScript, chrome.scripting),
     };
   }
   if (chrome.permissions) {

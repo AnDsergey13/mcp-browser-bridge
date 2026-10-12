@@ -33,7 +33,9 @@ const NOTIF_PREFIX = "bridge-session-"; // id уведомления = NOTIF_PRE
 
 // ---------- общее состояние ----------
 let paused = false;
-let reinjectDone = false; // П2-6: одноразовая переинжекция открытых вкладок
+// П2-6/П.7: сигнатура паттернов последней переинжекции открытых вкладок
+// (null — ещё не было). Повторяем при ИЗМЕНЕНИИ union-паттернов.
+let lastReinjectSig = null;
 /** @type {Array} подключения к серверам (ServerConnection) */
 const connections = [];
 /** Кэш per-connection состояния для popup; персистится как storage.local["connState"]. */
@@ -336,6 +338,9 @@ function createServerConnection(cfg) {
   async function notifyApproval() {
     const base = {
       type: "basic",
+      // Собственная иконка: в Chromium basic-уведомление без iconUrl может не
+      // показаться (исторически обязателен), в Firefox — просто косметика.
+      iconUrl: browser.runtime.getURL("icons/icon48.png"),
       title: "Bridge: новая сессия агента",
       message:
         "Сервер «" + label + "» запрашивает доступ к браузеру. Разрешить сессию?",
@@ -460,6 +465,15 @@ function createServerConnection(cfg) {
         await assertTabDomain(policyPatterns, params.tabId);
         const waitMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 30000);
         return sendCmdToTab(params.tabId, "waitFor", params, waitMs + 10000);
+      }
+      case "eval": {
+        // Ж.2: content ждёт до per-domain потолка сервера (≤300 с) — таймаут
+        // команды обязан быть больше контентного, иначе вместо честного
+        // EVAL_TIMEOUT сервер получит безликий TIMEOUT транспорта.
+        await BridgeOwners.assertAccess(params.tabId, label, connCount);
+        await assertTabDomain(policyPatterns, params.tabId);
+        const evalMs = Math.min(Math.max(Number(params.timeout_ms) || 10000, 500), 300000);
+        return sendCmdToTab(params.tabId, "eval", params, evalMs + 10000);
       }
       case "scan":
         // До 20 экранов с человеческим темпом — дедлайн контента 45 с (П2-3).
@@ -753,6 +767,12 @@ async function tryInjectContentScripts(tabId) {
     ]) {
       await browser.tabs.executeScript(tabId, { file, runAt: "document_idle" });
     }
+    // Успех снимает ЛИПКУЮ ошибку прошлых падений этого же пути: lastError
+    // нигде не сбрасывался сам и висел в popup вечно, выглядя актуальным.
+    const cur = await browser.storage.local.get({ lastError: "" });
+    if (String(cur.lastError || "").startsWith("executeScript fallback")) {
+      await saveState({ lastError: "" });
+    }
     return true;
   } catch (e) {
     await saveState({ lastError: "executeScript fallback (tab " + tabId + "): " + e.message });
@@ -1020,9 +1040,23 @@ async function screenshotCommand(params) {
 async function fetchFileCommand(conn, params) {
   await assertTabDomain(conn.policyPatterns, params.tabId);
   const tab = await getTab(params.tabId);
+  // Ж.1: blob: URL живёт в origin и процессе страницы — из background его не
+  // достать. Читаем постранично в MAIN world вкладки (scripting.executeScript
+  // НЕ зависит от CSP страницы, в отличие от eval-runner'а) и льём в тот же
+  // файловый релей. Гейтинг (capability download по домену вкладки, сверка
+  // origin blob'а) — на сервере; здесь — честное исполнение пропущенного.
+  // Отличие от http-ветки: res уходит ПОСЛЕ file.end (серверный transport-
+  // timeout 120 с покрывает весь трансфер, а не только старт).
+  if (String(params.url || "").startsWith("blob:")) {
+    return fetchBlobCommand(conn, params);
+  }
   const transferId = conn.nextTransferId();
   return BridgeFileRelay.start(
-    { url: params.url, name: params.name, transferId, referer: tab.url || "" },
+    {
+      url: params.url, name: params.name, transferId, referer: tab.url || "",
+      // П.5: финальный URL после редиректов — тоже только грантованный домен.
+      checkRedirect: (finalUrl) => urlMatchesPolicy(conn.policyPatterns, finalUrl),
+    },
     {
       sendStart: (d) => conn.sendEvt("file.start", d),
       sendChunk: (d) => conn.sendFileChunk(d), // Promise file.ack — backpressure
@@ -1032,19 +1066,127 @@ async function fetchFileCommand(conn, params) {
   );
 }
 
+const BLOB_SLICE = 256 * 1024;
+
+/* Исполняется в MAIN world страницы (сериализуется scripting.executeScript) —
+ * без замыканий, самодостаточна. Срез blob'а → base64. */
+async function __bridgeBlobSlice(url, offset, len) {
+  const resp = await fetch(url);
+  const blob = await resp.blob();
+  const u8 = new Uint8Array(await blob.slice(offset, offset + len).arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  return { size: blob.size, mime: blob.type || "application/octet-stream", data_base64: btoa(bin) };
+}
+
+function base64ToU8(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+async function execInMainWorld(tabId, func, args) {
+  if (!browser.scripting || !browser.scripting.executeScript) {
+    throw perr("FETCH_FAILED", "scripting.executeScript недоступен — blob: скачивание не поддержано в этом браузере");
+  }
+  let results;
+  try {
+    results = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func, args });
+  } catch (e) {
+    throw perr("FETCH_FAILED", "blob: MAIN-world чтение не удалось: " + ((e && e.message) || e));
+  }
+  const r = Array.isArray(results) ? results[0] : null;
+  if (!r || r.error) {
+    throw perr("FETCH_FAILED", "blob: " + ((r && r.error && r.error.message) || "MAIN-world скрипт не вернул результат"));
+  }
+  return r.result;
+}
+
+async function fetchBlobCommand(conn, params) {
+  const transferId = conn.nextTransferId();
+  const io = {
+    sendStart: (d) => conn.sendEvt("file.start", d),
+    sendChunk: (d) => conn.sendFileChunk(d), // Promise file.ack — backpressure
+    sendEnd: (d) => conn.sendEvt("file.end", d),
+    sendAbort: (d) => conn.sendEvt("file.abort", d),
+  };
+  const name = params.name || "blob-download.bin";
+  const hash = BridgeSha256.create();
+  let offset = 0, seq = 0, started = false, total = 0, mime = "application/octet-stream";
+  try {
+    for (;;) {
+      const r = await execInMainWorld(params.tabId, __bridgeBlobSlice, [String(params.url), offset, BLOB_SLICE]);
+      if (!r || typeof r.size !== "number") throw new Error("неожиданный ответ MAIN-world среза");
+      if (!started) {
+        total = r.size;
+        mime = r.mime || mime;
+        io.sendStart({ transferId, name, size: total || undefined, mime });
+        started = true;
+      }
+      const b64 = String(r.data_base64 || "");
+      if (b64) {
+        const u8 = base64ToU8(b64);
+        hash.update(u8);
+        const ack = await io.sendChunk({ transferId, seq, data_base64: b64 });
+        if (!ack || !ack.ok) throw new Error("file.ack не получен: " + ((ack && ack.error) || "нет ответа"));
+        seq++;
+        offset += u8.length;
+      }
+      if (offset >= total || !b64) break;
+    }
+    io.sendEnd({ transferId, sha256: hash.digestHex() });
+    return { transferId, size: total, mime };
+  } catch (e) {
+    if (started) io.sendAbort({ transferId, reason: String((e && e.message) || e) });
+    if (e && e.code) throw e;
+    throw perr("FETCH_FAILED", "blob: " + String((e && e.message) || e));
+  }
+}
+
 // consent.ask: баннер рисует content script; нет скрипта (challenge-страница) → deny.
 // Вкладка ушла с домена политики → консервативный deny с пояснением.
 async function consentCommand(patterns, params) {
   const timeoutMs = (Number(params.timeout_ms) || 120000) + 10000;
+  let notifId = null;
   try {
     const tab = await getTab(params.tabId);
     if (!urlMatchesPolicy(patterns, tab.url || "")) {
       return { decision: "deny", note: "domain_mismatch: " + (tab.url || "") };
     }
+    // П.2: баннер рисуется во вкладке — если она не активна ИЛИ её окно не в
+    // фокусе (вкладка в отдельном окне «активна», даже когда браузер свёрнут),
+    // пользователь баннер не увидит. Дублируем системным уведомлением (решение
+    // принимается в баннере). Автофокус вкладки НЕ делаем: он крадёт ввод,
+    // если пользователь печатает/диктует в другой вкладке.
+    let attentionNeeded = !tab.active;
+    if (!attentionNeeded && browser.windows && browser.windows.get && tab.windowId != null) {
+      try {
+        const w = await browser.windows.get(tab.windowId);
+        attentionNeeded = !w.focused;
+      } catch (e) { /* windows API недоступен — остаёмся на tab.active */ }
+    }
+    if (attentionNeeded) {
+      notifId = "bridge-consent-" + params.tabId + "-" + Date.now();
+      await browser.notifications
+        .create(notifId, {
+          type: "basic",
+          iconUrl: browser.runtime.getURL("icons/icon48.png"),
+          title: "Мост: нужно подтверждение",
+          message: ((params.domain || "") + " — " + (params.description || "")).slice(0, 200),
+        })
+        .catch(() => {}); // уведомление — резервный канал, сбой не должен ломать consent
+    }
     const st = await sendCmdToTab(params.tabId, "__consent", params, timeoutMs);
-    return { decision: st.decision || "deny" };
+    // reason («click»/«timeout») прокидываем наверх — сервер кэширует deny
+    // только при явном клике (П.3).
+    return { decision: st.decision || "deny", reason: st.reason || undefined };
   } catch (e) {
     return { decision: "deny", note: "content_script_absent: " + e.message };
+  } finally {
+    if (notifId) browser.notifications.clear(notifId).catch(() => {});
   }
 }
 
@@ -1104,25 +1246,34 @@ async function relayTextToServer(conn, msg) {
 }
 
 /**
- * П2-6: после (пере)запуска/обновления расширения уже открытые вкладки держат
- * СТАРЫЕ content scripts (SETUP.md требовал F5). Один раз по первому
- * policy.update переинжектируем вкладки, чьи URL попадают в match_patterns
- * политики (только грантованные домены, только при host-правах).
+ * П2-6/П.7: уже открытые вкладки держат СТАРЫЕ content scripts (или не имеют
+ * их вовсе, если домен грантован после открытия вкладки). По каждому
+ * policy.update переинжектируем вкладки, чьи URL попадают в union
+ * match_patterns — но только если набор паттернов ИЗМЕНИЛСЯ с прошлого раза
+ * (сигнатура): новый грант из popup расширяет union и вкладки нового домена
+ * получают скрипты без F5. При неудаче (нет host-прав, ошибка tabs.query)
+ * сигнатуру НЕ помечаем — следующий policy.update повторит попытку.
  * Скрипты идемпотентны: content-bridge.js имеет guard __BRIDGE_CONTENT_LOADED__;
  * серверный ref-кэш протухает сам (свежий snapshot / авто-retry после STALE_REF).
  * Сверка идёт по ОБЪЕДИНЕНИЮ паттернов всех подключений (content script общий).
  */
 async function reinjectOpenTabs() {
-  if (reinjectDone) return;
-  reinjectDone = true;
+  const patterns = unionPatterns().sort();
+  const sig = patterns.join("\n");
+  if (sig === lastReinjectSig) return;
   try {
     if (!(await BridgeInjector.hasHostPermission())) return;
-    const patterns = unionPatterns();
+    let injected = 0;
     const tabs = await browser.tabs.query({});
     for (const t of tabs) {
       if (!t.id || !t.url || !urlMatchesPolicy(patterns, t.url)) continue;
-      await tryInjectContentScripts(t.id);
+      if (await tryInjectContentScripts(t.id)) injected++;
     }
+    lastReinjectSig = sig;
+    // Для диагностики в popup/дебаге: когда и сколько вкладок переинжектировано.
+    await saveState({
+      lastReinject: { ts: Date.now(), tabs: injected, patterns: patterns.length },
+    });
   } catch (e) {
     console.warn("[bridge] reinject:", e);
   }
@@ -1160,7 +1311,7 @@ async function onPolicyUpdate(conn, data) {
     console.warn("[bridge] applyPolicy failed:", e);
     await saveState({ lastError: "applyPolicy: " + e.message });
   }
-  reinjectOpenTabs(); // одноразово (П2-6), без await — не блокируем policy.update
+  reinjectOpenTabs(); // П.7: повторяется при смене union-паттернов, без await — не блокируем policy.update
 }
 
 // ---------- сообщения от popup ----------

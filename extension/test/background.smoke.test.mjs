@@ -61,7 +61,7 @@ function boot(storageData) {
   for (const f of ["config.js", "owners.js", "keepalive.js", "injector.js", "sha256.js", "file-relay.js", "background.js"]) {
     vm.runInContext(readFileSync(path.join(SRC, f), "utf8"), sandbox, { filename: f });
   }
-  return { browser, getAlarm: () => alarmArmed };
+  return { browser, getAlarm: () => alarmArmed, sandbox };
 }
 
 test("smoke: загрузка всех модулей, миграция legacy, старт подключения, keepalive", async () => {
@@ -90,4 +90,39 @@ test("smoke: чистый старт без конфига — дефолтно�
   // дефолт не персистится (как раньше serverUrl не писался до сохранения в popup),
   // но подключение создано и его состояние лежит в connState
   assert.ok(browser.storage.store.connState.default, "connState.default создан");
+});
+
+test("П.7: reinjectOpenTabs повторяется при росте union-паттернов, не дёргается без изменений", async () => {
+  const { browser, sandbox } = boot({});
+  await new Promise((r) => setTimeout(r, 20));
+  const run = (src) => vm.runInContext(src, sandbox);
+
+  const calls = [];
+  browser.tabs.executeScript = async (tabId, inj) => {
+    calls.push([tabId, inj.file]);
+  };
+  browser.tabs.query = async () => [
+    { id: 1, url: "https://a.com/x" },
+    { id: 2, url: "https://b.com/y" },
+    { id: 3, url: "chrome://extensions/" },
+  ];
+
+  // первый policy.update с паттерном a.com — инжектим только вкладку 1 (4 файла)
+  run(`connections.push({ label: "t1", policyPatterns: ["*://*.a.com/*"] })`);
+  await run(`reinjectOpenTabs()`);
+  assert.deepEqual([...new Set(calls.map((c) => c[0]))], [1]);
+  assert.equal(calls.length, 4);
+  assert.equal(j(browser.storage.store.lastReinject).tabs, 1);
+
+  // повтор без изменений паттернов — ни одного вызова
+  calls.length = 0;
+  await run(`reinjectOpenTabs()`);
+  assert.equal(calls.length, 0, "без смены паттернов переинжекции нет");
+
+  // рост union (новый грант b.com) — повторная переинжекция, обе вкладки;
+  // chrome://extensions/ по-прежнему пропускается
+  run(`connections.push({ label: "t2", policyPatterns: ["*://*.b.com/*"] })`);
+  await run(`reinjectOpenTabs()`);
+  assert.deepEqual([...new Set(calls.map((c) => c[0]))].sort(), [1, 2]);
+  assert.equal(j(browser.storage.store.lastReinject).tabs, 2);
 });

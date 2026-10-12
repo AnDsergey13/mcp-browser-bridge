@@ -77,8 +77,15 @@
 - `extractMarkdown` `{tabId, selector?, images?:"inline"|"manifest"|"off", max_chars?:число}` →
   `{url,title,markdown,images:[{n,src,alt,w,h}],flags}`
   Картинки и embed'ы стоят ИНЛАЙН в markdown на своих местах: `![alt](src)`,
-  `[embedded: iframe-src]`, `[video|audio: src]`. Манифест `images` — для
-  скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
+  `[embedded: iframe-src]`, `[video|audio: src]` — маркеры embed только у
+  ВИДИМЫХ (достаточно больших) плееров/фреймов; скрытые/0x0 — числом
+  `[скрытые embed] ×N` без URL (Д3, SECURITY.md §4 №3). Скрытый текст
+  (display:none, visibility:hidden, закрытые `<details>` — пометка spoiler)
+  не смешивается с видимым: он вырезается из основного markdown и идёт
+  отдельной секцией `## Скрытый текст` в конце (Д1; кап 10 блоков/2000
+  символов, блок ≤300) с пометкой untrusted — спойлеры доступны по запросу,
+  но скрытая инъекция не маскируется под видимый контент. Манифест `images` —
+  для скачивания по номеру n (инлайн data: URI → `"data:(inline)"`).
   `images:"manifest"` — только манифест, без инлайна в тексте; `"off"` — без
   картинок вовсе (чистое чтение). Дефолт `"inline"` — контракт
   `localize-page.py`, не менять. `max_chars` (дефолт 15000) — лимит markdown
@@ -115,7 +122,7 @@
   хука → честный маркер `console_unavailable` (по образцу
   `netlog_unavailable`), а не молчаливый пустой буфер.
   MCP-инструмент: `page.console`, capability `read`.
-- `eval` `{tabId, expression, awaitPromise?:bool (дефолт true), timeout_ms?:≤30000 (дефолт 10000)}` →
+- `eval` `{tabId, expression, awaitPromise?:bool (дефолт true), timeout_ms?:дефолт 10000, потолок 30000 — per-domain `eval_timeout_ms` в policy.yaml поднимает до 300000}` →
   `{url,title,flags,value_json,value_type,bytes}` — инлайн (≤16000 символов
   JSON) — или `{url,title,flags,relayed:true,transferId,value_type,bytes}` —
   большой результат ушёл файловым релеем (§8) в `downloads/eval-result-*.json`
@@ -132,9 +139,17 @@
   страницы может запретить загрузку runner'а → ошибка `EVAL_UNAVAILABLE`
   (честный маркер, как `console_unavailable`). Таймаут исполнения →
   `EVAL_TIMEOUT`; исключение в выражении → `EVAL_ERROR` с сообщением страницы.
-  MCP-инструмент: `page.eval`. Гейтинг — двойной: capability `eval`
-  per-domain (default-deny) + gated `eval: confirm` (по умолчанию; consent-
-  баннер показывает expression, рекомендуется `eval: confirm` в hard_floor).
+  MCP-инструмент: `page.eval` `{tabId, expression, description, awaitPromise?,
+  timeout_ms?, browser?}` — `description` ОБЯЗАТЕЛЕН: 1–2 предложения простым
+  языком, ЧТО делает скрипт (пользователь не читает JS); пустой/отсутствующий →
+  `VALIDATION_ERROR` до policy-гейта и баннера. Гейтинг — двойной: capability
+  `eval` per-domain (default-deny) + gated `eval: confirm` (по умолчанию,
+  рекомендуется `eval: confirm` в hard_floor). Consent-баннер для eval
+  получает в params `description`, `title`/`url` вкладки-цели и ПОЛНЫЙ
+  `expression` и показывает: description первым, затем вкладку, затем
+  expression блоком кода с прокруткой (max-height + overflow:auto) и кнопкой
+  «Копировать» (navigator.clipboard с fallback); без этих полей (старый
+  сервер) баннер остаётся прежним (деградация по наличию полей).
   Expression пишется в policy-audit.jsonl (preview + sha256), вызов
   учитывается в pacing-окне 30 act/мин, ответ маркируется
   `untrusted_page_content` (N15 — страница может подделать ответ runner'а).
@@ -288,10 +303,24 @@ url из fetchFile, дальше — хопы редиректа по requestId)
 ставится, fetch идёт с заголовками по умолчанию (известная деградация
 Chromium-варианта).
 
-Нюанс trust-model: background-fetch следует cross-origin редиректам свободно;
-политика проверяет только НАЧАЛЬНЫЙ url (`fetchFile.url` + домен вкладки) —
-цель редиректа отдельно не проверяется (тот же trust-model, что навигация
-браузера по редиректу).
+Нюанс trust-model: background-fetch следует cross-origin редиректам свободно.
+Политика проверяет НАЧАЛЬНЫЙ url (`fetchFile.url` + домен вкладки) и — с П.5 —
+ФИНАЛЬНЫЙ url после всех редиректов (`resp.url`, сверка с match_patterns ДО
+чтения тела: вне грантованных доменов → `FETCH_FAILED`, на диск ничего не
+утекает). Промежуточные хопы цепочки по отдельности не проверяются (бэклог:
+возможное ужесточение через redirect:'manual' с проверкой каждого хопа).
+
+**blob:/data: (Ж.1).** У таких URL пустой host — политика проверяется по домену
+ВКЛАДКИ (capability `download` должен быть выдан ей), а для blob: сервер
+дополнительно сверяет origin внутри URL с origin вкладки (чужой →
+`VALIDATION_ERROR` до policy-гейта). Физически blob: живёт в процессе страницы:
+background читает его постранично (срезы по 256 КБ) через
+`scripting.executeScript({world:"MAIN"})` — это НЕ eval-runner и от CSP
+страницы не зависит. Отличия ветки: res на `fetchFile` уходит ПОСЛЕ `file.end`
+(трансфер целиком покрыт transport-timeout 120 с — для очень больших blob это
+честный таймаут, а не фоновый дожим), `data:` обрабатывается обычным
+background-fetch (менять нечего). Firefox: `browser.scripting` + `world:"MAIN"`
+— FF ≥ 128; на более старых — честный `FETCH_FAILED`.
 
 MV3: трансфер минутами живёт в service worker — WS-трафик (file.chunk/ack)
 сбрасывает idle-таймер (Chrome 116+, подтверждено спайком G1); страховка —
@@ -326,12 +355,32 @@ title: …
 [e3] textbox name=q placeholder="Поиск" value=""
 [e4] select name=city ["Минск","Гродно"]
 [e5] checkbox "Согласен" checked=false
+[e6] button "Отправить" type=submit
+[e7] textbox name=pwd type=password placeholder="Пароль" value="***"
+[e8] button "Подробнее" [aria: "Купить сейчас"]
+[e9] button "Закрыть" [из aria-label]
 # Заголовок раздела
 Текст абзаца… (видимый текст main/viewport, сжатый)
 ```
 
+- Сжатый текст в конце снапшота — только видимый: скрытые поддеревья
+  (display:none, закрытые `<details>`) вырезаются, как в extractMarkdown (Д1).
+
 - ref-метки `eN` — только интерактивные: a, button, input, select, textarea,
   summary, [role=button|link|checkbox|…], [contenteditable], [tabindex].
+- Метка элемента — ВИДИМЫЙ текст в приоритете (innerText → цель
+  aria-labelledby → alt/title вложенных img/svg → value/placeholder у полей).
+  Если есть только aria-label/title/name — текст с маркером источника
+  `[из aria-label]` / `[из title]` / `[из name]`. Если видимый текст и
+  aria-label РАСХОДЯТСЯ — показываются оба: `"видимое" [aria: "aria-текст"]`
+  (подмена становится явной; gated-классификатор сканирует оба текста).
+  Кавычки и `=` в метках глушатся (`"`→`'`, `=`→`:`), чтобы текст страницы
+  не ломал формат строки.
+- `type=submit` ставится на `input[type=submit]` и на `<button>` внутри
+  `<form>` без явного `type` (неявный submit); бит читает gated-классификатор.
+  `input[type=password]` печатается с `type=password`, значение всегда
+  маскируется (`***` если поле заполнено) — в снапшот/журнал пароль не
+  попадает.
 - Скоуп по умолчанию: пересечение viewport и `main|article` (fallback body);
   `scope:"full"` — вся страница. При дефолтном скоупе интерактивные элементы
   из `header/nav/footer/aside` опускаются В КОНЕЦ снапшота (П1-4), при
@@ -362,8 +411,10 @@ title: …
 `RESPONSE_TOO_LARGE` (после резки — hint), `TIMEOUT`, `INTERNAL`.
 
 Формат ответа MCP-инструмента: `{ok, data|error_code, hint, policy_reminder}`.
-`policy_reminder`: активный пресет + security-ограничения домена +
-содержимое `memory/domains/<domain>.md` и `memory/global-notes.md`, если есть.
+`policy_reminder`: активный пресет + security-ограничения домена + КАРТОЧКИ
+плейбуков `memory/domains/<domain>.md` и `memory/global-notes.md`
+(`{file, bytes, title}` — Ж.3: тело в ответ не вкладывается, полный текст
+модель читает файлом по запросу).
 
 ## 11. Мультиклиентность (несколько браузеров у одного сервера)
 

@@ -277,7 +277,9 @@ export class MockExtension {
         if (decision === 'allow') {
           await this.sendReq('grant.add', { domain: p.domain, capabilities: ['download'], scope: 'session' });
         }
-        return { decision };
+        // П.3: как новый баннер — скриптованные решения помечаем reason:'click'
+        // (явное решение пользователя); 'timeout' выше не отвечает вовсе.
+        return { decision, reason: 'click' };
       }
       case 'fetchFile': {
         // fetchFails — имитация падения fetch на стороне расширения (CORS и пр.):

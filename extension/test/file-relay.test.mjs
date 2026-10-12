@@ -233,6 +233,64 @@ test("start: сетевой сбой fetch → FETCH_FAILED до file.start", as
   assert.equal(io.events.length, 0);
 });
 
+test("start: сетевая ошибка с cause → тип и цепочка cause в сообщении (П.6)", async () => {
+  const { Relay } = loadRelay();
+  const io = makeIo();
+  const fetchImpl = async () => {
+    throw new TypeError("Failed to fetch", { cause: new Error("ERR_CERT_DATE_INVALID") });
+  };
+  await assert.rejects(Relay.start(PARAMS, io, { fetchImpl }), (e) => {
+    assert.equal(e.code, "FETCH_FAILED");
+    assert.match(e.message, /TypeError: Failed to fetch/);
+    assert.match(e.message, /cause: Error: ERR_CERT_DATE_INVALID/);
+    return true;
+  });
+  assert.equal(io.events.length, 0);
+});
+
+test("start: HTTP-ошибка несёт statusText и финальный URL (П.6)", async () => {
+  const { Relay } = loadRelay();
+  const io = makeIo();
+  const resp = fakeResponse([], { status: 403 });
+  resp.statusText = "Forbidden";
+  resp.url = "https://cdn.example/redirected/file";
+  await assert.rejects(Relay.start(PARAMS, io, { fetchImpl: async () => resp }), (e) => {
+    assert.equal(e.code, "FETCH_FAILED");
+    assert.match(e.message, /HTTP 403 Forbidden/);
+    assert.match(e.message, /финальный URL: https:\/\/cdn\.example\/redirected\/file/);
+    return true;
+  });
+});
+
+test("start: редирект на негрантованный домен → FETCH_FAILED ДО чтения тела (П.5)", async () => {
+  const { Relay } = loadRelay();
+  const io = makeIo();
+  const resp = fakeResponse([crypto.randomBytes(100)]);
+  resp.url = "https://evil.example/x.bin";
+  const params = { ...PARAMS, checkRedirect: (u) => !u.includes("evil.example") };
+  await assert.rejects(Relay.start(params, io, { fetchImpl: async () => resp }), (e) => {
+    assert.equal(e.code, "FETCH_FAILED");
+    assert.match(e.message, /редирект на негрантованный домен/);
+    assert.match(e.message, /evil\.example/);
+    return true;
+  });
+  assert.equal(io.events.length, 0, "file.start не отправлялся — тело не читалось");
+});
+
+test("start: редирект на грантованный домен → трансфер идёт (П.5)", async () => {
+  const { Relay } = loadRelay();
+  const io = makeIo();
+  const content = crypto.randomBytes(100);
+  const resp = fakeResponse([content]);
+  resp.url = "https://cdn.allowed.example/x.bin";
+  const params = { ...PARAMS, checkRedirect: () => true };
+  const res = await Relay.start(params, io, { fetchImpl: async () => resp });
+  assert.equal(res.transferId, "t_9");
+  await drainAcks(io, 1);
+  await tick();
+  assert.equal(io.events.some((e) => e.ev === "end"), true);
+});
+
 test("start: сбой посреди стрима → file.abort (res уже ушёл раньше)", async () => {
   const { Relay } = loadRelay();
   const io = makeIo();

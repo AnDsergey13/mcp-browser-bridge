@@ -2,7 +2,8 @@
 // (домен ФАЙЛА) → сервер шлёт grant.ask в браузер-владелец вкладки; allow → мок
 // сам шлёт grant.add → повторный policy.check проходит, загрузка без ретрая
 // агента; deny/таймаут/исключение → исходная ошибка (fail-closed); deny-кэш
-// 10 мин не даёт спамить баннером при пакетных загрузках.
+// 10 мин не даёт спамить баннером при пакетных загрузках — но ставится только
+// при ЯВНОМ клике «Запретить» (П.3): таймаут/ошибка кэша не дают.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -117,6 +118,18 @@ test('(d) исключение/таймаут grant.ask → исходная о�
   assert.equal(res2.error_code, 'DOMAIN_NOT_ALLOWED');
   assert.deepEqual(res2.data, { domain: 'slow.example' });
   assert.equal(mock.grantAskRequests.length, before + 1, 'grant.ask был отправлен, но ответ не пришёл');
+  mock.grantAsk = 'deny';
+});
+
+test('(д2) таймаут grant.ask НЕ ставит deny-кэш (П.3): немедленный повтор снова поднимает баннер', async () => {
+  mock.grantAsk = 'timeout';
+  const before = mock.grantAskRequests.length;
+  const res1 = await handle.core.callTool('file.download', { tabId: 1, url: 'http://flaky-cdn.example/a.bin' });
+  assert.equal(res1.ok, false);
+  // Пользователь баннер мог не видеть (таймаут) — кэша нет, баннер при повторе показывается.
+  const res2 = await handle.core.callTool('file.download', { tabId: 1, url: 'http://flaky-cdn.example/b.bin' });
+  assert.equal(res2.ok, false);
+  assert.equal(mock.grantAskRequests.length, before + 2, 'после таймаута grant.ask шлётся снова (нет deny-кэша)');
   mock.grantAsk = 'deny';
 });
 

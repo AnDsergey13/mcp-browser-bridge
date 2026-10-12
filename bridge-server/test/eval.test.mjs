@@ -1,7 +1,8 @@
 // eval.test.mjs — page.eval (L1.1): двойной гейт (capability eval + gated
-// eval:confirm), consent с expression в описании, аудит expression в
-// policy-audit.jsonl, untrusted-маркер (N15), релей больших результатов,
-// ошибки EVAL_ERROR/EVAL_UNAVAILABLE.
+// eval:confirm), обязательный description (Е: без него VALIDATION_ERROR до
+// баннера; баннер получает description/title/url/ПОЛНЫЙ expression), аудит
+// expression в policy-audit.jsonl, untrusted-маркер (N15), релей больших
+// результатов, ошибки EVAL_ERROR/EVAL_UNAVAILABLE.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -49,24 +50,44 @@ function auditLines() {
   return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
+test('page.eval без description → VALIDATION_ERROR до баннера (Е)', async () => {
+  prime();
+  for (const args of [
+    { tabId: 1, expression: '1+1' },                 // параметр отсутствует
+    { tabId: 1, expression: '1+1', description: '   ' }, // только пробелы
+  ]) {
+    const res = await handle.core.callTool('page.eval', args);
+    assert.equal(res.ok, false);
+    assert.equal(res.error_code, 'VALIDATION_ERROR', JSON.stringify(res));
+  }
+  assert.equal(mock.consentRequests.length, 0, 'баннер НЕ запрашивается без description');
+  assert.equal(mock.actions.length, 0, 'eval не должен был исполниться');
+});
+
 test('page.eval без capability eval на домене → CAPABILITY_DENIED, consent не спрашивают', async () => {
   prime();
-  const res = await handle.core.callTool('page.eval', { tabId: 2, expression: '1+1' });
+  const res = await handle.core.callTool('page.eval', { tabId: 2, expression: '1+1', description: 'Сложить 1+1 (проверка eval).' });
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'CAPABILITY_DENIED');
   assert.equal(mock.consentRequests.length, 0, 'consent не должен запрашиваться до capability-гейта');
   assert.equal(mock.actions.length, 0);
 });
 
-test('page.eval: gated eval:confirm — consent.ask с категорией eval и expression в описании; deny → ACTION_DENIED', async () => {
+test('page.eval: gated eval:confirm — consent.ask с категорией eval, description агента и контекстом вкладки (Е); deny → ACTION_DENIED', async () => {
   prime();
   mock.consent = 'deny';
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: 'window.store.getState()' });
+  const expr = 'window.store.getState()';
+  const description = 'Прочитать текущее состояние store страницы, ничего не меняя.';
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: expr, description });
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'ACTION_DENIED');
   assert.equal(mock.consentRequests.length, 1);
-  assert.equal(mock.consentRequests[0].category, 'eval');
-  assert.match(mock.consentRequests[0].description, /window\.store\.getState\(\)/);
+  const p = mock.consentRequests[0];
+  assert.equal(p.category, 'eval');
+  assert.equal(p.description, description, 'description баннера — осмысленный текст агента');
+  assert.equal(p.expression, expr, 'баннер получает ПОЛНЫЙ expression отдельным полем');
+  assert.equal(p.title, 'Form', 'title вкладки-цели из реестра');
+  assert.equal(p.url, 'http://localhost:18547/form', 'url вкладки-цели из реестра');
   assert.equal(mock.actions.length, 0, 'eval не должен был исполниться');
 });
 
@@ -74,7 +95,7 @@ test('page.eval: consent allow → значение возвращается, о
   prime();
   mock.tabs.get(1).evalResult = JSON.stringify({ user: 'bob', roles: ['admin'] });
   const expr = 'fetch("/api/me").then(r=>r.json())';
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: expr });
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: expr, description: 'Получить профиль текущего пользователя через внутренний API страницы.' });
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.deepEqual(mock.actions, ['eval']);
   assert.equal(mock.lastEvalParams.expression, expr, 'expression доехал до вкладки без искажений');
@@ -93,7 +114,7 @@ test('page.eval: результат >16 KB уходит файловым рел�
   prime();
   const big = JSON.stringify({ data: 'x'.repeat(20000) });
   mock.tabs.get(1).evalResult = big;
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: 'window.bigDump' });
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: 'window.bigDump', description: 'Прочитать большой дамп window.bigDump.' });
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.data.relayed, true);
   assert.equal(res.data.value_json, undefined, 'большой результат инлайном не отдаётся');
@@ -108,7 +129,7 @@ test('page.eval: результат >16 KB уходит файловым рел�
 test('page.eval: исключение в странице → EVAL_ERROR, eval_error в аудите', async () => {
   prime();
   mock.tabs.get(1).evalError = 'ReferenceError: nope is not defined';
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: 'nope()' });
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: 'nope()', description: 'Вызвать несуществующую функцию (проверка ошибки страницы).' });
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'EVAL_ERROR');
   const entry = auditLines().find((e) => e.kind === 'eval' && e.decision === 'eval_error');
@@ -118,14 +139,30 @@ test('page.eval: исключение в странице → EVAL_ERROR, eval_e
 test('page.eval: CSP запретил MAIN-world runner → EVAL_UNAVAILABLE', async () => {
   prime();
   mock.tabs.get(1).evalUnavailable = true;
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '1+1' });
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '1+1', description: 'Проверка eval на странице с жёстким CSP.' });
   assert.equal(res.ok, false);
   assert.equal(res.error_code, 'EVAL_UNAVAILABLE');
 });
 
 test('page.eval: пустое expression → ошибка до обращения к вкладке', async () => {
   prime();
-  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '   ' });
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '   ', description: 'Пустой скрипт — проверка валидации expression.' });
   assert.equal(res.ok, false);
   assert.equal(mock.actions.length, 0);
+});
+
+test('page.eval: per-domain eval_timeout_ms (Ж.2) — потолок из policy.yaml вместо 30 с', async () => {
+  prime();
+  mock.tabs.get(1).evalResult = '1';
+  // У localhost:18547 в TEST_POLICY eval_timeout_ms: 120000.
+  const res = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка per-domain потолка таймаута eval.', timeout_ms: 60000 });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(mock.lastEvalParams.timeout_ms, 60000, 'timeout_ms не зажат прежним потолком 30 с');
+  const res2 = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка клампа сверх per-domain потолка.', timeout_ms: 999999 });
+  assert.equal(res2.ok, true, JSON.stringify(res2));
+  assert.equal(mock.lastEvalParams.timeout_ms, 120000, 'зажато per-domain потолком из policy.yaml');
+  // Без аргумента — прежний дефолт 10 с.
+  const res3 = await handle.core.callTool('page.eval', { tabId: 1, expression: '1', description: 'Проверка дефолта таймаута eval.' });
+  assert.equal(res3.ok, true, JSON.stringify(res3));
+  assert.equal(mock.lastEvalParams.timeout_ms, 10000);
 });

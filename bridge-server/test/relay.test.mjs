@@ -109,3 +109,39 @@ test('file.download: ошибка fetchFile не отравляет очеред
   assert.match(entry.url, /after-fail\.bin/, 'url обязан быть своим, а не протухшим broken.bin');
   mock.fileToServe = { name: 'lesson.pdf', content: FILE_CONTENT, chunkSize: 400 };
 });
+
+test('file.download blob: (Ж.1): policy по домену вкладки, origin совпадает → файл скачан', async () => {
+  const content = crypto.randomBytes(600);
+  mock.fileToServe = { name: 'blob.bin', content, chunkSize: 400 };
+  const res = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'blob:http://allowed.example/9f2c4e00-uuid', name: 'blob.bin',
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(fs.readFileSync(path.join(env.downloadsDir, res.data.file)), content);
+  mock.fileToServe = { name: 'lesson.pdf', content: FILE_CONTENT, chunkSize: 400 };
+});
+
+test('file.download blob: чужого origin (Ж.1) → VALIDATION_ERROR до policy-гейта', async () => {
+  const res = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'blob:http://evil.example/9f2c4e00-uuid',
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.error_code, 'VALIDATION_ERROR');
+  assert.match(res.hint, /origin/);
+});
+
+test('file.download blob: на вкладке без capability download (Ж.1) → CAPABILITY_DENIED по домену вкладки', async () => {
+  const res = await handle.core.callTool('file.download', {
+    tabId: 2, url: 'blob:http://readonly.example/9f2c4e00-uuid',
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.error_code, 'CAPABILITY_DENIED');
+});
+
+test('file.download data: (Ж.1): policy по домену вкладки → скачивается', async () => {
+  const res = await handle.core.callTool('file.download', {
+    tabId: 1, url: 'data:application/octet-stream;base64,aGVsbG8gd29ybGQ=', name: 'hello.bin',
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.data.file, 'hello.bin');
+});

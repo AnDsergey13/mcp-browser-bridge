@@ -13,6 +13,7 @@ DIST="$SRC_DIR/../dist/chromium"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 cp -r "$SRC_DIR/src" "$DIST/src"
+cp -r "$SRC_DIR/icons" "$DIST/icons"
 cp "$SRC_DIR/sw-loader.js" "$DIST/sw-loader.js"
 cp "$SRC_DIR/manifest.chromium.json" "$DIST/manifest.json"
 

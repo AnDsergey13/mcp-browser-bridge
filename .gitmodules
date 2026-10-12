@@ -1,0 +1,3 @@
+[submodule "userscripts/poe-bulk-exporter"]
+	path = userscripts/poe-bulk-exporter
+	url = https://codeberg.org/femto/poe-bulk-exporter

@@ -46,6 +46,12 @@
     <!-- Кнопка удаления: gated-классификатор должен распознать delete -->
     <button id="btn-delete" type="button" class="danger">Удалить аккаунт</button>
   </div>
+  <div>
+    <!-- Д2: иконочная кнопка без видимого текста → метка [из aria-label] -->
+    <button id="btn-icon" type="button" aria-label="Закрыть окно"><svg width="12" height="12"></svg></button>
+    <!-- Д2: расхождение видимого текста и aria → "Подробнее" [aria: "Купить сейчас"] -->
+    <button id="btn-diverge" type="button" aria-label="Купить сейчас">Подробнее</button>
+  </div>
 </form>
 <div id="form-result"></div>
 

@@ -566,9 +566,11 @@
     }
     const expression = String(params.expression || "");
     if (!expression.trim()) throw cerr("INTERNAL", "page.eval: пустое expression");
+    // Потолок приходит от сервера (per-domain eval_timeout_ms, Ж.2); локальный
+    // кламп — страховка на случай прямого вызова команды мимо сервера.
     const timeoutMs = Math.min(
       Math.max(Number(params.timeout_ms) || EVAL_DEFAULT_TIMEOUT_MS, 500),
-      30000
+      300000
     );
     const requestId = "evq_" + Date.now().toString(36) + "_" + ++evalReqSeq;
     const response = await new Promise((resolve, reject) => {

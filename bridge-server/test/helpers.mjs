@@ -16,6 +16,7 @@ presets:
       "localhost:18547":
         capabilities: [read, interact, download, eval]
         gated: { login: auto, submit: confirm, delete: confirm, pay: auto }
+        eval_timeout_ms: 120000  # Ж.2: поднятый потолок page.eval для тестов
       "allowed.example":
         capabilities: [read, interact, download]
       "readonly.example":
